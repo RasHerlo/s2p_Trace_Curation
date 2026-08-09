@@ -1,0 +1,4 @@
+numpy>=1.24
+pyqtgraph>=0.13
+# Qt binding: use system/conda PyQt5, or pip install PyQt5 / PySide6
+PyQt5>=5.15; platform_system=="Windows"
