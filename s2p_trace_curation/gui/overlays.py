@@ -35,7 +35,7 @@ def build_fov_overlay(
     rois: list[dict[str, Any]],
     active_roi_id: int,
     overlay_filter: OverlayFilter,
-    alpha: float = 0.7,
+    alpha: float = 0.35,
 ) -> np.ndarray:
     """RGBA uint8 overlay; non-active red, active cyan."""
     overlay = np.zeros((Ly, Lx, 4), dtype=np.uint8)
@@ -131,8 +131,8 @@ def zoom_masks_rgba(
     row: dict[str, Any],
     Ly: int,
     Lx: int,
-    roi_alpha: float = 0.7,
-    neu_alpha: float = 0.7,
+    roi_alpha: float = 0.35,
+    neu_alpha: float = 0.35,
 ) -> np.ndarray:
     """Crop RGB frame and blend ROI (red) + neuropil (yellow-orange)."""
     crop = frame_rgb[y0 : y0 + side, x0 : x0 + side].copy()

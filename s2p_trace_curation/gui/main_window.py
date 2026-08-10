@@ -158,16 +158,16 @@ class MainWindow(QMainWindow):
         # Traces
         self.trace_widget = pg.GraphicsLayoutWidget()
         root_layout.addWidget(self.trace_widget, stretch=2)
-        self.plot_f = self.trace_widget.addPlot(row=0, col=0, title="F / Fneu")
+        self.plot_f = self.trace_widget.addPlot(row=0, col=0, title="F / x·Fneu")
         self.plot_comp = self.trace_widget.addPlot(row=1, col=0, title="trace_comp = F − x·Fneu")
         self.plot_bleach = self.trace_widget.addPlot(row=2, col=0, title="Bleach-corrected (placeholder)")
         self.plot_comp.setXLink(self.plot_f)
         self.plot_bleach.setXLink(self.plot_f)
         self.plot_bleach.setLabel("bottom", "frame")
-        self.curve_f = self.plot_f.plot(pen=pg.mkPen("#1f77b4", width=1), name="F")
-        self.curve_fneu = self.plot_f.plot(pen=pg.mkPen("#ff7f0e", width=1), name="Fneu")
-        self.curve_comp = self.plot_comp.plot(pen=pg.mkPen("#2ca02c", width=1.5))
         self.plot_f.addLegend(offset=(10, 10))
+        self.curve_f = self.plot_f.plot(pen=pg.mkPen("#1f77b4", width=1), name="F")
+        self.curve_fneu = self.plot_f.plot(pen=pg.mkPen("#ff7f0e", width=1), name="x·Fneu")
+        self.curve_comp = self.plot_comp.plot(pen=pg.mkPen("#2ca02c", width=1.5))
 
         self.cursors: list[pg.InfiniteLine] = []
         self.cursor_labels: list[pg.TextItem] = []
@@ -497,6 +497,11 @@ class MainWindow(QMainWindow):
             img = meta.get("meanImg")
         return None if img is None else np.asarray(img)
 
+    @staticmethod
+    def _set_display_rgb(view: pg.ImageView, rgb: np.ndarray) -> None:
+        """Show pre-composited RGB uint8 without ImageView re-applying levels."""
+        view.setImage(rgb, autoLevels=False, levels=(0, 255))
+
     def _refresh_fov(self) -> None:
         if self.doc is None:
             return
@@ -513,8 +518,7 @@ class MainWindow(QMainWindow):
             self._overlay_filter(),
         )
         composed = compose_rgb_with_overlay(rgb, overlay)
-        view: pg.ImageView = self.w1.image_view  # type: ignore[attr-defined]
-        view.setImage(composed, autoLevels=False)
+        self._set_display_rgb(self.w1.image_view, composed)  # type: ignore[attr-defined]
 
     def _movie_rgb(self, frame: np.ndarray) -> np.ndarray:
         lut = self._lut_cache[self.cmb_mov_lut.currentText()]
@@ -541,14 +545,14 @@ class MainWindow(QMainWindow):
         w2 = rgb.copy()
         if y_out.size:
             w2[y_out, x_out] = (255, 0, 0)
-        self.w2.image_view.setImage(w2, autoLevels=False)  # type: ignore[attr-defined]
+        self._set_display_rgb(self.w2.image_view, w2)  # type: ignore[attr-defined]
 
         # W3 zoom at C0
         y0, x0, side = zoom_square_window(
             row["roi"]["ypix"], row["roi"]["xpix"], row["neuropil"]["ipix"], Ly, Lx
         )
         zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
-        self.w3.image_view.setImage(zoom, autoLevels=False)  # type: ignore[attr-defined]
+        self._set_display_rgb(self.w3.image_view, zoom)  # type: ignore[attr-defined]
         self.w2.setTitle(f"Movie (W2) — frame {t}")  # type: ignore[attr-defined]
         self.w3.setTitle(f"ROI zoom (W3) — frame {t}")  # type: ignore[attr-defined]
 
@@ -558,10 +562,11 @@ class MainWindow(QMainWindow):
         row = self._row()
         F = np.asarray(row["roi"]["F"], dtype=np.float64)
         Fneu = np.asarray(row["neuropil"]["Fneu"], dtype=np.float64)
+        x = float(row["compensation"]["x"])
         comp = np.asarray(row["compensation"]["trace_comp"], dtype=np.float64)
         xs = np.arange(F.shape[0])
         self.curve_f.setData(xs, F)
-        self.curve_fneu.setData(xs, Fneu)
+        self.curve_fneu.setData(xs, x * Fneu)
         self.curve_comp.setData(xs, comp)
         if autoscale:
             self.plot_f.enableAutoRange(axis="y")
@@ -630,5 +635,5 @@ class MainWindow(QMainWindow):
             frame = self.stack.read_frame(fi)
             rgb = self._movie_rgb(frame)
             zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
-            view.setImage(zoom, autoLevels=False)
+            self._set_display_rgb(view, zoom)
             lab.setText(f"C{i + 1} — frame {fi}")
