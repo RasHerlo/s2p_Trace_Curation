@@ -45,6 +45,11 @@ from s2p_trace_curation.gui.overlays import (
     zoom_masks_rgba,
 )
 from s2p_trace_curation.suite2p_io import BinaryStack, plane_dir, zoom_square_window
+from s2p_trace_curation.user_settings import (
+    last_open_start_dir,
+    load_settings,
+    save_settings,
+)
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
 
@@ -101,6 +106,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+        self._apply_saved_settings()
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Open a suite2p folder to begin.")
 
@@ -338,9 +344,46 @@ class MainWindow(QMainWindow):
         self.spin_x.valueChanged.connect(self._on_x_changed)
         return panel
 
+    def _apply_saved_settings(self) -> None:
+        s = load_settings()
+        self._updating = True
+        try:
+            if src := s.get("fov_src"):
+                idx = self.cmb_fov_src.findText(str(src))
+                if idx >= 0:
+                    self.cmb_fov_src.setCurrentIndex(idx)
+            if lut := s.get("fov_lut"):
+                idx = self.cmb_fov_lut.findText(str(lut))
+                if idx >= 0:
+                    self.cmb_fov_lut.setCurrentIndex(idx)
+            if filt := s.get("overlay_filter"):
+                idx = self.cmb_overlay.findData(str(filt))
+                if idx >= 0:
+                    self.cmb_overlay.setCurrentIndex(idx)
+            if lut := s.get("mov_lut"):
+                idx = self.cmb_mov_lut.findText(str(lut))
+                if idx >= 0:
+                    self.cmb_mov_lut.setCurrentIndex(idx)
+        finally:
+            self._updating = False
+
+    def _persist_ui_settings(self, *, suite2p_dir: Path | None = None) -> None:
+        updates: dict[str, Any] = {
+            "fov_src": self.cmb_fov_src.currentText(),
+            "fov_lut": self.cmb_fov_lut.currentText(),
+            "overlay_filter": self.cmb_overlay.currentData(),
+            "mov_lut": self.cmb_mov_lut.currentText(),
+        }
+        if suite2p_dir is not None:
+            updates["last_suite2p_dir"] = str(suite2p_dir)
+        save_settings(updates)
+
     # --------------------------------------------------------------- session
     def open_suite2p(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select suite2p folder")
+        start = last_open_start_dir()
+        path = QFileDialog.getExistingDirectory(
+            self, "Select suite2p folder", start
+        )
         if not path:
             return
         try:
@@ -366,6 +409,7 @@ class MainWindow(QMainWindow):
         self._init_cursors()
         self._updating = False
         self._select_roi(0, force=True)
+        self._persist_ui_settings(suite2p_dir=suite2p_dir)
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -414,6 +458,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Reset ROI {self.active_roi_id} from suite2p")
 
     def closeEvent(self, event) -> None:
+        self._persist_ui_settings(suite2p_dir=self.suite2p_dir)
         if self.stack is not None:
             self.stack.close()
         super().closeEvent(event)
