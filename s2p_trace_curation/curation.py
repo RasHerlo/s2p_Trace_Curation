@@ -14,6 +14,7 @@ from s2p_trace_curation import PICKLE_NAME, SCHEMA_VERSION
 from s2p_trace_curation.suite2p_io import (
     PLANE_NAME,
     BinaryStack,
+    fov_images_from_ops,
     load_iscell,
     load_ops,
     load_stat,
@@ -50,6 +51,7 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
     Ly = int(ops["Ly"])
     Lx = int(ops["Lx"])
     nframes = int(F.shape[1])
+    fov_imgs = fov_images_from_ops(ops)
 
     rois: list[dict[str, Any]] = []
     for i in range(n_roi):
@@ -94,17 +96,21 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
             "Lx": Lx,
             "nframes": nframes,
             "fs": float(ops["fs"]) if "fs" in ops else None,
-            "meanImg": np.asarray(ops.get("meanImg")),
-            "meanImgE": np.asarray(ops.get("meanImgE")) if "meanImgE" in ops else None,
-            "VCorr": np.asarray(ops.get("Vcorr", ops.get("VCorr")))
-            if ("Vcorr" in ops or "VCorr" in ops)
-            else None,
+            "meanImg": fov_imgs["meanImg"],
+            "meanImgE": fov_imgs["meanImgE"],
+            "VCorr": fov_imgs["VCorr"],
             "notes": "",
             "source_suite2p_abspath": str(suite2p_dir),
         },
         "rois": rois,
     }
     return doc
+
+
+def sync_fov_images_from_ops(doc: dict[str, Any], suite2p_dir: Path) -> None:
+    """Refresh meanImg / meanImgE / VCorr from plane0/ops.npy (full-FOV embeds)."""
+    ops = load_ops(plane_dir(resolve_suite2p_dir(suite2p_dir)))
+    doc["meta"].update(fov_images_from_ops(ops))
 
 
 def save_curation(doc: dict[str, Any], suite2p_dir: Path) -> Path:
@@ -143,7 +149,9 @@ def open_suite2p_session(suite2p_dir: Path) -> tuple[Path, dict[str, Any], bool]
     suite2p_dir = resolve_suite2p_dir(suite2p_dir)
     pkl = pickle_path(suite2p_dir)
     if pkl.exists():
-        return suite2p_dir, load_curation(pkl), False
+        doc = load_curation(pkl)
+        sync_fov_images_from_ops(doc, suite2p_dir)
+        return suite2p_dir, doc, False
     doc = create_curation_from_plane(suite2p_dir)
     save_curation(doc, suite2p_dir)
     return suite2p_dir, doc, True

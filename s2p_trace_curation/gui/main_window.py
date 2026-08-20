@@ -94,7 +94,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("s2p Trace Curation")
-        self.resize(1600, 1000)
+        self.resize(1920, 1100)
 
         self.suite2p_dir: Path | None = None
         self.doc: dict[str, Any] | None = None
@@ -167,36 +167,35 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
-        root_layout = QVBoxLayout(root)
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(6, 6, 6, 6)
+        root_layout.setSpacing(6)
+
+        root_layout.addWidget(self._build_left_panel(), stretch=0)
+
+        # Center column: W1–W3, then traces + C1–C4 aligned to those three windows
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(6)
+        root_layout.addWidget(center, stretch=1)
 
         top_split = QSplitter(Qt.Orientation.Horizontal)
-        root_layout.addWidget(top_split, stretch=3)
-
-        top_split.addWidget(self._build_left_panel())
+        center_layout.addWidget(top_split, stretch=3)
 
         self.w1 = self._make_image_panel("FOV (W1)", clickable=True)
         self.w2 = self._make_image_panel("Movie (W2)")
-        self.w3_box = QWidget()
-        w3_layout = QVBoxLayout(self.w3_box)
-        w3_layout.setContentsMargins(0, 0, 0, 0)
-        self.btn_modify = QPushButton("Modify mask")
-        self.btn_modify.setEnabled(False)
-        self.btn_modify.setToolTip("Placeholder — mask editing coming later")
-        w3_layout.addWidget(self.btn_modify)
         self.w3 = self._make_image_panel("ROI zoom (W3)")
-        w3_layout.addWidget(self.w3)
-
         top_split.addWidget(self.w1)
         top_split.addWidget(self.w2)
-        top_split.addWidget(self.w3_box)
-        top_split.setStretchFactor(0, 0)
+        top_split.addWidget(self.w3)
+        top_split.setStretchFactor(0, 1)
         top_split.setStretchFactor(1, 1)
         top_split.setStretchFactor(2, 1)
-        top_split.setStretchFactor(3, 1)
 
         # Traces
         self.trace_widget = pg.GraphicsLayoutWidget()
-        root_layout.addWidget(self.trace_widget, stretch=2)
+        center_layout.addWidget(self.trace_widget, stretch=2)
         self.plot_f = self.trace_widget.addPlot(row=0, col=0, title="F / x·Fneu")
         self.plot_comp = self.trace_widget.addPlot(row=1, col=0, title="trace_comp = F − x·Fneu")
         self.plot_bleach = self.trace_widget.addPlot(row=2, col=0, title="Bleach-corrected (placeholder)")
@@ -218,9 +217,6 @@ class MainWindow(QMainWindow):
             pen=pg.mkPen(C0_COLOR, width=2, style=Qt.PenStyle.SolidLine),
         )
         self.cursor_c0.sigPositionChanged.connect(self._on_c0_moved)
-        for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
-            # Separate InfiniteLine per plot, linked via position sync
-            pass
         # Use one set of lines on plot_comp for labels; sync clones on other plots
         self._cursor_clones: dict[str, list[pg.InfiniteLine]] = {"f": [], "bleach": []}
 
@@ -259,9 +255,9 @@ class MainWindow(QMainWindow):
                 plot.addItem(clone)
                 self._cursor_clones[key].append(clone)
 
-        # Thumbnails
+        # Thumbnails (aligned with W1–W3 via center column)
         thumb_row = QHBoxLayout()
-        root_layout.addLayout(thumb_row)
+        center_layout.addLayout(thumb_row)
         self.thumb_views: list[pg.ImageView] = []
         self.thumb_labels: list[QLabel] = []
         for i in range(4):
@@ -280,6 +276,8 @@ class MainWindow(QMainWindow):
             thumb_row.addWidget(wrap)
             self.thumb_views.append(view)
             self.thumb_labels.append(lab)
+
+        root_layout.addWidget(self._build_right_panel(), stretch=0)
 
     def _make_image_panel(self, title: str, clickable: bool = False) -> QWidget:
         box = QGroupBox(title)
@@ -362,7 +360,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
 
         # connections
-        self.cmb_fov_src.currentIndexChanged.connect(self._refresh_fov)
+        self.cmb_fov_src.currentIndexChanged.connect(self._on_fov_src_changed)
         self.cmb_fov_lut.currentIndexChanged.connect(self._refresh_fov)
         self.spin_fov_lo.valueChanged.connect(self._refresh_fov)
         self.spin_fov_hi.valueChanged.connect(self._refresh_fov)
@@ -375,6 +373,46 @@ class MainWindow(QMainWindow):
         self.btn_roi_down.clicked.connect(lambda: self.spin_roi.setValue(self.spin_roi.value() - 1))
         self.chk_iscell.toggled.connect(self._on_iscell_toggled)
         self.spin_x.valueChanged.connect(self._on_x_changed)
+        return panel
+
+    def _build_right_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setMinimumWidth(260)
+        panel.setMaximumWidth(320)
+        layout = QVBoxLayout(panel)
+
+        zoom = QGroupBox("ROI zoom (W3)")
+        zoom_form = QFormLayout(zoom)
+        self.cmb_w3_src = QComboBox()
+        self.cmb_w3_src.addItems(["movie", "meanImg", "meanImgE", "VCorr"])
+        self.cmb_w3_lut = QComboBox()
+        self.cmb_w3_lut.addItems(list(LUT_NAMES))
+        self.spin_w3_lo = QDoubleSpinBox()
+        self.spin_w3_hi = QDoubleSpinBox()
+        for s in (self.spin_w3_lo, self.spin_w3_hi):
+            s.setRange(-1e9, 1e9)
+            s.setDecimals(2)
+        zoom_form.addRow("Image", self.cmb_w3_src)
+        zoom_form.addRow("LUT", self.cmb_w3_lut)
+        zoom_form.addRow("Lower", self.spin_w3_lo)
+        zoom_form.addRow("Upper", self.spin_w3_hi)
+        layout.addWidget(zoom)
+
+        actions = QGroupBox("Mask tools")
+        actions_layout = QVBoxLayout(actions)
+        self.btn_modify = QPushButton("Modify mask")
+        self.btn_modify.setEnabled(False)
+        self.btn_modify.setToolTip("Placeholder — mask editing coming later")
+        actions_layout.addWidget(self.btn_modify)
+        actions_layout.addStretch(1)
+        layout.addWidget(actions)
+
+        layout.addStretch(1)
+
+        self.cmb_w3_src.currentIndexChanged.connect(self._on_w3_src_changed)
+        self.cmb_w3_lut.currentIndexChanged.connect(self._refresh_w3_and_thumbs)
+        self.spin_w3_lo.valueChanged.connect(self._refresh_w3_and_thumbs)
+        self.spin_w3_hi.valueChanged.connect(self._refresh_w3_and_thumbs)
         return panel
 
     def _apply_saved_settings(self) -> None:
@@ -397,6 +435,14 @@ class MainWindow(QMainWindow):
                 idx = self.cmb_mov_lut.findText(str(lut))
                 if idx >= 0:
                     self.cmb_mov_lut.setCurrentIndex(idx)
+            if src := s.get("w3_src"):
+                idx = self.cmb_w3_src.findText(str(src))
+                if idx >= 0:
+                    self.cmb_w3_src.setCurrentIndex(idx)
+            if lut := s.get("w3_lut"):
+                idx = self.cmb_w3_lut.findText(str(lut))
+                if idx >= 0:
+                    self.cmb_w3_lut.setCurrentIndex(idx)
         finally:
             self._updating = False
 
@@ -406,6 +452,8 @@ class MainWindow(QMainWindow):
             "fov_lut": self.cmb_fov_lut.currentText(),
             "overlay_filter": self.cmb_overlay.currentData(),
             "mov_lut": self.cmb_mov_lut.currentText(),
+            "w3_src": self.cmb_w3_src.currentText(),
+            "w3_lut": self.cmb_w3_lut.currentText(),
         }
         if suite2p_dir is not None:
             updates["last_suite2p_dir"] = str(suite2p_dir)
@@ -452,17 +500,56 @@ class MainWindow(QMainWindow):
 
     def _init_display_levels(self) -> None:
         assert self.doc is not None
-        meta = self.doc["meta"]
-        img = meta.get("meanImg")
+        img = self._fov_source_image()
         if img is not None:
-            lo, hi = np.percentile(img, [1, 99])
-            self.spin_fov_lo.setValue(float(lo))
-            self.spin_fov_hi.setValue(float(hi))
+            self._set_levels_from_image(img, self.spin_fov_lo, self.spin_fov_hi)
         if self.stack is not None:
             sample = self.stack.read_frame(0)
-            lo, hi = np.percentile(sample, [1, 99])
-            self.spin_mov_lo.setValue(float(lo))
-            self.spin_mov_hi.setValue(float(hi))
+            self._set_levels_from_image(sample, self.spin_mov_lo, self.spin_mov_hi)
+        w3_img = self._w3_source_image(frame_index=0)
+        if w3_img is not None:
+            self._set_levels_from_image(w3_img, self.spin_w3_lo, self.spin_w3_hi)
+
+    def _set_levels_from_image(
+        self, img: np.ndarray, spin_lo: QDoubleSpinBox, spin_hi: QDoubleSpinBox
+    ) -> None:
+        """Set Lower/Upper spins from 1–99% of an image."""
+        flat = np.asarray(img, dtype=np.float64)
+        flat = flat[np.isfinite(flat)]
+        if flat.size == 0:
+            lo, hi = 0.0, 1.0
+        else:
+            lo, hi = np.percentile(flat, [1, 99])
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo = float(flat.min())
+                hi = float(flat.max())
+            if hi <= lo:
+                hi = lo + 1.0
+        spin_lo.blockSignals(True)
+        spin_hi.blockSignals(True)
+        spin_lo.setValue(float(lo))
+        spin_hi.setValue(float(hi))
+        spin_lo.blockSignals(False)
+        spin_hi.blockSignals(False)
+
+    def _set_fov_levels_from_image(self, img: np.ndarray) -> None:
+        self._set_levels_from_image(img, self.spin_fov_lo, self.spin_fov_hi)
+
+    def _on_fov_src_changed(self) -> None:
+        if self.doc is None:
+            return
+        img = self._fov_source_image()
+        if img is not None:
+            self._set_fov_levels_from_image(img)
+        self._refresh_fov()
+
+    def _on_w3_src_changed(self) -> None:
+        if self.doc is None:
+            return
+        img = self._w3_source_image()
+        if img is not None:
+            self._set_levels_from_image(img, self.spin_w3_lo, self.spin_w3_hi)
+        self._refresh_w3_and_thumbs()
 
     def _init_cursors(self) -> None:
         assert self.doc is not None
@@ -575,6 +662,34 @@ class MainWindow(QMainWindow):
             img = meta.get("meanImg")
         return None if img is None else np.asarray(img)
 
+    def _w3_source_image(self, frame_index: int | None = None) -> np.ndarray | None:
+        """Raw 2D image for W3 / thumbnail backdrop (before LUT)."""
+        if self.doc is None:
+            return None
+        key = self.cmb_w3_src.currentText()
+        meta = self.doc["meta"]
+        if key == "movie":
+            if self.stack is None:
+                return None
+            t = self._c0_frame_index() if frame_index is None else int(frame_index)
+            return self.stack.read_frame(t)
+        mapping = {
+            "meanImg": meta.get("meanImg"),
+            "meanImgE": meta.get("meanImgE"),
+            "VCorr": meta.get("VCorr"),
+        }
+        img = mapping.get(key)
+        if img is None:
+            img = meta.get("meanImg")
+        return None if img is None else np.asarray(img)
+
+    def _w3_rgb(self, frame_index: int | None = None) -> np.ndarray | None:
+        img = self._w3_source_image(frame_index=frame_index)
+        if img is None:
+            return None
+        lut = self._lut_cache[self.cmb_w3_lut.currentText()]
+        return apply_lut(img, lut, self.spin_w3_lo.value(), self.spin_w3_hi.value())
+
     @staticmethod
     def _set_display_rgb(view: pg.ImageView, rgb: np.ndarray) -> None:
         """Show pre-composited RGB uint8 without ImageView re-applying levels."""
@@ -608,6 +723,16 @@ class MainWindow(QMainWindow):
         n = int(self.doc["meta"]["nframes"])
         return int(np.clip(round(self.cursor_c0.value()), 0, max(n - 1, 0)))
 
+    def _zoom_geometry(self) -> tuple[int, int, int, dict[str, Any]]:
+        assert self.doc is not None
+        meta = self.doc["meta"]
+        Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
+        row = self._row()
+        y0, x0, side = zoom_square_window(
+            row["roi"]["ypix"], row["roi"]["xpix"], row["neuropil"]["ipix"], Ly, Lx
+        )
+        return y0, x0, side, row
+
     def _refresh_movie_views(self) -> None:
         if self.doc is None or self.stack is None:
             return
@@ -624,15 +749,31 @@ class MainWindow(QMainWindow):
         if y_out.size:
             w2[y_out, x_out] = (255, 0, 0)
         self._set_display_rgb(self.w2.image_view, w2)  # type: ignore[attr-defined]
+        self.w2.setTitle(f"Movie (W2) — frame {t}")  # type: ignore[attr-defined]
 
-        # W3 zoom at C0
-        y0, x0, side = zoom_square_window(
-            row["roi"]["ypix"], row["roi"]["xpix"], row["neuropil"]["ipix"], Ly, Lx
-        )
+        self._refresh_w3()
+
+    def _refresh_w3_and_thumbs(self) -> None:
+        self._refresh_w3()
+        self._debounce.start()
+
+    def _refresh_w3(self) -> None:
+        if self.doc is None:
+            return
+        meta = self.doc["meta"]
+        Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
+        t = self._c0_frame_index()
+        rgb = self._w3_rgb(frame_index=t if self.cmb_w3_src.currentText() == "movie" else None)
+        if rgb is None:
+            return
+        y0, x0, side, row = self._zoom_geometry()
         zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
         self._set_display_rgb(self.w3.image_view, zoom)  # type: ignore[attr-defined]
-        self.w2.setTitle(f"Movie (W2) — frame {t}")  # type: ignore[attr-defined]
-        self.w3.setTitle(f"ROI zoom (W3) — frame {t}")  # type: ignore[attr-defined]
+        src = self.cmb_w3_src.currentText()
+        title = f"ROI zoom (W3) — {src}"
+        if src == "movie":
+            title += f" frame {t}"
+        self.w3.setTitle(title)  # type: ignore[attr-defined]
 
     def _refresh_traces(self, autoscale: bool = False) -> None:
         if self.doc is None:
@@ -697,21 +838,23 @@ class MainWindow(QMainWindow):
             label.setPos(fi, val)
 
     def _update_thumbnails(self) -> None:
-        if self.doc is None or self.stack is None:
+        if self.doc is None:
             return
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
-        row = self._row()
-        y0, x0, side = zoom_square_window(
-            row["roi"]["ypix"], row["roi"]["xpix"], row["neuropil"]["ipix"], Ly, Lx
-        )
+        y0, x0, side, row = self._zoom_geometry()
         n = int(meta["nframes"])
+        src = self.cmb_w3_src.currentText()
         for i, (line, view, lab) in enumerate(
             zip(self.cursors, self.thumb_views, self.thumb_labels)
         ):
             fi = int(np.clip(round(line.value()), 0, max(n - 1, 0)))
-            frame = self.stack.read_frame(fi)
-            rgb = self._movie_rgb(frame)
+            rgb = self._w3_rgb(frame_index=fi if src == "movie" else None)
+            if rgb is None:
+                continue
             zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
             self._set_display_rgb(view, zoom)
-            lab.setText(f"C{i + 1} — frame {fi}")
+            if src == "movie":
+                lab.setText(f"C{i + 1} — frame {fi}")
+            else:
+                lab.setText(f"C{i + 1} — {src}")

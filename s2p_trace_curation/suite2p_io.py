@@ -184,3 +184,62 @@ def zoom_square_window(
     top = max(0, min(top, Ly - side))
     left = max(0, min(left, Lx - side))
     return top, left, side
+
+
+def embed_into_fov(
+    img: np.ndarray,
+    Ly: int,
+    Lx: int,
+    yrange: Any = None,
+    xrange: Any = None,
+) -> np.ndarray:
+    """
+    Place a possibly cropped suite2p map into a full (Ly, Lx) array.
+    Uses ops yrange/xrange when the crop matches; otherwise centers the crop.
+    """
+    img = np.asarray(img)
+    if img.ndim != 2:
+        raise ValueError(f"Expected 2D image, got shape {img.shape}")
+    if img.shape == (Ly, Lx):
+        return img.astype(np.float32, copy=False)
+
+    out = np.zeros((Ly, Lx), dtype=np.float32)
+    if yrange is not None and xrange is not None:
+        y0, y1 = int(yrange[0]), int(yrange[1])
+        x0, x1 = int(xrange[0]), int(xrange[1])
+        if img.shape == (y1 - y0, x1 - x0) and 0 <= y0 < y1 <= Ly and 0 <= x0 < x1 <= Lx:
+            out[y0:y1, x0:x1] = img.astype(np.float32, copy=False)
+            return out
+
+    if img.shape[0] <= Ly and img.shape[1] <= Lx:
+        y0 = (Ly - img.shape[0]) // 2
+        x0 = (Lx - img.shape[1]) // 2
+        out[y0 : y0 + img.shape[0], x0 : x0 + img.shape[1]] = img.astype(
+            np.float32, copy=False
+        )
+        return out
+
+    return np.asarray(img[:Ly, :Lx], dtype=np.float32)
+
+
+def fov_images_from_ops(ops: dict[str, Any]) -> dict[str, np.ndarray | None]:
+    """Extract meanImg / meanImgE / VCorr as full-FOV float32 arrays (or None)."""
+    Ly = int(ops["Ly"])
+    Lx = int(ops["Lx"])
+    yrange = ops.get("yrange")
+    xrange = ops.get("xrange")
+
+    meanImg = None
+    if ops.get("meanImg") is not None:
+        meanImg = embed_into_fov(np.asarray(ops["meanImg"]), Ly, Lx, yrange, xrange)
+
+    meanImgE = None
+    if ops.get("meanImgE") is not None:
+        meanImgE = embed_into_fov(np.asarray(ops["meanImgE"]), Ly, Lx, yrange, xrange)
+
+    vcorr_raw = ops.get("Vcorr", ops.get("VCorr"))
+    VCorr = None
+    if vcorr_raw is not None:
+        VCorr = embed_into_fov(np.asarray(vcorr_raw), Ly, Lx, yrange, xrange)
+
+    return {"meanImg": meanImg, "meanImgE": meanImgE, "VCorr": VCorr}
