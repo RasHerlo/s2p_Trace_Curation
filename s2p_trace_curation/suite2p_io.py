@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -109,7 +109,13 @@ class BinaryStack:
         return flat.reshape(self.Ly, self.Lx)
 
     def extract_roi_trace(
-        self, ypix: np.ndarray, xpix: np.ndarray, lam: np.ndarray
+        self,
+        ypix: np.ndarray,
+        xpix: np.ndarray,
+        lam: np.ndarray,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> np.ndarray:
         """Weighted mean fluorescence over frames (full pass — used after mask edits)."""
         ypix = np.asarray(ypix, dtype=np.int64)
@@ -120,20 +126,41 @@ class BinaryStack:
             return np.zeros(self.nframes, dtype=np.float64)
         out = np.empty(self.nframes, dtype=np.float64)
         for t in range(self.nframes):
+            if should_cancel is not None and should_cancel():
+                from s2p_trace_curation.mask_edit import ExtractCancelled
+
+                raise ExtractCancelled()
             frame = self.read_frame(t)
             out[t] = float((frame[ypix, xpix] * lam).sum() / wsum)
+            if progress is not None:
+                progress(t + 1, self.nframes)
         return out
 
-    def extract_neuropil_trace(self, ipix: np.ndarray) -> np.ndarray:
+    def extract_neuropil_trace(
+        self,
+        ipix: np.ndarray,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress_offset: int = 0,
+        progress_total: int | None = None,
+    ) -> np.ndarray:
         """Unweighted mean over neuropil pixels."""
         ipix = np.asarray(ipix, dtype=np.int64)
         if ipix.size == 0:
             return np.zeros(self.nframes, dtype=np.float64)
         y, x = np.unravel_index(ipix, (self.Ly, self.Lx))
         out = np.empty(self.nframes, dtype=np.float64)
+        total = self.nframes if progress_total is None else int(progress_total)
         for t in range(self.nframes):
+            if should_cancel is not None and should_cancel():
+                from s2p_trace_curation.mask_edit import ExtractCancelled
+
+                raise ExtractCancelled()
             frame = self.read_frame(t)
             out[t] = float(frame[y, x].mean())
+            if progress is not None:
+                progress(progress_offset + t + 1, total)
         return out
 
 

@@ -15,6 +15,7 @@ QAction = QtGui.QAction
 QKeySequence = QtGui.QKeySequence
 QAbstractSpinBox = QtWidgets.QAbstractSpinBox
 QApplication = QtWidgets.QApplication
+QButtonGroup = QtWidgets.QButtonGroup
 QCheckBox = QtWidgets.QCheckBox
 QComboBox = QtWidgets.QComboBox
 QDoubleSpinBox = QtWidgets.QDoubleSpinBox
@@ -26,7 +27,9 @@ QLabel = QtWidgets.QLabel
 QLineEdit = QtWidgets.QLineEdit
 QMainWindow = QtWidgets.QMainWindow
 QMessageBox = QtWidgets.QMessageBox
+QProgressBar = QtWidgets.QProgressBar
 QPushButton = QtWidgets.QPushButton
+QRadioButton = QtWidgets.QRadioButton
 QShortcut = QtWidgets.QShortcut
 QSpinBox = QtWidgets.QSpinBox
 QSplitter = QtWidgets.QSplitter
@@ -34,8 +37,11 @@ QStatusBar = QtWidgets.QStatusBar
 QVBoxLayout = QtWidgets.QVBoxLayout
 QWidget = QtWidgets.QWidget
 
+from copy import deepcopy
+
 from s2p_trace_curation.curation import (
     open_suite2p_session,
+    reextract_after_mask_edit,
     reset_roi_from_suite2p,
     save_curation,
     set_compensation_x,
@@ -48,6 +54,12 @@ from s2p_trace_curation.gui.overlays import (
     rois_at_pixel,
     thick_outline_mask,
     zoom_masks_rgba,
+)
+from s2p_trace_curation.mask_edit import (
+    MODE_LABELS,
+    ExtractCancelled,
+    MaskEditMode,
+    apply_brush,
 )
 from s2p_trace_curation.suite2p_io import BinaryStack, plane_dir, zoom_square_window
 from s2p_trace_curation.user_settings import (
@@ -90,6 +102,52 @@ class ClickableImageView(pg.ImageView):
         self._on_click(int(mouse.y()), int(mouse.x()))
 
 
+class PaintImageView(pg.ImageView):
+    """ImageView with optional left-drag paint callback in image row/col coords."""
+
+    def __init__(self, *args, on_paint=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_paint = on_paint
+        self.paint_enabled = False
+        self._painting = False
+        self.ui.roiBtn.hide()
+        self.ui.menuBtn.hide()
+        self.ui.graphicsView.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if (
+            not self.paint_enabled
+            or self._on_paint is None
+            or obj is not self.ui.graphicsView.viewport()
+        ):
+            return super().eventFilter(obj, event)
+
+        et = event.type()
+        if et == QtCore.QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._painting = True
+                self._emit_paint(event.pos())
+                return True
+        elif et == QtCore.QEvent.Type.MouseMove:
+            if self._painting and event.buttons() & Qt.MouseButton.LeftButton:
+                self._emit_paint(event.pos())
+                return True
+        elif et == QtCore.QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton and self._painting:
+                self._painting = False
+                return True
+        return super().eventFilter(obj, event)
+
+    def _emit_paint(self, viewport_pos) -> None:
+        assert self._on_paint is not None
+        scene_pos = self.ui.graphicsView.mapToScene(viewport_pos)
+        view = self.getView()
+        if not view.sceneBoundingRect().contains(scene_pos):
+            return
+        mouse = view.mapSceneToView(scene_pos)
+        self._on_paint(int(round(mouse.y())), int(round(mouse.x())))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -102,6 +160,18 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self.active_roi_id = 0
         self._updating = False
+
+        self._mask_edit_active = False
+        self._mask_edit_snapshot: dict[str, Any] | None = None
+        self._mask_edit_mode: MaskEditMode = "add_f"
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        self._extract_cancel = False
+        self._extracting = False
+        self._w3_y0 = 0
+        self._w3_x0 = 0
+        self._w3_side = 1
 
         self._lut_cache = {name: make_lut(name) for name in LUT_NAMES}
         self._debounce = QTimer(self)
@@ -152,12 +222,12 @@ class MainWindow(QMainWindow):
         return isinstance(w, (QAbstractSpinBox, QComboBox, QLineEdit))
 
     def _roi_step(self, delta: int) -> None:
-        if self.doc is None or self._focus_owns_arrows_or_space():
+        if self.doc is None or self._focus_owns_arrows_or_space() or self._mask_edit_active:
             return
         self.spin_roi.setValue(self.spin_roi.value() + delta)
 
     def _toggle_iscell_shortcut(self) -> None:
-        if self.doc is None or self._focus_owns_arrows_or_space():
+        if self.doc is None or self._focus_owns_arrows_or_space() or self._mask_edit_active:
             return
         # Checkbox already toggles on Space when focused; avoid a double toggle.
         if QApplication.focusWidget() is self.chk_iscell:
@@ -185,7 +255,7 @@ class MainWindow(QMainWindow):
 
         self.w1 = self._make_image_panel("FOV (W1)", clickable=True)
         self.w2 = self._make_image_panel("Movie (W2)")
-        self.w3 = self._make_image_panel("ROI zoom (W3)")
+        self.w3 = self._make_image_panel("ROI zoom (W3)", paintable=True)
         top_split.addWidget(self.w1)
         top_split.addWidget(self.w2)
         top_split.addWidget(self.w3)
@@ -279,10 +349,14 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(self._build_right_panel(), stretch=0)
 
-    def _make_image_panel(self, title: str, clickable: bool = False) -> QWidget:
+    def _make_image_panel(
+        self, title: str, clickable: bool = False, paintable: bool = False
+    ) -> QWidget:
         box = QGroupBox(title)
         layout = QVBoxLayout(box)
-        if clickable:
+        if paintable:
+            view = PaintImageView(on_paint=self._on_w3_paint)
+        elif clickable:
             view = ClickableImageView(on_click=self._on_fov_click)
         else:
             view = pg.ImageView()
@@ -400,14 +474,69 @@ class MainWindow(QMainWindow):
 
         actions = QGroupBox("Mask tools")
         actions_layout = QVBoxLayout(actions)
-        self.btn_modify = QPushButton("Modify mask")
+        self.btn_modify = QPushButton("Modify Mask")
         self.btn_modify.setEnabled(False)
-        self.btn_modify.setToolTip("Placeholder — mask editing coming later")
+        self.btn_modify.setToolTip("Edit F / Fneu pixels in W3")
+        self.btn_modify.clicked.connect(self._start_mask_edit)
         actions_layout.addWidget(self.btn_modify)
+
+        self.mask_edit_panel = QWidget()
+        edit_layout = QVBoxLayout(self.mask_edit_panel)
+        edit_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.mask_mode_group = QButtonGroup(self)
+        self.mask_mode_buttons: dict[MaskEditMode, QRadioButton] = {}
+        for i, (mode, label) in enumerate(MODE_LABELS.items()):
+            rb = QRadioButton(label)
+            self.mask_mode_group.addButton(rb, i)
+            self.mask_mode_buttons[mode] = rb
+            edit_layout.addWidget(rb)
+            rb.toggled.connect(self._on_mask_mode_toggled)
+        self.mask_mode_buttons["add_f"].setChecked(True)
+
+        brush_row = QFormLayout()
+        self.spin_brush = QSpinBox()
+        self.spin_brush.setRange(0, 30)
+        self.spin_brush.setValue(2)
+        self.spin_brush.setToolTip("Brush radius in pixels (0 = single pixel)")
+        brush_row.addRow("Brush radius", self.spin_brush)
+        edit_layout.addLayout(brush_row)
+
+        self.btn_recalc = QPushButton("Re-calculate Traces")
+        self.btn_recalc.clicked.connect(self._recalculate_traces)
+        edit_layout.addWidget(self.btn_recalc)
+
+        self.extract_progress = QProgressBar()
+        self.extract_progress.setRange(0, 100)
+        self.extract_progress.setValue(0)
+        self.extract_progress.setVisible(False)
+        edit_layout.addWidget(self.extract_progress)
+
+        self.btn_cancel_job = QPushButton("Cancel job")
+        self.btn_cancel_job.setEnabled(False)
+        self.btn_cancel_job.clicked.connect(self._cancel_extract_job)
+        edit_layout.addWidget(self.btn_cancel_job)
+
+        self.btn_apply_mask = QPushButton("Apply Mask")
+        self.btn_apply_mask.clicked.connect(self._apply_mask_edit)
+        edit_layout.addWidget(self.btn_apply_mask)
+
+        self.btn_cancel_mask = QPushButton("Cancel")
+        self.btn_cancel_mask.clicked.connect(self._cancel_mask_edit)
+        edit_layout.addWidget(self.btn_cancel_mask)
+
+        self.mask_edit_panel.setVisible(False)
+        actions_layout.addWidget(self.mask_edit_panel)
         actions_layout.addStretch(1)
         layout.addWidget(actions)
 
         layout.addStretch(1)
+
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setEnabled(False)
+        self.btn_save.setToolTip("Save trc_curation.pkl (Ctrl+S)")
+        self.btn_save.clicked.connect(self.save_session)
+        layout.addWidget(self.btn_save)
 
         self.cmb_w3_src.currentIndexChanged.connect(self._on_w3_src_changed)
         self.cmb_w3_lut.currentIndexChanged.connect(self._refresh_w3_and_thumbs)
@@ -473,6 +602,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open failed", str(exc))
 
     def _load_suite2p(self, path: Path) -> None:
+        if self._mask_edit_active:
+            self._cancel_mask_edit()
         if self.stack is not None:
             self.stack.close()
             self.stack = None
@@ -491,6 +622,8 @@ class MainWindow(QMainWindow):
         self._updating = False
         self._select_roi(0, force=True)
         self._persist_ui_settings(suite2p_dir=suite2p_dir)
+        self.btn_modify.setEnabled(True)
+        self.btn_save.setEnabled(True)
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -562,15 +695,30 @@ class MainWindow(QMainWindow):
         self._sync_cursor_clones()
         self._updating = False
 
-    def save_session(self) -> None:
+    def save_session(self) -> bool:
         if self.doc is None or self.suite2p_dir is None:
-            return
+            return False
+        if self._mask_edit_active:
+            QMessageBox.information(
+                self,
+                "Mask edit active",
+                "Finish with Apply Mask or Cancel before saving.",
+            )
+            return False
         path = save_curation(self.doc, self.suite2p_dir)
         self.dirty = False
         self.statusBar().showMessage(f"Saved {path}")
+        return True
 
     def reset_current_roi(self) -> None:
         if self.doc is None or self.suite2p_dir is None:
+            return
+        if self._mask_edit_active:
+            QMessageBox.information(
+                self,
+                "Mask edit active",
+                "Finish with Apply Mask or Cancel before resetting the ROI.",
+            )
             return
         reset_roi_from_suite2p(self.doc, self.suite2p_dir, self.active_roi_id)
         self.dirty = True
@@ -578,10 +726,224 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Reset ROI {self.active_roi_id} from suite2p")
 
     def closeEvent(self, event) -> None:
+        if self._mask_edit_active:
+            reply = QMessageBox.question(
+                self,
+                "Mask edit in progress",
+                "A mask edit is still open. Cancel the edit and continue closing?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._cancel_mask_edit()
+
+        if self.dirty:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Unsaved changes")
+            box.setText("You have unsaved changes to trc_curation.pkl.")
+            box.setInformativeText("Save before closing?")
+            btn_save = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+            btn_discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(btn_save)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel:
+                event.ignore()
+                return
+            if clicked is btn_save:
+                if not self.save_session():
+                    event.ignore()
+                    return
+
         self._persist_ui_settings(suite2p_dir=self.suite2p_dir)
         if self.stack is not None:
             self.stack.close()
         super().closeEvent(event)
+
+    # ----------------------------------------------------------- mask edit
+    def _set_mask_edit_ui(self, active: bool) -> None:
+        self._mask_edit_active = active
+        self.mask_edit_panel.setVisible(active)
+        self.btn_modify.setEnabled(not active and self.doc is not None)
+        view: PaintImageView = self.w3.image_view  # type: ignore[attr-defined]
+        view.paint_enabled = active
+        # Freeze ROI controls while editing
+        self.spin_roi.setEnabled(not active)
+        self.btn_roi_up.setEnabled(not active)
+        self.btn_roi_down.setEnabled(not active)
+        self.chk_iscell.setEnabled(not active)
+
+    def _on_mask_mode_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        for mode, rb in self.mask_mode_buttons.items():
+            if rb.isChecked():
+                self._mask_edit_mode = mode
+                break
+
+    def _start_mask_edit(self) -> None:
+        if self.doc is None or self._mask_edit_active:
+            return
+        self._mask_edit_snapshot = deepcopy(self._row())
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        self._set_mask_edit_ui(True)
+        self.statusBar().showMessage(
+            f"Modify Mask: ROI {self.active_roi_id} — paint in W3, then Apply or Cancel"
+        )
+
+    def _cancel_mask_edit(self) -> None:
+        if not self._mask_edit_active:
+            return
+        if self._extracting:
+            self._extract_cancel = True
+            return
+        if self._mask_edit_snapshot is not None and self.doc is not None:
+            snap = self._mask_edit_snapshot
+            for i, r in enumerate(self.doc["rois"]):
+                if int(r["roi_id"]) == int(self.active_roi_id):
+                    self.doc["rois"][i] = snap
+                    break
+        self._mask_edit_snapshot = None
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        self._set_mask_edit_ui(False)
+        self._refresh_all()
+        self.statusBar().showMessage("Mask edit cancelled — previous masks/traces restored")
+
+    def _apply_mask_edit(self) -> None:
+        if not self._mask_edit_active or self.doc is None or self.suite2p_dir is None:
+            return
+        if self._extracting:
+            return
+        if self._mask_traces_stale:
+            ok = self._recalculate_traces()
+            if not ok:
+                return
+        path = save_curation(self.doc, self.suite2p_dir)
+        self.dirty = False
+        self._mask_edit_snapshot = None
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        self._set_mask_edit_ui(False)
+        self._refresh_all()
+        self.statusBar().showMessage(f"Applied mask edits and saved {path}")
+
+    def _cancel_extract_job(self) -> None:
+        if self._extracting:
+            self._extract_cancel = True
+
+    def _recalculate_traces(self) -> bool:
+        if self.doc is None or self.suite2p_dir is None:
+            return False
+        if not self._mask_roi_changed and not self._mask_neu_changed and not self._mask_traces_stale:
+            self.statusBar().showMessage("Traces already up to date")
+            return True
+        if self._extracting:
+            return False
+        roi_changed = bool(self._mask_roi_changed)
+        neu_changed = bool(self._mask_neu_changed)
+        if self._mask_traces_stale and not roi_changed and not neu_changed:
+            roi_changed = True
+            neu_changed = True
+
+        self._extracting = True
+        self._extract_cancel = False
+        self.extract_progress.setVisible(True)
+        self.extract_progress.setValue(0)
+        self.btn_cancel_job.setEnabled(True)
+        self.btn_recalc.setEnabled(False)
+        self.btn_apply_mask.setEnabled(False)
+        self.btn_cancel_mask.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            def _progress(step: int, total: int) -> None:
+                pct = int(100 * step / max(total, 1))
+                self.extract_progress.setValue(pct)
+                if step == 1 or step == total or step % 25 == 0:
+                    QApplication.processEvents()
+
+            reextract_after_mask_edit(
+                self._row(),
+                self.suite2p_dir,
+                roi_changed=roi_changed,
+                neuropil_changed=neu_changed,
+                progress=_progress,
+                should_cancel=lambda: self._extract_cancel,
+            )
+            self._mask_traces_stale = False
+            self._mask_roi_changed = False
+            self._mask_neu_changed = False
+            self.dirty = True
+            self._refresh_traces(autoscale=True)
+            self.extract_progress.setValue(100)
+            self.statusBar().showMessage("Traces re-calculated from data.bin")
+            return True
+        except ExtractCancelled:
+            self.statusBar().showMessage("Trace re-calculation cancelled")
+            return False
+        except Exception as exc:
+            QMessageBox.critical(self, "Re-calculate failed", str(exc))
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._extracting = False
+            self._extract_cancel = False
+            self.btn_cancel_job.setEnabled(False)
+            self.btn_recalc.setEnabled(True)
+            self.btn_apply_mask.setEnabled(True)
+            self.btn_cancel_mask.setEnabled(True)
+            self.extract_progress.setVisible(False)
+
+    def _on_w3_paint(self, y_img: int, x_img: int) -> None:
+        if (
+            not self._mask_edit_active
+            or self._extracting
+            or self.doc is None
+        ):
+            return
+        Ly = int(self.doc["meta"]["Ly"])
+        Lx = int(self.doc["meta"]["Lx"])
+        if y_img < 0 or x_img < 0 or y_img >= self._w3_side or x_img >= self._w3_side:
+            return
+        cy = self._w3_y0 + y_img
+        cx = self._w3_x0 + x_img
+        if cy < 0 or cx < 0 or cy >= Ly or cx >= Lx:
+            return
+        changed, msg = apply_brush(
+            self._row(),
+            self._mask_edit_mode,
+            cy,
+            cx,
+            int(self.spin_brush.value()),
+            Ly,
+            Lx,
+        )
+        if not changed:
+            if msg:
+                self.statusBar().showMessage(msg)
+            return
+        if self._mask_edit_mode in ("add_f", "remove_f"):
+            self._mask_roi_changed = True
+        if self._mask_edit_mode in ("add_fneu", "remove_fneu"):
+            self._mask_neu_changed = True
+        # Stealing between masks dirties both
+        if self._mask_edit_mode in ("add_f", "add_fneu"):
+            self._mask_roi_changed = True
+            self._mask_neu_changed = True
+        self._mask_traces_stale = True
+        self.dirty = True
+        self._refresh_fov()
+        self._refresh_movie_views()
+        if msg:
+            self.statusBar().showMessage(msg)
 
     # --------------------------------------------------------------- ROI sel
     def _row(self, roi_id: int | None = None) -> dict[str, Any]:
@@ -596,12 +958,14 @@ class MainWindow(QMainWindow):
         return self.cmb_overlay.currentData()  # type: ignore[return-value]
 
     def _on_roi_spin(self, value: int) -> None:
-        if self._updating or self.doc is None:
+        if self._updating or self.doc is None or self._mask_edit_active:
             return
         self._select_roi(value)
 
     def _select_roi(self, roi_id: int, force: bool = False) -> None:
         if self.doc is None:
+            return
+        if self._mask_edit_active and not force:
             return
         if not force and roi_id == self.active_roi_id and not self._updating:
             # still refresh when forced internals call
@@ -616,7 +980,7 @@ class MainWindow(QMainWindow):
         self._refresh_all()
 
     def _on_fov_click(self, y: int, x: int) -> None:
-        if self.doc is None:
+        if self.doc is None or self._mask_edit_active:
             return
         Ly = int(self.doc["meta"]["Ly"])
         Lx = int(self.doc["meta"]["Lx"])
@@ -627,7 +991,7 @@ class MainWindow(QMainWindow):
             self._select_roi(int(hits[0]["roi_id"]))
 
     def _on_iscell_toggled(self, checked: bool) -> None:
-        if self._updating or self.doc is None:
+        if self._updating or self.doc is None or self._mask_edit_active:
             return
         self._row()["iscell"] = bool(checked)
         self.dirty = True
@@ -767,12 +1131,15 @@ class MainWindow(QMainWindow):
         if rgb is None:
             return
         y0, x0, side, row = self._zoom_geometry()
+        self._w3_y0, self._w3_x0, self._w3_side = y0, x0, side
         zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
         self._set_display_rgb(self.w3.image_view, zoom)  # type: ignore[attr-defined]
         src = self.cmb_w3_src.currentText()
         title = f"ROI zoom (W3) — {src}"
         if src == "movie":
             title += f" frame {t}"
+        if self._mask_edit_active:
+            title += " [editing]"
         self.w3.setTitle(title)  # type: ignore[attr-defined]
 
     def _refresh_traces(self, autoscale: bool = False) -> None:

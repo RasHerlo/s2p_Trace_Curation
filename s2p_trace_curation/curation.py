@@ -219,17 +219,42 @@ def set_compensation_x(row: dict[str, Any], x: float) -> None:
 
 
 def reextract_after_mask_edit(
-    row: dict[str, Any], suite2p_dir: Path, *, roi_changed: bool, neuropil_changed: bool
+    row: dict[str, Any],
+    suite2p_dir: Path,
+    *,
+    roi_changed: bool,
+    neuropil_changed: bool,
+    progress: Any = None,
+    should_cancel: Any = None,
 ) -> None:
     """Recompute F and/or Fneu from data.bin after mask edits; refresh trace_comp."""
     plane = plane_dir(resolve_suite2p_dir(suite2p_dir))
+    n_passes = int(roi_changed) + int(neuropil_changed)
     with BinaryStack(plane) as stack:
+        total = stack.nframes * max(n_passes, 1)
+        done = 0
+
+        def _progress(step: int, _total: int) -> None:
+            if progress is not None:
+                progress(step, total)
+
         if roi_changed:
             row["roi"]["F"] = stack.extract_roi_trace(
-                row["roi"]["ypix"], row["roi"]["xpix"], row["roi"]["lam"]
+                row["roi"]["ypix"],
+                row["roi"]["xpix"],
+                row["roi"]["lam"],
+                progress=_progress if progress else None,
+                should_cancel=should_cancel,
             )
             row["roi"]["modified"] = True
+            done = stack.nframes
         if neuropil_changed:
-            row["neuropil"]["Fneu"] = stack.extract_neuropil_trace(row["neuropil"]["ipix"])
+            row["neuropil"]["Fneu"] = stack.extract_neuropil_trace(
+                row["neuropil"]["ipix"],
+                progress=_progress if progress else None,
+                should_cancel=should_cancel,
+                progress_offset=done,
+                progress_total=total,
+            )
             row["neuropil"]["modified"] = True
     set_compensation_x(row, float(row["compensation"]["x"]))
