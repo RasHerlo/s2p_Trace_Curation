@@ -12,6 +12,9 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 Qt = QtCore.Qt
 QTimer = QtCore.QTimer
 QAction = QtGui.QAction
+QKeySequence = QtGui.QKeySequence
+QAbstractSpinBox = QtWidgets.QAbstractSpinBox
+QApplication = QtWidgets.QApplication
 QCheckBox = QtWidgets.QCheckBox
 QComboBox = QtWidgets.QComboBox
 QDoubleSpinBox = QtWidgets.QDoubleSpinBox
@@ -20,9 +23,11 @@ QFormLayout = QtWidgets.QFormLayout
 QGroupBox = QtWidgets.QGroupBox
 QHBoxLayout = QtWidgets.QHBoxLayout
 QLabel = QtWidgets.QLabel
+QLineEdit = QtWidgets.QLineEdit
 QMainWindow = QtWidgets.QMainWindow
 QMessageBox = QtWidgets.QMessageBox
 QPushButton = QtWidgets.QPushButton
+QShortcut = QtWidgets.QShortcut
 QSpinBox = QtWidgets.QSpinBox
 QSplitter = QtWidgets.QSplitter
 QStatusBar = QtWidgets.QStatusBar
@@ -106,6 +111,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+        self._build_shortcuts()
         self._apply_saved_settings()
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Open a suite2p folder to begin.")
@@ -130,6 +136,33 @@ class MainWindow(QMainWindow):
         act_quit = QAction("Quit", self)
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
+
+    def _build_shortcuts(self) -> None:
+        sc_up = QShortcut(QKeySequence(Qt.Key.Key_Up), self)
+        sc_down = QShortcut(QKeySequence(Qt.Key.Key_Down), self)
+        sc_space = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        for sc in (sc_up, sc_down, sc_space):
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_up.activated.connect(lambda: self._roi_step(+1))
+        sc_down.activated.connect(lambda: self._roi_step(-1))
+        sc_space.activated.connect(self._toggle_iscell_shortcut)
+
+    def _focus_owns_arrows_or_space(self) -> bool:
+        w = QApplication.focusWidget()
+        return isinstance(w, (QAbstractSpinBox, QComboBox, QLineEdit))
+
+    def _roi_step(self, delta: int) -> None:
+        if self.doc is None or self._focus_owns_arrows_or_space():
+            return
+        self.spin_roi.setValue(self.spin_roi.value() + delta)
+
+    def _toggle_iscell_shortcut(self) -> None:
+        if self.doc is None or self._focus_owns_arrows_or_space():
+            return
+        # Checkbox already toggles on Space when focused; avoid a double toggle.
+        if QApplication.focusWidget() is self.chk_iscell:
+            return
+        self.chk_iscell.toggle()
 
     def _build_ui(self) -> None:
         root = QWidget()
