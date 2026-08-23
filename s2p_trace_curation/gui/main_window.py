@@ -31,6 +31,7 @@ QProgressBar = QtWidgets.QProgressBar
 QPushButton = QtWidgets.QPushButton
 QRadioButton = QtWidgets.QRadioButton
 QShortcut = QtWidgets.QShortcut
+QSlider = QtWidgets.QSlider
 QSpinBox = QtWidgets.QSpinBox
 QSplitter = QtWidgets.QSplitter
 QStatusBar = QtWidgets.QStatusBar
@@ -39,7 +40,11 @@ QWidget = QtWidgets.QWidget
 
 from copy import deepcopy
 
+from s2p_trace_curation.batch_select import mean_traces_for_rois, rois_in_lasso
 from s2p_trace_curation.curation import (
+    append_roi,
+    empty_roi_draft,
+    next_roi_id,
     open_suite2p_session,
     reextract_after_mask_edit,
     reset_roi_from_suite2p,
@@ -61,7 +66,13 @@ from s2p_trace_curation.mask_edit import (
     MaskEditMode,
     apply_brush,
 )
-from s2p_trace_curation.suite2p_io import BinaryStack, plane_dir, zoom_square_window
+from s2p_trace_curation.suite2p_io import (
+    BinaryStack,
+    median_zoom_side,
+    plane_dir,
+    zoom_square_at,
+    zoom_square_window,
+)
 from s2p_trace_curation.user_settings import (
     last_open_start_dir,
     load_settings,
@@ -82,16 +93,77 @@ C0_COLOR = "#ffff66"  # solid movie cursor
 
 
 class ClickableImageView(pg.ImageView):
-    """ImageView that reports left-clicks in image row/col coordinates."""
+    """ImageView: left-click select and/or freehand lasso drawing."""
 
-    def __init__(self, *args, on_click=None, **kwargs):
+    def __init__(self, *args, on_click=None, on_lasso=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._on_click = on_click
+        self._on_lasso = on_lasso
+        self.lasso_enabled = False
+        self._lasso_drawing = False
+        self._lasso_points: list[tuple[float, float]] = []
         self.ui.roiBtn.hide()
         self.ui.menuBtn.hide()
         self.getView().scene().sigMouseClicked.connect(self._scene_clicked)
+        self.ui.graphicsView.viewport().installEventFilter(self)
+        self._lasso_curve = pg.PlotDataItem(
+            pen=pg.mkPen("#ffff00", width=2), connect="all"
+        )
+        self.getView().addItem(self._lasso_curve)
+
+    def clear_lasso_drawing(self) -> None:
+        self._lasso_points = []
+        self._lasso_curve.setData([], [])
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if (
+            not self.lasso_enabled
+            or self._on_lasso is None
+            or obj is not self.ui.graphicsView.viewport()
+        ):
+            return super().eventFilter(obj, event)
+
+        et = event.type()
+        if et == QtCore.QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._lasso_drawing = True
+                self._lasso_points = []
+                self._append_lasso_pos(event.pos())
+                return True
+        elif et == QtCore.QEvent.Type.MouseMove:
+            if self._lasso_drawing and event.buttons() & Qt.MouseButton.LeftButton:
+                self._append_lasso_pos(event.pos())
+                return True
+        elif et == QtCore.QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton and self._lasso_drawing:
+                self._lasso_drawing = False
+                self._append_lasso_pos(event.pos())
+                pts = list(self._lasso_points)
+                if len(pts) >= 3:
+                    self._on_lasso(pts)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _append_lasso_pos(self, viewport_pos) -> None:
+        scene_pos = self.ui.graphicsView.mapToScene(viewport_pos)
+        view = self.getView()
+        if not view.sceneBoundingRect().contains(scene_pos):
+            return
+        mouse = view.mapSceneToView(scene_pos)
+        # Image coords: y=row, x=col
+        pt = (float(mouse.y()), float(mouse.x()))
+        if self._lasso_points:
+            prev = self._lasso_points[-1]
+            if (prev[0] - pt[0]) ** 2 + (prev[1] - pt[1]) ** 2 < 0.25:
+                return
+        self._lasso_points.append(pt)
+        ys = [p[0] for p in self._lasso_points]
+        xs = [p[1] for p in self._lasso_points]
+        self._lasso_curve.setData(xs, ys)
 
     def _scene_clicked(self, event) -> None:
+        if self.lasso_enabled:
+            return
         if self._on_click is None or event.button() != Qt.MouseButton.LeftButton:
             return
         pos = event.scenePos()
@@ -103,11 +175,12 @@ class ClickableImageView(pg.ImageView):
 
 
 class PaintImageView(pg.ImageView):
-    """ImageView with optional left-drag paint callback in image row/col coords."""
+    """ImageView with optional left-drag paint and wheel zoom callbacks."""
 
-    def __init__(self, *args, on_paint=None, **kwargs):
+    def __init__(self, *args, on_paint=None, on_wheel=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._on_paint = on_paint
+        self._on_wheel = on_wheel
         self.paint_enabled = False
         self._painting = False
         self.ui.roiBtn.hide()
@@ -115,14 +188,19 @@ class PaintImageView(pg.ImageView):
         self.ui.graphicsView.viewport().installEventFilter(self)
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
-        if (
-            not self.paint_enabled
-            or self._on_paint is None
-            or obj is not self.ui.graphicsView.viewport()
-        ):
+        if obj is not self.ui.graphicsView.viewport():
             return super().eventFilter(obj, event)
 
         et = event.type()
+        if et == QtCore.QEvent.Type.Wheel and self._on_wheel is not None:
+            delta = event.angleDelta().y()
+            if delta != 0:
+                self._on_wheel(1 if delta > 0 else -1)
+                return True
+
+        if not self.paint_enabled or self._on_paint is None:
+            return super().eventFilter(obj, event)
+
         if et == QtCore.QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._painting = True
@@ -160,8 +238,14 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self.active_roi_id = 0
         self._updating = False
+        self._batch_mode = False
+        self._batch_roi_ids: list[int] = []
 
         self._mask_edit_active = False
+        self._mask_edit_kind: str | None = None  # "modify" | "add"
+        self._add_mask_draft: dict[str, Any] | None = None
+        self._add_mask_center: tuple[float, float] | None = None
+        self._add_mask_side = 64
         self._mask_edit_snapshot: dict[str, Any] | None = None
         self._mask_edit_mode: MaskEditMode = "add_f"
         self._mask_traces_stale = False
@@ -226,7 +310,12 @@ class MainWindow(QMainWindow):
         return isinstance(w, (QAbstractSpinBox, QComboBox, QLineEdit))
 
     def _roi_step(self, delta: int) -> None:
-        if self.doc is None or self._focus_owns_arrows_or_space() or self._mask_edit_active:
+        if (
+            self.doc is None
+            or self._focus_owns_arrows_or_space()
+            or self._mask_edit_active
+            or self._batch_mode
+        ):
             return
         self.spin_roi.setValue(self.spin_roi.value() + delta)
 
@@ -359,9 +448,13 @@ class MainWindow(QMainWindow):
         box = QGroupBox(title)
         layout = QVBoxLayout(box)
         if paintable:
-            view = PaintImageView(on_paint=self._on_w3_paint)
+            view = PaintImageView(
+                on_paint=self._on_w3_paint, on_wheel=self._on_w3_wheel
+            )
         elif clickable:
-            view = ClickableImageView(on_click=self._on_fov_click)
+            view = ClickableImageView(
+                on_click=self._on_fov_click, on_lasso=self._on_fov_lasso
+            )
         else:
             view = pg.ImageView()
             view.ui.roiBtn.hide()
@@ -426,12 +519,27 @@ class MainWindow(QMainWindow):
         roi_nav.addWidget(self.btn_roi_up)
         roi_nav.addWidget(self.btn_roi_down)
         self.chk_iscell = QCheckBox("iscell")
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Single"))
+        self.slider_mode = QSlider(Qt.Orientation.Horizontal)
+        self.slider_mode.setMinimum(0)
+        self.slider_mode.setMaximum(1)
+        self.slider_mode.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider_mode.setTickInterval(1)
+        self.slider_mode.setSingleStep(1)
+        self.slider_mode.setPageStep(1)
+        self.slider_mode.setFixedWidth(80)
+        self.slider_mode.setToolTip("Single ROI mode ↔ Batch lasso mode")
+        mode_row.addWidget(self.slider_mode)
+        mode_row.addWidget(QLabel("Batch"))
+        mode_row.addStretch(1)
         self.spin_x = QDoubleSpinBox()
         self.spin_x.setRange(-5.0, 5.0)
         self.spin_x.setSingleStep(0.05)
         self.spin_x.setDecimals(3)
         self.spin_x.setValue(1.0)
         roi_form.addRow("ROI #", roi_nav)
+        roi_form.addRow("Mode", mode_row)
         roi_form.addRow(self.chk_iscell)
         roi_form.addRow("x (F−x·Fneu)", self.spin_x)
         layout.addWidget(roi)
@@ -451,6 +559,7 @@ class MainWindow(QMainWindow):
         self.btn_roi_down.clicked.connect(lambda: self.spin_roi.setValue(self.spin_roi.value() - 1))
         self.chk_iscell.toggled.connect(self._on_iscell_toggled)
         self.spin_x.valueChanged.connect(self._on_x_changed)
+        self.slider_mode.valueChanged.connect(self._on_mode_slider)
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -484,6 +593,12 @@ class MainWindow(QMainWindow):
         self.btn_modify.clicked.connect(self._start_mask_edit)
         actions_layout.addWidget(self.btn_modify)
 
+        self.btn_add_mask = QPushButton("Add Mask")
+        self.btn_add_mask.setEnabled(False)
+        self.btn_add_mask.setToolTip("Create a new ROI: pick center on W1, paint in W3")
+        self.btn_add_mask.clicked.connect(self._start_add_mask)
+        actions_layout.addWidget(self.btn_add_mask)
+
         self.mask_edit_panel = QWidget()
         edit_layout = QVBoxLayout(self.mask_edit_panel)
         edit_layout.setContentsMargins(0, 0, 0, 0)
@@ -506,6 +621,34 @@ class MainWindow(QMainWindow):
         brush_row.addRow("Brush radius", self.spin_brush)
         edit_layout.addLayout(brush_row)
 
+        zoom_row = QHBoxLayout()
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setFixedWidth(32)
+        self.btn_zoom_out.setToolTip("Zoom out (larger W3 crop)")
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedWidth(32)
+        self.btn_zoom_in.setToolTip("Zoom in (smaller W3 crop)")
+        self.spin_add_side = QSpinBox()
+        self.spin_add_side.setRange(8, 2048)
+        self.spin_add_side.setValue(64)
+        self.spin_add_side.setToolTip("W3 square side (pixels); wheel also zooms")
+        self.lbl_zoom_side = QLabel("Zoom side")
+        zoom_row.addWidget(self.lbl_zoom_side)
+        zoom_row.addWidget(self.btn_zoom_out)
+        zoom_row.addWidget(self.spin_add_side)
+        zoom_row.addWidget(self.btn_zoom_in)
+        edit_layout.addLayout(zoom_row)
+        self.btn_zoom_out.clicked.connect(lambda: self._nudge_add_zoom(+8))
+        self.btn_zoom_in.clicked.connect(lambda: self._nudge_add_zoom(-8))
+        self.spin_add_side.valueChanged.connect(self._on_add_side_changed)
+        for w in (
+            self.lbl_zoom_side,
+            self.spin_add_side,
+            self.btn_zoom_in,
+            self.btn_zoom_out,
+        ):
+            w.setVisible(False)
+
         self.btn_recalc = QPushButton("Re-calculate Traces")
         self.btn_recalc.clicked.connect(self._recalculate_traces)
         edit_layout.addWidget(self.btn_recalc)
@@ -522,7 +665,7 @@ class MainWindow(QMainWindow):
         edit_layout.addWidget(self.btn_cancel_job)
 
         self.btn_apply_mask = QPushButton("Apply Mask")
-        self.btn_apply_mask.clicked.connect(self._apply_mask_edit)
+        self.btn_apply_mask.clicked.connect(self._finish_mask_edit)
         edit_layout.addWidget(self.btn_apply_mask)
 
         self.btn_cancel_mask = QPushButton("Cancel")
@@ -643,7 +786,17 @@ class MainWindow(QMainWindow):
         self._select_roi(0, force=True)
         self._persist_ui_settings(suite2p_dir=suite2p_dir)
         self.btn_modify.setEnabled(True)
+        self.btn_add_mask.setEnabled(True)
         self.btn_save.setEnabled(True)
+        self._batch_mode = False
+        self._batch_roi_ids = []
+        self._updating = True
+        self.slider_mode.setValue(0)
+        self._updating = False
+        w1: ClickableImageView = self.w1.image_view  # type: ignore[attr-defined]
+        w1.lasso_enabled = False
+        w1.clear_lasso_drawing()
+        self._apply_mode_controls()
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -722,7 +875,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Mask edit active",
-                "Finish with Apply Mask or Cancel before saving.",
+                "Finish with Apply/Save Mask or Cancel before saving.",
             )
             return False
         path = save_curation(self.doc, self.suite2p_dir)
@@ -737,7 +890,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Mask edit active",
-                "Finish with Apply Mask or Cancel before resetting the ROI.",
+                "Finish with Apply/Save Mask or Cancel before resetting the ROI.",
             )
             return
         reset_roi_from_suite2p(self.doc, self.suite2p_dir, self.active_roi_id)
@@ -788,14 +941,34 @@ class MainWindow(QMainWindow):
     def _set_mask_edit_ui(self, active: bool) -> None:
         self._mask_edit_active = active
         self.mask_edit_panel.setVisible(active)
-        self.btn_modify.setEnabled(not active and self.doc is not None)
+        can_start = not active and self.doc is not None and not self._batch_mode
+        self.btn_modify.setEnabled(can_start)
+        self.btn_add_mask.setEnabled(can_start)
         view: PaintImageView = self.w3.image_view  # type: ignore[attr-defined]
-        view.paint_enabled = active
-        # Freeze ROI controls while editing
-        self.spin_roi.setEnabled(not active)
-        self.btn_roi_up.setEnabled(not active)
-        self.btn_roi_down.setEnabled(not active)
-        self.chk_iscell.setEnabled(not active)
+        paint_ok = active and (
+            self._mask_edit_kind == "modify"
+            or (self._mask_edit_kind == "add" and self._add_mask_center is not None)
+        )
+        view.paint_enabled = paint_ok
+        single_ok = not active and not self._batch_mode
+        self.spin_roi.setEnabled(single_ok)
+        self.btn_roi_up.setEnabled(single_ok)
+        self.btn_roi_down.setEnabled(single_ok)
+        self.chk_iscell.setEnabled(not active and not self._batch_mode)
+        self.spin_x.setEnabled(single_ok)
+        self.slider_mode.setEnabled(not active and self.doc is not None)
+        is_add = self._mask_edit_kind == "add"
+        for w in (
+            self.lbl_zoom_side,
+            self.spin_add_side,
+            self.btn_zoom_in,
+            self.btn_zoom_out,
+        ):
+            w.setVisible(bool(active and is_add))
+        if active and is_add:
+            self.btn_apply_mask.setText("Save Mask")
+        else:
+            self.btn_apply_mask.setText("Apply Mask")
 
     def _on_mask_mode_toggled(self, checked: bool) -> None:
         if not checked:
@@ -806,8 +979,11 @@ class MainWindow(QMainWindow):
                 break
 
     def _start_mask_edit(self) -> None:
-        if self.doc is None or self._mask_edit_active:
+        if self.doc is None or self._mask_edit_active or self._batch_mode:
             return
+        self._mask_edit_kind = "modify"
+        self._add_mask_draft = None
+        self._add_mask_center = None
         self._mask_edit_snapshot = deepcopy(self._row())
         self._mask_traces_stale = False
         self._mask_roi_changed = False
@@ -817,25 +993,85 @@ class MainWindow(QMainWindow):
             f"Modify Mask: ROI {self.active_roi_id} — paint in W3, then Apply or Cancel"
         )
 
+    def _start_add_mask(self) -> None:
+        if self.doc is None or self._mask_edit_active or self._batch_mode:
+            return
+        Ly = int(self.doc["meta"]["Ly"])
+        Lx = int(self.doc["meta"]["Lx"])
+        side = median_zoom_side(self.doc["rois"], Ly, Lx)
+        self._mask_edit_kind = "add"
+        self._add_mask_center = None
+        self._add_mask_side = side
+        self._add_mask_draft = empty_roi_draft(
+            next_roi_id(self.doc), int(self.doc["meta"]["nframes"])
+        )
+        self._mask_edit_snapshot = None
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        self._updating = True
+        self.spin_add_side.setMaximum(min(Ly, Lx))
+        self.spin_add_side.setValue(side)
+        self._updating = False
+        self._set_mask_edit_ui(True)
+        view: PaintImageView = self.w3.image_view  # type: ignore[attr-defined]
+        view.paint_enabled = False
+        self.statusBar().showMessage(
+            "Add Mask: click W1 to place the red cross (click again to move before painting)"
+        )
+        self._refresh_fov()
+        self._refresh_w3()
+
+    def _nudge_add_zoom(self, delta: int) -> None:
+        if self._mask_edit_kind != "add" or self.doc is None:
+            return
+        Ly = int(self.doc["meta"]["Ly"])
+        Lx = int(self.doc["meta"]["Lx"])
+        new_side = int(np.clip(self._add_mask_side + delta, 8, min(Ly, Lx)))
+        self.spin_add_side.setValue(new_side)
+
+    def _on_add_side_changed(self, value: int) -> None:
+        if self._updating or self._mask_edit_kind != "add":
+            return
+        self._add_mask_side = int(value)
+        if self._add_mask_center is not None:
+            self._refresh_w3()
+            self._refresh_fov()
+
+    def _on_w3_wheel(self, direction: int) -> None:
+        if self._mask_edit_kind != "add" or not self._mask_edit_active:
+            return
+        self._nudge_add_zoom(-8 if direction > 0 else 8)
+
     def _cancel_mask_edit(self) -> None:
         if not self._mask_edit_active:
             return
         if self._extracting:
             self._extract_cancel = True
             return
-        if self._mask_edit_snapshot is not None and self.doc is not None:
-            snap = self._mask_edit_snapshot
-            for i, r in enumerate(self.doc["rois"]):
-                if int(r["roi_id"]) == int(self.active_roi_id):
-                    self.doc["rois"][i] = snap
-                    break
+        if self._mask_edit_kind == "modify" and self._mask_edit_snapshot is not None:
+            if self.doc is not None:
+                snap = self._mask_edit_snapshot
+                for i, r in enumerate(self.doc["rois"]):
+                    if int(r["roi_id"]) == int(self.active_roi_id):
+                        self.doc["rois"][i] = snap
+                        break
         self._mask_edit_snapshot = None
+        self._add_mask_draft = None
+        self._add_mask_center = None
+        self._mask_edit_kind = None
         self._mask_traces_stale = False
         self._mask_roi_changed = False
         self._mask_neu_changed = False
         self._set_mask_edit_ui(False)
         self._refresh_all()
-        self.statusBar().showMessage("Mask edit cancelled — previous masks/traces restored")
+        self.statusBar().showMessage("Mask edit cancelled")
+
+    def _finish_mask_edit(self) -> None:
+        if self._mask_edit_kind == "add":
+            self._save_new_mask()
+        else:
+            self._apply_mask_edit()
 
     def _apply_mask_edit(self) -> None:
         if not self._mask_edit_active or self.doc is None or self.suite2p_dir is None:
@@ -849,12 +1085,57 @@ class MainWindow(QMainWindow):
         path = save_curation(self.doc, self.suite2p_dir)
         self.dirty = False
         self._mask_edit_snapshot = None
+        self._mask_edit_kind = None
         self._mask_traces_stale = False
         self._mask_roi_changed = False
         self._mask_neu_changed = False
         self._set_mask_edit_ui(False)
         self._refresh_all()
         self.statusBar().showMessage(f"Applied mask edits and saved {path}")
+
+    def _save_new_mask(self) -> None:
+        if (
+            not self._mask_edit_active
+            or self._mask_edit_kind != "add"
+            or self.doc is None
+            or self.suite2p_dir is None
+            or self._add_mask_draft is None
+        ):
+            return
+        if self._extracting:
+            return
+        if self._add_mask_center is None:
+            QMessageBox.warning(self, "Save Mask", "Click W1 to place the ROI center first.")
+            return
+        row = self._add_mask_draft
+        if len(row["roi"]["ypix"]) == 0 or len(row["neuropil"]["ipix"]) == 0:
+            QMessageBox.warning(
+                self,
+                "Save Mask",
+                "Both F-ROI and Fneu-ROI must be non-empty before saving.",
+            )
+            return
+        self._mask_roi_changed = True
+        self._mask_neu_changed = True
+        self._mask_traces_stale = True
+        ok = self._recalculate_traces()
+        if not ok:
+            return
+        append_roi(self.doc, row)
+        new_id = int(row["roi_id"])
+        self._add_mask_draft = None
+        self._add_mask_center = None
+        self._mask_edit_kind = None
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        path = save_curation(self.doc, self.suite2p_dir)
+        self.dirty = False
+        self._set_mask_edit_ui(False)
+        n = len(self.doc["rois"])
+        self.spin_roi.setMaximum(max(0, n - 1))
+        self._select_roi(new_id, force=True)
+        self.statusBar().showMessage(f"Saved new ROI {new_id} to {path}")
 
     def _cancel_extract_job(self) -> None:
         if self._extracting:
@@ -923,11 +1204,9 @@ class MainWindow(QMainWindow):
             self.extract_progress.setVisible(False)
 
     def _on_w3_paint(self, y_img: int, x_img: int) -> None:
-        if (
-            not self._mask_edit_active
-            or self._extracting
-            or self.doc is None
-        ):
+        if not self._mask_edit_active or self._extracting or self.doc is None:
+            return
+        if self._mask_edit_kind == "add" and self._add_mask_center is None:
             return
         Ly = int(self.doc["meta"]["Ly"])
         Lx = int(self.doc["meta"]["Lx"])
@@ -954,7 +1233,6 @@ class MainWindow(QMainWindow):
             self._mask_roi_changed = True
         if self._mask_edit_mode in ("add_fneu", "remove_fneu"):
             self._mask_neu_changed = True
-        # Stealing between masks dirties both
         if self._mask_edit_mode in ("add_f", "add_fneu"):
             self._mask_roi_changed = True
             self._mask_neu_changed = True
@@ -968,6 +1246,12 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- ROI sel
     def _row(self, roi_id: int | None = None) -> dict[str, Any]:
         assert self.doc is not None
+        if (
+            roi_id is None
+            and self._mask_edit_kind == "add"
+            and self._add_mask_draft is not None
+        ):
+            return self._add_mask_draft
         rid = self.active_roi_id if roi_id is None else roi_id
         for row in self.doc["rois"]:
             if int(row["roi_id"]) == int(rid):
@@ -978,7 +1262,7 @@ class MainWindow(QMainWindow):
         return self.cmb_overlay.currentData()  # type: ignore[return-value]
 
     def _on_roi_spin(self, value: int) -> None:
-        if self._updating or self.doc is None or self._mask_edit_active:
+        if self._updating or self.doc is None or self._mask_edit_active or self._batch_mode:
             return
         self._select_roi(value)
 
@@ -986,6 +1270,8 @@ class MainWindow(QMainWindow):
         if self.doc is None:
             return
         if self._mask_edit_active and not force:
+            return
+        if self._batch_mode and not force:
             return
         if not force and roi_id == self.active_roi_id and not self._updating:
             # still refresh when forced internals call
@@ -1000,25 +1286,125 @@ class MainWindow(QMainWindow):
         self._refresh_all()
 
     def _on_fov_click(self, y: int, x: int) -> None:
-        if self.doc is None or self._mask_edit_active:
+        if self.doc is None or self._batch_mode:
             return
         Ly = int(self.doc["meta"]["Ly"])
         Lx = int(self.doc["meta"]["Lx"])
         if y < 0 or x < 0 or y >= Ly or x >= Lx:
             return
+
+        # Add Mask: place / move center (only before painting starts)
+        if self._mask_edit_active and self._mask_edit_kind == "add":
+            painted = self._mask_roi_changed or self._mask_neu_changed
+            if painted:
+                self.statusBar().showMessage(
+                    "Center locked after painting — Cancel to start over"
+                )
+                return
+            self._add_mask_center = (float(y), float(x))
+            view: PaintImageView = self.w3.image_view  # type: ignore[attr-defined]
+            view.paint_enabled = True
+            self._refresh_fov()
+            self._refresh_w3()
+            self.statusBar().showMessage(
+                f"Add Mask center at (y={y}, x={x}) — paint in W3, then Save Mask"
+            )
+            return
+
+        if self._mask_edit_active:
+            return
         hits = rois_at_pixel(self.doc["rois"], y, x, self._overlay_filter())
         if hits:
             self._select_roi(int(hits[0]["roi_id"]))
 
+    def _on_mode_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        batch = int(value) == 1
+        if batch == self._batch_mode:
+            return
+        if batch and self._mask_edit_active:
+            self._cancel_mask_edit()
+        self._batch_mode = batch
+        self._batch_roi_ids = []
+        w1: ClickableImageView = self.w1.image_view  # type: ignore[attr-defined]
+        w1.lasso_enabled = batch
+        w1.clear_lasso_drawing()
+        self._apply_mode_controls()
+        if batch:
+            self.statusBar().showMessage(
+                "Batch mode: draw a closed lasso on W1 (visible ROIs only, >50% pixels)"
+            )
+            self._updating = True
+            self.spin_x.setValue(1.0)
+            self.chk_iscell.setChecked(True)
+            self._updating = False
+            self._refresh_all()
+        else:
+            self.statusBar().showMessage("Single ROI mode")
+            self._select_roi(self.active_roi_id, force=True)
+
+    def _apply_mode_controls(self) -> None:
+        single = not self._batch_mode and not self._mask_edit_active
+        self.spin_roi.setEnabled(single)
+        self.btn_roi_up.setEnabled(single)
+        self.btn_roi_down.setEnabled(single)
+        self.spin_x.setEnabled(single)
+        self.btn_modify.setEnabled(single and self.doc is not None)
+        self.btn_add_mask.setEnabled(single and self.doc is not None)
+        self.chk_iscell.setEnabled(not self._mask_edit_active and self.doc is not None)
+        self.slider_mode.setEnabled(not self._mask_edit_active and self.doc is not None)
+        # Grey out W3 chrome in batch mode
+        self.w3.setEnabled(not self._batch_mode)
+        for w in (
+            self.cmb_w3_src,
+            self.cmb_w3_lut,
+            self.spin_w3_lo,
+            self.spin_w3_hi,
+        ):
+            w.setEnabled(not self._batch_mode)
+
+    def _on_fov_lasso(self, points_yx: list[tuple[float, float]]) -> None:
+        if not self._batch_mode or self.doc is None:
+            return
+        ids = rois_in_lasso(
+            self.doc["rois"], points_yx, self._overlay_filter(), min_fraction=0.5
+        )
+        self._batch_roi_ids = ids
+        # Snap all selected ROIs to iscell=True (default on)
+        for row in self.doc["rois"]:
+            if int(row["roi_id"]) in ids:
+                row["iscell"] = True
+        self.dirty = True
+        self._updating = True
+        self.chk_iscell.setChecked(True)
+        self.spin_x.setValue(1.0)
+        self._updating = False
+        self._refresh_all()
+        self.statusBar().showMessage(
+            f"Batch: {len(ids)} ROI(s) — iscell ON for all; uncheck to clear them"
+        )
+
     def _on_iscell_toggled(self, checked: bool) -> None:
         if self._updating or self.doc is None or self._mask_edit_active:
+            return
+        if self._batch_mode:
+            if not self._batch_roi_ids:
+                return
+            id_set = set(self._batch_roi_ids)
+            for row in self.doc["rois"]:
+                if int(row["roi_id"]) in id_set:
+                    row["iscell"] = bool(checked)
+            self.dirty = True
+            self._refresh_fov()
+            self._refresh_movie_views()
             return
         self._row()["iscell"] = bool(checked)
         self.dirty = True
         self._refresh_fov()
 
     def _on_x_changed(self, value: float) -> None:
-        if self._updating or self.doc is None:
+        if self._updating or self.doc is None or self._batch_mode:
             return
         set_compensation_x(self._row(), float(value))
         self.dirty = True
@@ -1087,15 +1473,40 @@ class MainWindow(QMainWindow):
             return
         lut = self._lut_cache[self.cmb_fov_lut.currentText()]
         rgb = apply_lut(img, lut, self.spin_fov_lo.value(), self.spin_fov_hi.value())
+        batch_ids = set(self._batch_roi_ids) if self._batch_mode else None
+        active_id = self.active_roi_id
+        rois = list(self.doc["rois"])
+        if (
+            self._mask_edit_kind == "add"
+            and self._add_mask_draft is not None
+            and len(self._add_mask_draft["roi"]["ypix"]) > 0
+        ):
+            rois = rois + [self._add_mask_draft]
+            active_id = int(self._add_mask_draft["roi_id"])
         overlay = build_fov_overlay(
             int(self.doc["meta"]["Ly"]),
             int(self.doc["meta"]["Lx"]),
-            self.doc["rois"],
-            self.active_roi_id,
+            rois,
+            active_id,
             self._overlay_filter(),
+            batch_roi_ids=batch_ids,
         )
         composed = compose_rgb_with_overlay(rgb, overlay)
+        if self._mask_edit_kind == "add" and self._add_mask_center is not None:
+            cy, cx = self._add_mask_center
+            self._draw_red_cross(composed, int(round(cy)), int(round(cx)))
         self._set_display_rgb(self.w1.image_view, composed)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _draw_red_cross(rgb: np.ndarray, cy: int, cx: int, arm: int = 6) -> None:
+        Ly, Lx = rgb.shape[:2]
+        for d in range(-arm, arm + 1):
+            y = cy + d
+            x = cx + d
+            if 0 <= cy < Ly and 0 <= cx + d < Lx:
+                rgb[cy, cx + d] = (255, 0, 0)
+            if 0 <= cy + d < Ly and 0 <= cx < Lx:
+                rgb[cy + d, cx] = (255, 0, 0)
 
     def _movie_rgb(self, frame: np.ndarray) -> np.ndarray:
         lut = self._lut_cache[self.cmb_mov_lut.currentText()]
@@ -1112,6 +1523,14 @@ class MainWindow(QMainWindow):
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
         row = self._row()
+        if self._mask_edit_kind == "add" and self._add_mask_center is not None:
+            cy, cx = self._add_mask_center
+            y0, x0, side = zoom_square_at(cy, cx, self._add_mask_side, Ly, Lx)
+            return y0, x0, side, row
+        if self._mask_edit_kind == "add":
+            cy, cx = (Ly - 1) / 2.0, (Lx - 1) / 2.0
+            y0, x0, side = zoom_square_at(cy, cx, self._add_mask_side, Ly, Lx)
+            return y0, x0, side, row
         y0, x0, side = zoom_square_window(
             row["roi"]["ypix"], row["roi"]["xpix"], row["neuropil"]["ipix"], Ly, Lx
         )
@@ -1122,16 +1541,28 @@ class MainWindow(QMainWindow):
             return
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
-        row = self._row()
         t = self._c0_frame_index()
         frame = self.stack.read_frame(t)
         rgb = self._movie_rgb(frame)
 
-        # W2 with thick outline
-        y_out, x_out = thick_outline_mask(Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=2)
         w2 = rgb.copy()
-        if y_out.size:
-            w2[y_out, x_out] = (255, 0, 0)
+        if self._batch_mode and self._batch_roi_ids:
+            id_set = set(self._batch_roi_ids)
+            for row in self.doc["rois"]:
+                if int(row["roi_id"]) not in id_set:
+                    continue
+                y_out, x_out = thick_outline_mask(
+                    Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=2
+                )
+                if y_out.size:
+                    w2[y_out, x_out] = (255, 0, 0)
+        else:
+            row = self._row()
+            y_out, x_out = thick_outline_mask(
+                Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=2
+            )
+            if y_out.size:
+                w2[y_out, x_out] = (255, 0, 0)
         self._set_display_rgb(self.w2.image_view, w2)  # type: ignore[attr-defined]
         self.w2.setTitle(f"Movie (W2) — frame {t}")  # type: ignore[attr-defined]
 
@@ -1143,6 +1574,12 @@ class MainWindow(QMainWindow):
 
     def _refresh_w3(self) -> None:
         if self.doc is None:
+            return
+        if self._batch_mode:
+            # Placeholder grey panel while batch-selecting
+            grey = np.full((64, 64, 3), 80, dtype=np.uint8)
+            self._set_display_rgb(self.w3.image_view, grey)  # type: ignore[attr-defined]
+            self.w3.setTitle("ROI zoom (W3) — batch mode")  # type: ignore[attr-defined]
             return
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
@@ -1165,15 +1602,33 @@ class MainWindow(QMainWindow):
     def _refresh_traces(self, autoscale: bool = False) -> None:
         if self.doc is None:
             return
-        row = self._row()
-        F = np.asarray(row["roi"]["F"], dtype=np.float64)
-        Fneu = np.asarray(row["neuropil"]["Fneu"], dtype=np.float64)
-        x = float(row["compensation"]["x"])
-        comp = np.asarray(row["compensation"]["trace_comp"], dtype=np.float64)
-        xs = np.arange(F.shape[0])
-        self.curve_f.setData(xs, F)
-        self.curve_fneu.setData(xs, x * Fneu)
-        self.curve_comp.setData(xs, comp)
+        if self._batch_mode:
+            if self._batch_roi_ids:
+                F, Fneu, comp = mean_traces_for_rois(self.doc["rois"], self._batch_roi_ids)
+                x_disp = 1.0
+            else:
+                F = Fneu = comp = np.zeros(int(self.doc["meta"]["nframes"]), dtype=np.float64)
+                x_disp = 1.0
+            xs = np.arange(F.shape[0])
+            self.curve_f.setData(xs, F)
+            self.curve_fneu.setData(xs, x_disp * Fneu)
+            self.curve_comp.setData(xs, comp)
+            self.plot_f.setTitle(
+                f"mean F / mean Fneu (batch n={len(self._batch_roi_ids)}, display x=1)"
+            )
+            self.plot_comp.setTitle("mean(F − 1·Fneu) — batch display")
+        else:
+            row = self._row()
+            F = np.asarray(row["roi"]["F"], dtype=np.float64)
+            Fneu = np.asarray(row["neuropil"]["Fneu"], dtype=np.float64)
+            x = float(row["compensation"]["x"])
+            comp = np.asarray(row["compensation"]["trace_comp"], dtype=np.float64)
+            xs = np.arange(F.shape[0])
+            self.curve_f.setData(xs, F)
+            self.curve_fneu.setData(xs, x * Fneu)
+            self.curve_comp.setData(xs, comp)
+            self.plot_f.setTitle("F / Fneu")
+            self.plot_comp.setTitle("trace_comp = F − x·Fneu")
         if autoscale:
             self.plot_f.enableAutoRange(axis="y")
             self.plot_comp.enableAutoRange(axis="y")
@@ -1216,7 +1671,13 @@ class MainWindow(QMainWindow):
     def _update_cursor_labels(self) -> None:
         if self.doc is None:
             return
-        comp = np.asarray(self._row()["compensation"]["trace_comp"], dtype=np.float64)
+        if self._batch_mode:
+            if self._batch_roi_ids:
+                _, _, comp = mean_traces_for_rois(self.doc["rois"], self._batch_roi_ids)
+            else:
+                comp = np.zeros(int(self.doc["meta"]["nframes"]), dtype=np.float64)
+        else:
+            comp = np.asarray(self._row()["compensation"]["trace_comp"], dtype=np.float64)
         n = len(comp)
         for line, label in zip(self.cursors, self.cursor_labels):
             fi = int(np.clip(round(line.value()), 0, max(n - 1, 0)))
@@ -1226,6 +1687,12 @@ class MainWindow(QMainWindow):
 
     def _update_thumbnails(self) -> None:
         if self.doc is None:
+            return
+        if self._batch_mode:
+            grey = np.full((64, 64, 3), 80, dtype=np.uint8)
+            for i, (view, lab) in enumerate(zip(self.thumb_views, self.thumb_labels)):
+                self._set_display_rgb(view, grey)
+                lab.setText(f"C{i + 1} — batch")
             return
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])

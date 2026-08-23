@@ -36,16 +36,20 @@ def build_fov_overlay(
     active_roi_id: int,
     overlay_filter: OverlayFilter,
     alpha: float = 0.35,
+    batch_roi_ids: set[int] | None = None,
 ) -> np.ndarray:
-    """RGBA uint8 overlay; non-active red, active cyan."""
+    """RGBA uint8 overlay; non-active red, active/batch cyan."""
     overlay = np.zeros((Ly, Lx, 4), dtype=np.uint8)
     a = int(round(alpha * 255))
+    batch = batch_roi_ids or set()
     for row in iter_visible_rois(rois, overlay_filter):
         y = np.asarray(row["roi"]["ypix"], dtype=np.int64)
         x = np.asarray(row["roi"]["xpix"], dtype=np.int64)
         if y.size == 0:
             continue
-        if int(row["roi_id"]) == int(active_roi_id):
+        rid = int(row["roi_id"])
+        highlight = rid in batch or (not batch and rid == int(active_roi_id))
+        if highlight:
             overlay[y, x, 0] = 0
             overlay[y, x, 1] = 255
             overlay[y, x, 2] = 255

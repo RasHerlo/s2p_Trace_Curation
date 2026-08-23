@@ -213,6 +213,49 @@ def zoom_square_window(
     return top, left, side
 
 
+def zoom_square_at(
+    cy: float,
+    cx: float,
+    side: int,
+    Ly: int,
+    Lx: int,
+) -> tuple[int, int, int]:
+    """Square crop of given side centered on (cy, cx), clamped to FOV."""
+    side = int(max(1, min(side, Ly, Lx)))
+    top = int(round(cy - (side - 1) / 2.0))
+    left = int(round(cx - (side - 1) / 2.0))
+    top = max(0, min(top, Ly - side))
+    left = max(0, min(left, Lx - side))
+    return top, left, side
+
+
+def median_zoom_side(
+    rois: list,
+    Ly: int,
+    Lx: int,
+    pad_factor: float = 1.5,
+    default: int = 64,
+) -> int:
+    """Median of per-ROI zoom square sides (ROI∪neuropil, same rule as W3)."""
+    sides: list[int] = []
+    for row in rois:
+        try:
+            _, _, side = zoom_square_window(
+                row["roi"]["ypix"],
+                row["roi"]["xpix"],
+                row["neuropil"]["ipix"],
+                Ly,
+                Lx,
+                pad_factor=pad_factor,
+            )
+            sides.append(int(side))
+        except Exception:
+            continue
+    if not sides:
+        return int(max(1, min(default, Ly, Lx)))
+    return int(max(1, min(int(np.median(sides)), Ly, Lx)))
+
+
 def embed_into_fov(
     img: np.ndarray,
     Ly: int,

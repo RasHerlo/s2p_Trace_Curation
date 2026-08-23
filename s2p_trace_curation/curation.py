@@ -218,6 +218,41 @@ def set_compensation_x(row: dict[str, Any], x: float) -> None:
     )
 
 
+def next_roi_id(doc: dict[str, Any]) -> int:
+    if not doc.get("rois"):
+        return 0
+    return max(int(r["roi_id"]) for r in doc["rois"]) + 1
+
+
+def empty_roi_draft(roi_id: int, nframes: int) -> dict[str, Any]:
+    """Blank ROI row for Add Mask (masks filled by painting; traces on Save)."""
+    T = int(nframes)
+    z = np.zeros(T, dtype=np.float64)
+    return {
+        "roi_id": int(roi_id),
+        "iscell": True,
+        "iscell_prob": None,
+        "roi": {
+            "ypix": np.zeros(0, dtype=np.int32),
+            "xpix": np.zeros(0, dtype=np.int32),
+            "lam": np.zeros(0, dtype=np.float32),
+            "F": z.copy(),
+            "modified": True,
+        },
+        "neuropil": {
+            "ipix": np.zeros(0, dtype=np.int32),
+            "Fneu": z.copy(),
+            "modified": True,
+        },
+        "compensation": {"x": 1.0, "trace_comp": z.copy()},
+    }
+
+
+def append_roi(doc: dict[str, Any], row: dict[str, Any]) -> None:
+    doc["rois"].append(row)
+    doc["rois"].sort(key=lambda r: int(r["roi_id"]))
+
+
 def reextract_after_mask_edit(
     row: dict[str, Any],
     suite2p_dir: Path,

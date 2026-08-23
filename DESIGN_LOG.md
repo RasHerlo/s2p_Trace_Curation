@@ -355,6 +355,53 @@ Aligned with handoff note: intercalate ROI sets on the **same** registered movie
 
 ---
 
+## Session 2026-08-23 — Batch iscell selection (design)
+
+### Intent (draft)
+Button **batch-select** beside the iscell control. Enter batch mode → freehand region on **W1** → ROIs in that region become the batch. iscell checkbox applies to **all** in the batch (default on). Traces show **mean F** and **mean Fneu**. **W3** disabled/greyed until returning to single-ROI mode.
+
+### Open questions (batch)
+| # | Topic | Status |
+|---|--------|--------|
+| B1 | Single↔Batch **slide toggle** | **Agreed** |
+| B2 | Closed **lasso** on W1 | **Agreed** |
+| B3 | Include if **>50%** of ROI pixels inside | **Agreed** |
+| B4 | Only ROIs shown by W1 overlay filter | **Agreed** |
+| B5 | Snap all batch ROIs to iscell **checked** on lasso | **Agreed** |
+| B6 | Mean F, mean Fneu, mean display `trace_comp` with **x=1** (stored x unchanged) | **Agreed** |
+| B7 | New lasso replaces previous batch | **Agreed** |
+| B8 | Disable Modify mask + ROI # (+ x edit) in batch | **Agreed** |
+| B9 | W3 greyed / disabled in batch | **Agreed** |
+
+### Implementation
+- `s2p_trace_curation/batch_select.py`
+- Main window: mode slider, lasso on W1, batch iscell, mean traces
+
+---
+
+## Session 2026-08-23 — Add Mask / new ROI (design)
+
+### Intent (draft)
+**Mask tools → Add Mask** (under Modify Mask). Pick a point on **W1** with a small red cross cursor → **W3** shows a square zoom centered there (size from typical pickle zoom / ROI∪neuropil scale). Paint new F and Fneu masks from scratch (same brush modes as Modify Mask). Extra zoom in/out on W3. Finish with **Save Mask** (not Apply) → append ROI + extracted traces to `trc_curation.pkl`.
+
+### Open questions (add mask)
+| # | Topic | Status |
+|---|--------|--------|
+| N1 | Initial W3 square = **median** of existing zooms; then adjustable | **Agreed** |
+| N2 | Zoom: **wheel + +/-** (and side spin) | **Agreed** |
+| N3 | `roi_id` = max+1 | **Agreed** |
+| N4 | Default `iscell=True`, `x=1.0` | **Agreed** |
+| N5 | Forbid empty F / Fneu on Save | **Agreed** |
+| N6 | Pickle-only (no suite2p file rewrite) | **Agreed** |
+| N7 | Click again moves center **before painting**; Cancel discards | **Agreed** |
+| N8 | Disable Add Mask in batch mode | **Agreed** |
+
+### Implementation
+- Mask tools: **Add Mask** → W1 red cross → W3 paint → **Save Mask**
+- `empty_roi_draft` / `append_roi` in `curation.py`; brush allows empty-start builds
+
+---
+
 ## Inspiration / references
 - suite2p native outputs and GUI curation patterns (`iscell`, neuropil coeff)
 - Compensation: `trace_comp = F - x * Fneu`
