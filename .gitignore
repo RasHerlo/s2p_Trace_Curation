@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .venv
+venv_s2p_tc/
 env/
 venv/
 ENV/

@@ -193,6 +193,10 @@ class MainWindow(QMainWindow):
         act_open.triggered.connect(self.open_suite2p)
         file_menu.addAction(act_open)
 
+        act_merge = QAction("Merge s2p folders…", self)
+        act_merge.triggered.connect(self.merge_suite2p_folders)
+        file_menu.addAction(act_merge)
+
         act_save = QAction("Save", self)
         act_save.setShortcut("Ctrl+S")
         act_save.triggered.connect(self.save_session)
@@ -600,6 +604,22 @@ class MainWindow(QMainWindow):
             self._load_suite2p(Path(path))
         except Exception as exc:
             QMessageBox.critical(self, "Open failed", str(exc))
+
+    def merge_suite2p_folders(self) -> None:
+        from s2p_trace_curation.gui.merge_dialog import MergeSuite2pDialog
+
+        dlg = MergeSuite2pDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        if dlg.merged_dir is not None:
+            try:
+                self._load_suite2p(dlg.merged_dir)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Open merged folder failed",
+                    f"Merge wrote files, but opening failed:\n{exc}",
+                )
 
     def _load_suite2p(self, path: Path) -> None:
         if self._mask_edit_active:

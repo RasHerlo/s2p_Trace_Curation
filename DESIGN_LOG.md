@@ -314,11 +314,44 @@ Toolkit: **pyqtgraph + Qt bindings** (PyQt5 preferred on Windows/conda; PySide6 
 | L4 | Open = choose suite2p folder; load existing `trc_curation.pkl` if present, else generate from `plane0` |
 
 ### Future GUI features (parked)
-- **Modify mask** tools (paint/erase, neuropil ring, lam weights)
 - Bleach-correction panel + lower trace
 - Manual Y-scale controls
-- Merge / split / draw new ROIs
+- Merge / split / draw **new** ROIs within one plane (distinct from folder merge)
 - Multi-plane or cross-recording comparison
+
+---
+
+## Session 2026-08-23 — Merge s2p folders (design)
+
+### Intent (draft)
+File menu → **Merge s2p folders**: dialog to pick two suite2p folders + output parent + name (default `suite2p_merged`). Write a normal suite2p tree (`plane0/` + files) plus `merge_note.txt` beside `plane0/`. Typical case: merge `_anat` / `_temp` (or temporal vs Cellpose) arms under the same Chan folder onto one shared movie.
+
+Aligned with handoff note: intercalate ROI sets on the **same** registered movie; do not re-run suite2p registration here.
+
+### UI (draft)
+- Inputs: Folder A, Folder B (each = suite2p dir containing `plane0/`)
+- Output parent: if A and B share a parent, suggest that parent; editable
+- Output name: default `suite2p_merged`; editable
+- Result path: `{output_parent}/{output_name}/`
+
+### Open questions (merge)
+| # | Topic | Status |
+|---|--------|--------|
+| M1 | Merge = concatenate ROI catalogs; require **identical** `data.bin` | **Agreed** |
+| M2 | Canonical movie = copy from Folder A (identical under check) | **Agreed** |
+| M3 | `Ly`/`Lx`/`nframes` must match | **Agreed** |
+| M4 | ROI order = dialog pick order (A then B) | **Agreed** |
+| M5 | Keep overlapping ROIs | **Agreed** |
+| M6 | Provenance: `merge_note.txt` only for now | **Agreed** |
+| M7 | No input pickles; clean merged folder; pickle on first Open | **Agreed** |
+| M8 | If output exists: warn and ask (overwrite / abort) | **Agreed** |
+| M9 | Auto-Open merged folder after success | **Agreed** |
+| M10 | Write zero `spks.npy` for merged ROI count | **Agreed** |
+| M11 | `data.bin` check toggle: **sample** (default) vs **full**; persist in settings | **Agreed** |
+
+### Implementation (2026-08-23)
+- `s2p_trace_curation/merge_suite2p.py` — compare + merge
+- `s2p_trace_curation/gui/merge_dialog.py` — File → Merge s2p folders…
 
 ---
 
@@ -327,13 +360,12 @@ Toolkit: **pyqtgraph + Qt bindings** (PyQt5 preferred on Windows/conda; PySide6 
 - Compensation: `trace_comp = F - x * Fneu`
 - Portability: USB / cross-machine folder moves with co-located pickle
 - Multi-cursor trace inspection + debounced frame thumbnails
+- Handoff: temporal vs Cellpose / anat vs temp ROI intercalation on shared `data.bin`
 
 ---
 
 ## Implementation status
-- **v1 shell in place** (2026-08-09):
-  - `s2p_trace_curation/curation.py` — create/load/save `trc_curation.pkl`, reset ROI, set `x`
-  - `s2p_trace_curation/suite2p_io.py` — ops/stat/traces/`data.bin` + zoom geometry
-  - `s2p_trace_curation/gui/main_window.py` — FOV / movie / zoom / traces / cursors / thumbnails
-- Placeholders: Modify mask, bleach subplot
+- **v1 shell in place** (2026-08-09 + later remote updates):
+  - curation I/O, suite2p_io, main GUI, mask edit, user settings
+- **Merge s2p folders:** design only (2026-08-23)
 - Run: `python -m s2p_trace_curation`
