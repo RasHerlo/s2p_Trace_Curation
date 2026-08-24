@@ -45,6 +45,16 @@ QWidget = QtWidgets.QWidget
 
 from copy import deepcopy
 
+from s2p_trace_curation.analyses import (
+    PICKLE_SORT_ID,
+    active_sort_run,
+    apply_raster_sort,
+    dropdown_label,
+    ensure_analyses,
+    raster_sort_id,
+    refresh_stale_flags,
+    set_raster_sort,
+)
 from s2p_trace_curation.annotations import (
     ANNOTATION_PROPERTIES,
     PROPERTY_SPEC,
@@ -66,6 +76,7 @@ from s2p_trace_curation.curation import (
     save_curation,
     set_compensation_x,
 )
+from s2p_trace_curation.gui.analysis_dialog import AnalysisToolsWindow
 from s2p_trace_curation.gui.colormaps import (
     LUT_NAMES,
     apply_lut,
@@ -320,6 +331,7 @@ class MainWindow(QMainWindow):
         self._raster_row_ids: list[int] = []
         self._raster_box_items: list[Any] = []
         self._raster_last_shape: tuple[int, int] | None = None
+        self._analysis_window: AnalysisToolsWindow | None = None
 
         self._mask_edit_active = False
         self._mask_edit_kind: str | None = None  # "modify" | "add"
@@ -421,7 +433,10 @@ class MainWindow(QMainWindow):
             or self._batch_mode
         ):
             return
-        ids = self._filtered_roi_ids()
+        if self._raster_mode and self._raster_row_ids:
+            ids = self._raster_row_ids
+        else:
+            ids = self._filtered_roi_ids()
         if not ids:
             return
         try:
@@ -747,6 +762,13 @@ class MainWindow(QMainWindow):
         self.cmb_raster_show.setCurrentIndex(self.cmb_overlay.currentIndex())
         self.cmb_raster_show.setEnabled(False)
 
+        self.cmb_raster_sort = QComboBox()
+        self.cmb_raster_sort.setEnabled(False)
+        self.cmb_raster_sort.setToolTip(
+            "Pickle: doc / roi_id order. Other entries: saved Analysis Tools runs."
+        )
+        self.cmb_raster_sort.addItem("Pickle", PICKLE_SORT_ID)
+
         self.cmb_raster_lut = QComboBox()
         self.cmb_raster_lut.addItems(list(LUT_NAMES))
         self.cmb_raster_lut.setEnabled(False)
@@ -779,12 +801,21 @@ class MainWindow(QMainWindow):
             "Recompute stored [0, 1] traces from current trace_comp and LED+Shutter ranges"
         )
 
+        self.btn_analysis_tools = QPushButton("Analysis Tools")
+        self.btn_analysis_tools.setEnabled(False)
+        self.btn_analysis_tools.setToolTip(
+            "Open clustering / sort runs (params + order stored in the pickle)"
+        )
+        self.btn_analysis_tools.clicked.connect(self._open_analysis_tools)
+
         raster_form.addRow("Raster-mode", raster_on_row)
         raster_form.addRow("Show", self.cmb_raster_show)
+        raster_form.addRow("Sort", self.cmb_raster_sort)
         raster_form.addRow("LUT", self.cmb_raster_lut)
         raster_form.addRow(self.chk_raster_revert)
         raster_form.addRow("Mode", raster_mode_row)
         raster_form.addRow(self.btn_rebuild_tc_norm)
+        raster_form.addRow(self.btn_analysis_tools)
         layout.addWidget(raster)
         layout.addStretch(1)
 
@@ -808,6 +839,7 @@ class MainWindow(QMainWindow):
         self.cmb_raster_lut.currentIndexChanged.connect(self._on_raster_display_changed)
         self.chk_raster_revert.toggled.connect(self._on_raster_display_changed)
         self.slider_raster_batch.valueChanged.connect(self._on_raster_batch_slider)
+        self.cmb_raster_sort.currentIndexChanged.connect(self._on_raster_sort_changed)
         self.btn_rebuild_tc_norm.clicked.connect(self._rebuild_tc_norm)
         return panel
 
@@ -1213,8 +1245,13 @@ class MainWindow(QMainWindow):
         w1.clear_lasso_drawing()
         self._apply_mode_controls()
         self._tc_norm_stale = tc_norm_is_stale(doc)
+        ensure_analyses(doc)
+        refresh_stale_flags(doc)
+        self._fill_raster_sort_combo()
         self._update_rebuild_button()
         self._set_raster_controls_enabled(True)
+        if self._analysis_window is not None:
+            self._analysis_window.refresh_from_doc()
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -1566,6 +1603,7 @@ class MainWindow(QMainWindow):
         n = len(self.doc["rois"])
         self.spin_roi.setMaximum(max(0, n - 1))
         self._select_roi(new_id, force=True)
+        self._refresh_analysis_stale_ui()
         self.statusBar().showMessage(f"Saved new ROI {new_id} to {path}")
 
     def _cancel_extract_job(self) -> None:
@@ -1877,6 +1915,7 @@ class MainWindow(QMainWindow):
         self.spin_x.setValue(1.0)
         self._updating = False
         self._refresh_all()
+        self._refresh_analysis_stale_ui()
         self.statusBar().showMessage(
             f"Batch: {len(ids)} ROI(s) — iscell ON for all; uncheck to clear them"
         )
@@ -1894,9 +1933,11 @@ class MainWindow(QMainWindow):
             self.dirty = True
             self._refresh_fov()
             self._refresh_movie_views()
+            self._refresh_analysis_stale_ui()
             return
         self._row()["iscell"] = bool(checked)
         self.dirty = True
+        self._refresh_analysis_stale_ui()
         jumped = self._ensure_active_roi_in_filter()
         if not jumped:
             self._refresh_fov()
@@ -1917,12 +1958,103 @@ class MainWindow(QMainWindow):
         self.cmb_raster_lut.setEnabled(enabled)
         self.chk_raster_revert.setEnabled(enabled)
         self.slider_raster_batch.setEnabled(enabled)
+        self.cmb_raster_sort.setEnabled(enabled)
+        self.btn_analysis_tools.setEnabled(enabled)
         self._update_rebuild_button()
 
     def _update_rebuild_button(self) -> None:
         self.btn_rebuild_tc_norm.setEnabled(
             self.doc is not None and self._tc_norm_stale
         )
+
+    def _refresh_analysis_stale_ui(self) -> None:
+        if self.doc is None:
+            return
+        refresh_stale_flags(self.doc)
+        self._fill_raster_sort_combo()
+        if self._analysis_window is not None:
+            self._analysis_window.reload_run_list()
+
+    def _fill_raster_sort_combo(self) -> None:
+        if self.doc is None:
+            return
+        current = raster_sort_id(self.doc)
+        was_updating = self._updating
+        self._updating = True
+        self.cmb_raster_sort.clear()
+        self.cmb_raster_sort.addItem("Pickle", PICKLE_SORT_ID)
+        for run in ensure_analyses(self.doc):
+            self.cmb_raster_sort.addItem(dropdown_label(run), str(run["id"]))
+        idx = self.cmb_raster_sort.findData(current)
+        self.cmb_raster_sort.setCurrentIndex(idx if idx >= 0 else 0)
+        self._updating = was_updating
+
+    def _on_raster_sort_changed(self) -> None:
+        if self._updating or self.doc is None:
+            return
+        data = self.cmb_raster_sort.currentData()
+        sid = str(data) if data else PICKLE_SORT_ID
+        if raster_sort_id(self.doc) == sid:
+            return
+        set_raster_sort(self.doc, sid)
+        self.dirty = True
+        if self._raster_mode:
+            self._refresh_raster()
+
+    def _open_analysis_tools(self) -> None:
+        if self.doc is None:
+            return
+        if self._analysis_window is None:
+            self._analysis_window = AnalysisToolsWindow(self)
+
+            def _clear(_obj: object = None) -> None:
+                self._analysis_window = None
+
+            self._analysis_window.destroyed.connect(_clear)
+        self._analysis_window.refresh_from_doc()
+        self._analysis_window.show()
+        self._analysis_window.raise_()
+        self._analysis_window.activateWindow()
+
+    def _analysis_runs_changed(self) -> None:
+        if self.doc is None:
+            return
+        self.dirty = True
+        refresh_stale_flags(self.doc)
+        self._fill_raster_sort_combo()
+        if self._raster_mode:
+            self._refresh_raster()
+
+    def _ensure_analysis_inputs(self) -> bool:
+        if self.doc is None:
+            return False
+        if not self.doc["rois"]:
+            QMessageBox.information(self, "Analysis Tools", "No ROIs loaded.")
+            return False
+        has_any = any(row.get("tc_norm") is not None for row in self.doc["rois"])
+        if self._tc_norm_stale or (has_any and tc_norm_is_stale(self.doc)):
+            reply = QMessageBox.question(
+                self,
+                "tc_norm is stale",
+                "Analyses use tc_norm. Rebuild tc_norm first?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+            self._rebuild_tc_norm()
+            return True
+        if not has_any:
+            rebuild_all_tc_norm(self.doc)
+            self.dirty = True
+            self._tc_norm_stale = False
+            self._update_rebuild_button()
+            return True
+        if fill_missing_tc_norm(self.doc):
+            self.dirty = True
+            self._tc_norm_stale = True
+            self._update_rebuild_button()
+        return True
 
     def _mark_tc_norm_stale(self) -> None:
         if self.doc is None:
@@ -1934,6 +2066,7 @@ class MainWindow(QMainWindow):
             return
         self._tc_norm_stale = True
         self._update_rebuild_button()
+        self._refresh_analysis_stale_ui()
 
     def _on_raster_mode_slider(self, value: int) -> None:
         if self._updating:
@@ -2000,6 +2133,7 @@ class MainWindow(QMainWindow):
         self.dirty = True
         self._tc_norm_stale = False
         self._update_rebuild_button()
+        self._refresh_analysis_stale_ui()
         if self._raster_mode:
             self._refresh_raster()
         self.statusBar().showMessage("Rebuilt tc_norm from trace_comp and LED+Shutter")
@@ -2035,6 +2169,8 @@ class MainWindow(QMainWindow):
             self._tc_norm_stale = True
             self._update_rebuild_button()
         rows = rois_for_raster(self.doc["rois"], self._overlay_filter())
+        run = active_sort_run(self.doc)
+        rows = apply_raster_sort(rows, run)
         self._raster_row_ids = [int(r["roi_id"]) for r in rows]
         n_sel = sum(1 for r in rows if bool(r.get("iscell", True)))
         n_unsel = len(rows) - n_sel
@@ -2066,11 +2202,27 @@ class MainWindow(QMainWindow):
             vb.setRange(xRange=prev_range[0], yRange=prev_range[1], padding=0)
         self._raster_last_shape = shape
         self._clear_raster_boxes()
-        if rows:
-            self._add_raster_group_box(-0.5, -0.5, float(nframes), float(n_sel), "#e74c3c")
-            self._add_raster_group_box(
-                -0.5, float(n_sel) - 0.5, float(nframes), float(n_unsel), "#3498db"
-            )
+        filt = self._overlay_filter()
+        if rows and (run is not None or filt != "both"):
+            if run is not None:
+                self._add_raster_group_box(
+                    -0.5, -0.5, float(nframes), float(n_sel), "#e74c3c"
+                )
+                self._add_raster_group_box(
+                    -0.5,
+                    float(n_sel) - 0.5,
+                    float(nframes),
+                    float(n_unsel),
+                    "#3498db",
+                )
+            elif filt == "cell":
+                self._add_raster_group_box(
+                    -0.5, -0.5, float(nframes), float(len(rows)), "#e74c3c"
+                )
+            elif filt == "noncell":
+                self._add_raster_group_box(
+                    -0.5, -0.5, float(nframes), float(len(rows)), "#3498db"
+                )
         self.raster_c0.setZValue(20)
         self._updating = True
         self.raster_c0.setValue(self.cursor_c0.value())

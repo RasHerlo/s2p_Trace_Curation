@@ -121,19 +121,16 @@ def rebuild_all_tc_norm(doc: dict[str, Any]) -> None:
 def rois_for_raster(
     rois: list[dict[str, Any]], overlay_filter: OverlayFilter
 ) -> list[dict[str, Any]]:
-    """Visible ROIs for the raster: selected (iscell) first, then unselected."""
-    selected: list[dict[str, Any]] = []
-    unselected: list[dict[str, Any]] = []
+    """Visible ROIs for the raster, in pickle (doc / roi_id) order."""
+    out: list[dict[str, Any]] = []
     for row in rois:
-        if bool(row.get("iscell", True)):
-            selected.append(row)
-        else:
-            unselected.append(row)
-    if overlay_filter == "cell":
-        return selected
-    if overlay_filter == "noncell":
-        return unselected
-    return selected + unselected
+        iscell = bool(row.get("iscell", True))
+        if overlay_filter == "cell" and not iscell:
+            continue
+        if overlay_filter == "noncell" and iscell:
+            continue
+        out.append(row)
+    return out
 
 
 def stack_tc_norm(rows: list[dict[str, Any]], nframes: int) -> np.ndarray:

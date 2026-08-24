@@ -1,0 +1,286 @@
+"""Named analysis runs: params, member list, sort order, fingerprints.
+
+Matrices are recomputed in the Analysis Tools window, not stored.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from s2p_trace_curation.annotations import ensure_annotations
+from s2p_trace_curation.raster import tc_norm_is_stale
+
+PICKLE_SORT_ID = "pickle"
+FIGURES_DIRNAME = "figures"
+
+KIND_PLACEHOLDER = "placeholder"
+KIND_LABELS: dict[str, str] = {
+    KIND_PLACEHOLDER: "Placeholder (selected pickle order)",
+}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def figures_dir(suite2p_dir: Path) -> Path:
+    """Reserved snapshot folder: sibling of plane0/. Created lazily on first export."""
+    return Path(suite2p_dir) / FIGURES_DIRNAME
+
+
+def ensure_analyses(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    runs = doc.get("analyses")
+    if runs is None:
+        runs = []
+        doc["analyses"] = runs
+    meta = doc.setdefault("meta", {})
+    if not meta.get("raster_sort"):
+        meta["raster_sort"] = PICKLE_SORT_ID
+    return runs
+
+
+def next_analysis_id(doc: dict[str, Any]) -> str:
+    n = 0
+    for run in ensure_analyses(doc):
+        s = str(run.get("id", ""))
+        if s.startswith("a-"):
+            try:
+                n = max(n, int(s[2:]))
+            except ValueError:
+                pass
+    return f"a-{n + 1:03d}"
+
+
+def kind_label(kind: str) -> str:
+    return KIND_LABELS.get(str(kind), str(kind))
+
+
+def current_iscell_ids(doc: dict[str, Any]) -> list[int]:
+    return [int(r["roi_id"]) for r in doc["rois"] if bool(r.get("iscell", True))]
+
+
+def get_analysis(doc: dict[str, Any], analysis_id: str) -> dict[str, Any] | None:
+    aid = str(analysis_id)
+    for run in ensure_analyses(doc):
+        if str(run.get("id")) == aid:
+            return run
+    return None
+
+
+def raster_sort_id(doc: dict[str, Any]) -> str:
+    sid = str((doc.get("meta") or {}).get("raster_sort") or PICKLE_SORT_ID)
+    if sid != PICKLE_SORT_ID and get_analysis(doc, sid) is None:
+        return PICKLE_SORT_ID
+    return sid
+
+
+def set_raster_sort(doc: dict[str, Any], sort_id: str) -> None:
+    doc.setdefault("meta", {})["raster_sort"] = str(sort_id)
+
+
+def _led_spans(doc: dict[str, Any]) -> list[list[int]]:
+    return sorted(
+        [int(a["start_frame"]), int(a["end_frame"])]
+        for a in ensure_annotations(doc)
+        if str(a["property"]) == "LED+Shutter"
+    )
+
+
+def analysis_input_sig(
+    doc: dict[str, Any],
+    roi_ids: list[int],
+    kind: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    by_id = {int(r["roi_id"]): r for r in doc["rois"]}
+    sums: list[float | None] = []
+    for i in roi_ids:
+        row = by_id.get(int(i))
+        if row is None:
+            sums.append(None)
+            continue
+        tr = row.get("tc_norm")
+        if tr is None:
+            sums.append(None)
+        else:
+            sums.append(float(np.nansum(np.asarray(tr, dtype=np.float64))))
+    return {
+        "kind": str(kind),
+        "params": deepcopy(params),
+        "ids": [int(i) for i in roi_ids],
+        "tc_sums": sums,
+        "led": _led_spans(doc),
+    }
+
+
+def _params_equal(a: Any, b: Any) -> bool:
+    return deepcopy(a) == deepcopy(b)
+
+
+def _sigs_equal(a: Any, b: Any) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if str(a.get("kind")) != str(b.get("kind")):
+        return False
+    if not _params_equal(a.get("params") or {}, b.get("params") or {}):
+        return False
+    if [int(i) for i in (a.get("ids") or [])] != [int(i) for i in (b.get("ids") or [])]:
+        return False
+    if _led_list(a.get("led")) != _led_list(b.get("led")):
+        return False
+    sa = a.get("tc_sums") or []
+    sb = b.get("tc_sums") or []
+    if len(sa) != len(sb):
+        return False
+    for xa, xb in zip(sa, sb):
+        if xa is None and xb is None:
+            continue
+        if xa is None or xb is None:
+            return False
+        if not np.isclose(float(xa), float(xb), rtol=0.0, atol=1e-6, equal_nan=True):
+            return False
+    return True
+
+
+def _led_list(raw: Any) -> list[list[int]]:
+    return [list(x) for x in (raw or [])]
+
+
+def is_run_stale(doc: dict[str, Any], run: dict[str, Any]) -> bool:
+    if tc_norm_is_stale(doc):
+        return True
+    stored_ids = [int(i) for i in (run.get("roi_ids") or [])]
+    if stored_ids != current_iscell_ids(doc):
+        return True
+    current = analysis_input_sig(
+        doc, stored_ids, str(run.get("kind", "")), run.get("params") or {}
+    )
+    return not _sigs_equal(run.get("input_sig"), current)
+
+
+def refresh_stale_flags(doc: dict[str, Any]) -> int:
+    """Recompute `stale` on each run. Returns how many are stale."""
+    n = 0
+    for run in ensure_analyses(doc):
+        stale = is_run_stale(doc, run)
+        run["stale"] = stale
+        if stale:
+            n += 1
+    return n
+
+
+def compute_run(
+    doc: dict[str, Any], kind: str, params: dict[str, Any]
+) -> tuple[list[int], list[int]]:
+    """Return (roi_ids in pickle order, sort permutation). Matrices are not stored."""
+    del params  # unused until real methods land
+    kind = str(kind)
+    if kind == KIND_PLACEHOLDER:
+        ids = current_iscell_ids(doc)
+        return ids, list(ids)
+    raise ValueError(f"Unknown analysis kind: {kind}")
+
+
+def make_analysis_run(
+    doc: dict[str, Any],
+    *,
+    label: str,
+    kind: str,
+    params: dict[str, Any],
+    roi_ids: list[int],
+    order: list[int],
+    analysis_id: str | None = None,
+) -> dict[str, Any]:
+    now = _utc_now()
+    params = deepcopy(params)
+    roi_ids = [int(i) for i in roi_ids]
+    order = [int(i) for i in order]
+    return {
+        "id": analysis_id or next_analysis_id(doc),
+        "label": str(label).strip() or "Untitled",
+        "kind": str(kind),
+        "params": params,
+        "roi_ids": roi_ids,
+        "order": order,
+        "input_sig": analysis_input_sig(doc, roi_ids, kind, params),
+        "stale": False,
+        "created_utc": now,
+        "updated_utc": now,
+    }
+
+
+def apply_run_result(
+    run: dict[str, Any],
+    doc: dict[str, Any],
+    *,
+    label: str | None = None,
+    kind: str | None = None,
+    params: dict[str, Any] | None = None,
+    roi_ids: list[int],
+    order: list[int],
+) -> None:
+    if label is not None:
+        run["label"] = str(label).strip() or "Untitled"
+    if kind is not None:
+        run["kind"] = str(kind)
+    if params is not None:
+        run["params"] = deepcopy(params)
+    run["roi_ids"] = [int(i) for i in roi_ids]
+    run["order"] = [int(i) for i in order]
+    run["input_sig"] = analysis_input_sig(
+        doc, run["roi_ids"], str(run["kind"]), run.get("params") or {}
+    )
+    run["stale"] = False
+    run["updated_utc"] = _utc_now()
+
+
+def dropdown_label(run: dict[str, Any]) -> str:
+    name = str(run.get("label") or run.get("id") or "Untitled")
+    if run.get("stale"):
+        return f"{name} (stale)"
+    return name
+
+
+def apply_raster_sort(
+    rows: list[dict[str, Any]],
+    run: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Reorder visible raster rows.
+
+    Pickle (run is None): keep incoming order (caller already used pickle order).
+    Saved run: still-selected members in `order`, then new selected cells in
+    pickle order, then unselected (when present) in pickle order.
+    """
+    if run is None:
+        return list(rows)
+    by_id = {int(r["roi_id"]): r for r in rows}
+    selected = [r for r in rows if bool(r.get("iscell", True))]
+    unselected = [r for r in rows if not bool(r.get("iscell", True))]
+    used: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for i in (int(x) for x in (run.get("order") or [])):
+        row = by_id.get(i)
+        if row is None or not bool(row.get("iscell", True)):
+            continue
+        out.append(row)
+        used.add(i)
+    for r in selected:
+        i = int(r["roi_id"])
+        if i not in used:
+            out.append(r)
+            used.add(i)
+    out.extend(unselected)
+    return out
+
+
+def active_sort_run(doc: dict[str, Any]) -> dict[str, Any] | None:
+    sid = raster_sort_id(doc)
+    if sid == PICKLE_SORT_ID:
+        return None
+    return get_analysis(doc, sid)
+

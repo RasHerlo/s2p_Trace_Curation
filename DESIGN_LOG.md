@@ -402,6 +402,69 @@ Button **batch-select** beside the iscell control. Enter batch mode → freehand
 
 ---
 
+## Session 2026-08-24 — Analysis Tools (design, shell first)
+
+### Intent
+Clustering / ordering tools (similarity, HAC, PCA, later UMAP) to sort the raster and help drop or keep traces. Methods will expand; this session locks **logistics** and a **GUI shell**. Individual methods (PCA, HAC, …) are designed after the window exists.
+
+### Persistence
+Named runs live in `trc_curation.pkl` (schema **3**). No live sidecar. Matrices are **not** stored; the Analysis Tools window recomputes them. Each run stores params, the `iscell=True` member list, the sort **order**, and an input fingerprint. Explicit **Rebuild** (same idea as Rebuild tc_norm). Stale runs are kept and flagged, not deleted.
+
+Optional PNG/PDF snapshots later: `{suite2p_dir}/figures/` (sibling of `plane0/`), created lazily on first save. **Never** write those into `figure_for_cAMP_Neu_paper`. The paper repo will recreate panels from the pickle (`order`, labels, params) plus `data.bin` for images. No figure export in this slice.
+
+### v1 analysis input
+- Members: current `iscell=True` at last successful run (stored as `roi_ids`; Rebuild refreshes from current selected)
+- Trace field: **`tc_norm` only**
+- Time: full movie, LED+Shutter already NaN in `tc_norm`
+- Annotation-window / group comparisons: later, in the same window
+
+### Raster sort
+Raster Tools dropdown. Default **Pickle** = `doc["rois"]` order (`roi_id`), still filtered by Show. One active sort (`meta.raster_sort` = `"pickle"` or an analysis `id`); several runs may exist.
+
+A saved run: permutation for members still `iscell=True` and in Show; new selected cells (not in the run) append until Rebuild; non-cells (when Show includes them) follow in pickle order. Stale runs still apply that rule; the dropdown marks `(stale)`.
+
+### GUI
+**Analysis Tools** button opens a **non-modal** window (not a left-panel fold-out). Raster Tools keeps display controls + the sort dropdown. Method views stay in the analysis window.
+
+Iterative params: selected run (or **New**). Tweak → **Run** (preview in the window) → **Save** overwrites that run. **Save as** creates another dropdown entry. Unsaved tweaks never touch the pickle. **Rebuild** recomputes a saved run from current members/`tc_norm` using **saved** params.
+
+First slice: pickle `analyses` + migration, sort dropdown, analysis window (list, stale/rebuild, Save / Save as), one stub kind (`placeholder` = pickle order of selected). No PCA/HAC, no PNG export.
+
+### Run record (illustrative)
+
+```python
+{
+  "id": "a-001",
+  "label": "Untitled",
+  "kind": "placeholder",
+  "params": {},
+  "roi_ids": [...],   # iscell=True at last run, pickle order
+  "order": [...],     # permutation of roi_ids
+  "input_sig": {...}, # kind, params, ids, tc_norm sums, LED spans
+  "stale": False,
+  "created_utc": "...",
+  "updated_utc": "...",
+}
+```
+
+### Agreements (locked 2026-08-24)
+
+| ID | Agreement |
+|----|-----------|
+| AN-A1 | Analyses in `trc_curation.pkl`; schema 3; `analyses: []` + `meta.raster_sort` |
+| AN-A2 | Store params, `roi_ids`, `order`, fingerprint; do not store matrices |
+| AN-A3 | Members = `iscell=True`; v1 input = full-movie `tc_norm` |
+| AN-A4 | Raster dropdown: Pickle (default) + saved runs; persist `meta.raster_sort` |
+| AN-A5 | Pickle order = doc/`roi_id` order, filtered by Show (not iscell-block grouping) |
+| AN-A6 | Stale + explicit Rebuild; Rebuild uses last saved params |
+| AN-A7 | Save overwrites selected run; Save as adds a run; New is a draft until Save |
+| AN-A8 | Analysis Tools = separate non-modal window |
+| AN-A9 | Snapshots later → `{suite2p}/figures/` next to `plane0/`; never the figure git repo |
+| AN-A10 | Figure repo will read the pickle (plus `data.bin` for images); no export this slice |
+| AN-A11 | Method-specific UI (PCA, HAC, …) after the shell |
+
+---
+
 ## Inspiration / references
 - suite2p native outputs and GUI curation patterns (`iscell`, neuropil coeff)
 - Compensation: `trace_comp = F - x * Fneu`
@@ -414,5 +477,6 @@ Button **batch-select** beside the iscell control. Enter batch mode → freehand
 ## Implementation status
 - **v1 shell in place** (2026-08-09 + later remote updates):
   - curation I/O, suite2p_io, main GUI, mask edit, user settings
-- **Merge s2p folders:** design only (2026-08-23)
+- **Merge s2p folders / batch iscell / Add Mask:** implemented (2026-08-23+)
+- **Analysis Tools:** schema + raster sort dropdown + window shell (2026-08-24); methods TBD
 - Run: `python -m s2p_trace_curation`

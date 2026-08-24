@@ -22,6 +22,7 @@ from s2p_trace_curation.suite2p_io import (
     plane_dir,
     resolve_suite2p_dir,
 )
+from s2p_trace_curation.analyses import PICKLE_SORT_ID, ensure_analyses, get_analysis, refresh_stale_flags
 
 
 def _utc_now() -> str:
@@ -101,9 +102,11 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
             "VCorr": fov_imgs["VCorr"],
             "notes": "",
             "source_suite2p_abspath": str(suite2p_dir),
+            "raster_sort": PICKLE_SORT_ID,
         },
         "rois": rois,
         "annotations": [],
+        "analyses": [],
     }
     return doc
 
@@ -139,6 +142,11 @@ def load_curation(path: Path) -> dict[str, Any]:
     # Migrations
     if "annotations" not in doc or doc["annotations"] is None:
         doc["annotations"] = []
+    ensure_analyses(doc)
+    refresh_stale_flags(doc)
+    sid = str((doc.get("meta") or {}).get("raster_sort") or PICKLE_SORT_ID)
+    if sid != PICKLE_SORT_ID and get_analysis(doc, sid) is None:
+        doc.setdefault("meta", {})["raster_sort"] = PICKLE_SORT_ID
     doc["schema_version"] = SCHEMA_VERSION
     return doc
 
