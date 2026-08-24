@@ -465,6 +465,74 @@ First slice: pickle `analyses` + migration, sort dropdown, analysis window (list
 
 ---
 
+## Session 2026-08-24 — Analysis methods (inspiration + first kind)
+
+Sources (ideas, not libraries): [suite2p](https://github.com/RasHerlo/suite2p) rastermap / PC sort; [Agnos](https://github.com/RasHerlo/Agnos) Ružička, HAC, PCA + k-means elbow. Recompute from `tc_norm` in this repo. Do not import `suite2p.gui` or MATLAB.
+
+### Potential add-ons (parked list)
+
+| Kind | Axis | Role in this GUI | Status |
+|------|------|------------------|--------|
+| **HAC + similarity** | neurons | Leaf order → raster sort; optional tree cut → labels | **First method** |
+| **PCA sort** | neurons | Sort by loading on a chosen PC (suite2p / lab `post_process_neus`) | Next |
+| **PCA + k-means + elbow** | neurons | Agnos-style *k* on first PCs; labels + banded raster | After PCA |
+| **Rastermap** | neurons (optional time) | 1-D embedding; often the nicest large-*N* raster | Parked (see below) |
+| Similarity matrix only | neurons | Diagnostic view; seriation via HAC leaves, not a sort by itself | View inside HAC |
+| PCA trajectories / Vec k-means | **time** | Network states, manifolds (Agnos Vec) | Later (annotation windows) |
+| Rastermap time-sort | **time** | Sort frames | Later |
+| UMAP | neurons | Non-deterministic; persist embeddings if added | Later |
+
+### Rastermap vs iterative vetting
+
+Rastermap is built for “make ensembles visible in a raster.” Cost is **not** the blocker at curated *N* (tens–a few hundred `iscell=True`): a refit is typically seconds, vs milliseconds for HAC/PCA.
+
+Why it is a weaker **inner loop** after each iscell change:
+
+- Extra dependency (`rastermap`); more opaque knobs (`nPC`, embedding size, annealing).
+- Embedding can **jitter** between runs on the same traces — awkward when Rebuild is the contract.
+- Once the set is small, HAC/PCA are easier to explain (“these share Ružička mass”) and to pin for figures.
+
+Keep it as a **coarse first pass** when *N* is still large, then switch to HAC for the drop/keep loop. Not v1.
+
+### First method: HAC
+
+**Input:** `tc_norm` of current `iscell=True`; pairwise metric ignores NaN frames (LED+Shutter), not `nan_to_num(0)` (zeros look like silence for Ružička).
+
+**Output:** dendrogram leaf order → `order`. Optional later: cut → `labels`. Matrices recomputed in the window (similarity image + dendrogram).
+
+**Distance (stored in `params["metric"]`):**
+
+| Metric | Distance | Fit to `tc_norm` ∈ [0, 1] |
+|--------|----------|---------------------------|
+| **Ružička** (default) | \(1 - \sum\min / \sum\max\) | Shared positive mass; Agnos |
+| Pearson | \((1 - r) / 2\) so \(d \in [0, 1]\) | Shape; anti-corr = far; can cluster shared slow ramps |
+| Cosine | \(1 - \cos\) (no extra centering) | Direction of the raw vectors; with centering ≈ Pearson |
+| Euclidean | \(\lVert a-b \rVert_2\) | All frames equally, including quiet; needed for Ward |
+
+**Linkage (`params["linkage"]`):**
+
+| Linkage | Behaviour | Pair with |
+|---------|-----------|-----------|
+| **Average (UPGMA)** (default) | Robust; usual for traces / expression | Ružička, Pearson, cosine |
+| Complete | Tighter, compact groups; can split chains | Ružička if groups look too strung out |
+| Single | Chains through nearest neighbours | Avoid for traces |
+| Ward | Minimise variance | **Euclidean only** (not Ružička/Pearson) |
+
+**Proposed v1 defaults:** `metric=ruzicka`, `linkage=average`. Expose metric + linkage in the Method pane (disable Ward unless Euclidean). Cosine without centering is the closest “angle” cousin to Ružička; Pearson is the comparison for shape.
+
+**Params to persist:** `{metric, linkage}` (and later `cut_threshold` / `n_clusters` if we cut the tree).
+
+### Open questions (HAC)
+
+| # | Topic | Status |
+|---|--------|--------|
+| H1 | Default metric **Ružička**, linkage **average**; also **Euclidean + Ward** | **Agreed** |
+| H2 | Pearson distance = `(1-r)/2` (signed; anti-corr far) vs `1-\|r\|` | Open (not in v1) |
+| H3 | Tree cut / labels in v1 or leaf-order only first | **Order only** |
+| H4 | scipy dependency for `pdist` / `linkage` / dendrogram | **Yes** |
+
+---
+
 ## Inspiration / references
 - suite2p native outputs and GUI curation patterns (`iscell`, neuropil coeff)
 - Compensation: `trace_comp = F - x * Fneu`
@@ -478,5 +546,5 @@ First slice: pickle `analyses` + migration, sort dropdown, analysis window (list
 - **v1 shell in place** (2026-08-09 + later remote updates):
   - curation I/O, suite2p_io, main GUI, mask edit, user settings
 - **Merge s2p folders / batch iscell / Add Mask:** implemented (2026-08-23+)
-- **Analysis Tools:** schema + raster sort dropdown + window shell (2026-08-24); methods TBD
+- **Analysis Tools:** schema + window shell; **HAC** (Ružička/average default, Euclidean/Ward) implemented 2026-08-24; PCA / k-means / rastermap parked
 - Run: `python -m s2p_trace_curation`

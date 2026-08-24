@@ -19,7 +19,9 @@ PICKLE_SORT_ID = "pickle"
 FIGURES_DIRNAME = "figures"
 
 KIND_PLACEHOLDER = "placeholder"
+KIND_HAC = "hac"
 KIND_LABELS: dict[str, str] = {
+    KIND_HAC: "HAC (hierarchical clustering)",
     KIND_PLACEHOLDER: "Placeholder (selected pickle order)",
 }
 
@@ -178,11 +180,15 @@ def compute_run(
     doc: dict[str, Any], kind: str, params: dict[str, Any]
 ) -> tuple[list[int], list[int]]:
     """Return (roi_ids in pickle order, sort permutation). Matrices are not stored."""
-    del params  # unused until real methods land
     kind = str(kind)
     if kind == KIND_PLACEHOLDER:
         ids = current_iscell_ids(doc)
         return ids, list(ids)
+    if kind == KIND_HAC:
+        from s2p_trace_curation.hac import run_hac
+
+        result = run_hac(doc, params)
+        return result["roi_ids"], result["order"]
     raise ValueError(f"Unknown analysis kind: {kind}")
 
 
