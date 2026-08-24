@@ -37,6 +37,7 @@ QShortcut = QtWidgets.QShortcut
 QSlider = QtWidgets.QSlider
 QSpinBox = QtWidgets.QSpinBox
 QSplitter = QtWidgets.QSplitter
+QStackedWidget = QtWidgets.QStackedWidget
 QStatusBar = QtWidgets.QStatusBar
 QToolButton = QtWidgets.QToolButton
 QVBoxLayout = QtWidgets.QVBoxLayout
@@ -65,7 +66,22 @@ from s2p_trace_curation.curation import (
     save_curation,
     set_compensation_x,
 )
-from s2p_trace_curation.gui.colormaps import LUT_NAMES, apply_lut, make_lut
+from s2p_trace_curation.gui.colormaps import (
+    LUT_NAMES,
+    apply_lut,
+    colorize_raster,
+    lut_with_revert,
+    make_lut,
+    selected_row_lut,
+)
+from s2p_trace_curation.raster import (
+    fill_missing_tc_norm,
+    rebuild_all_tc_norm,
+    rois_for_raster,
+    stack_tc_norm,
+    tc_norm_is_stale,
+    tc_norm_sig,
+)
 from s2p_trace_curation.gui.overlays import (
     OverlayFilter,
     build_fov_overlay,
@@ -292,6 +308,12 @@ class MainWindow(QMainWindow):
         self._updating = False
         self._batch_mode = False
         self._batch_roi_ids: list[int] = []
+        self._raster_mode = False
+        self._raster_batch = False
+        self._tc_norm_stale = False
+        self._raster_row_ids: list[int] = []
+        self._raster_box_items: list[Any] = []
+        self._raster_last_shape: tuple[int, int] | None = None
 
         self._mask_edit_active = False
         self._mask_edit_kind: str | None = None  # "modify" | "add"
@@ -376,7 +398,18 @@ class MainWindow(QMainWindow):
             or self._batch_mode
         ):
             return
-        self.spin_roi.setValue(self.spin_roi.value() + delta)
+        ids = self._filtered_roi_ids()
+        if not ids:
+            return
+        try:
+            idx = ids.index(self.active_roi_id)
+        except ValueError:
+            idx = 0 if delta > 0 else len(ids) - 1
+            self._select_roi(ids[idx])
+            return
+        new_idx = idx + int(delta)
+        if 0 <= new_idx < len(ids):
+            self._select_roi(ids[new_idx])
 
     def _toggle_iscell_shortcut(self) -> None:
         if self.doc is None or self._focus_owns_arrows_or_space() or self._mask_edit_active:
@@ -415,9 +448,17 @@ class MainWindow(QMainWindow):
         top_split.setStretchFactor(1, 1)
         top_split.setStretchFactor(2, 1)
 
+        self.lower_stack = QStackedWidget()
+        center_layout.addWidget(self.lower_stack, stretch=2)
+
+        inspect_panel = QWidget()
+        inspect_layout = QVBoxLayout(inspect_panel)
+        inspect_layout.setContentsMargins(0, 0, 0, 0)
+        inspect_layout.setSpacing(6)
+
         # Traces
         self.trace_widget = pg.GraphicsLayoutWidget()
-        center_layout.addWidget(self.trace_widget, stretch=2)
+        inspect_layout.addWidget(self.trace_widget, stretch=2)
         self.plot_f = self.trace_widget.addPlot(row=0, col=0, title="F / x·Fneu")
         self.plot_comp = self.trace_widget.addPlot(row=1, col=0, title="trace_comp = F − x·Fneu")
         self.plot_bleach = self.trace_widget.addPlot(row=2, col=0, title="Bleach-corrected (placeholder)")
@@ -491,8 +532,10 @@ class MainWindow(QMainWindow):
                 self._cursor_clones[key].append(clone)
 
         # Thumbnails (aligned with W1–W3 via center column)
-        thumb_row = QHBoxLayout()
-        center_layout.addLayout(thumb_row)
+        thumb_wrap = QWidget()
+        thumb_row = QHBoxLayout(thumb_wrap)
+        thumb_row.setContentsMargins(0, 0, 0, 0)
+        inspect_layout.addWidget(thumb_wrap)
         self.thumb_views: list[pg.ImageView] = []
         self.thumb_labels: list[QLabel] = []
         for i in range(4):
@@ -511,6 +554,45 @@ class MainWindow(QMainWindow):
             thumb_row.addWidget(wrap)
             self.thumb_views.append(view)
             self.thumb_labels.append(lab)
+
+        raster_panel = QWidget()
+        raster_layout = QVBoxLayout(raster_panel)
+        raster_layout.setContentsMargins(0, 0, 0, 0)
+        raster_layout.setSpacing(6)
+
+        self.raster_view = ClickableImageView(on_click=self._on_raster_click)
+        self.raster_view.ui.histogram.hide()
+        self.raster_view.setMinimumHeight(180)
+        raster_layout.addWidget(self.raster_view, stretch=3)
+
+        self.plot_raster_trace = pg.PlotWidget(title="tc_norm")
+        self.plot_raster_trace.setMinimumHeight(100)
+        self.plot_raster_trace.showGrid(x=True, y=False, alpha=0.2)
+        self.plot_raster_trace.setLabel("bottom", "frame")
+        self.curve_raster_trace = self.plot_raster_trace.plot(
+            pen=pg.mkPen("#2ca02c", width=1.5)
+        )
+        self.raster_c0 = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            movable=True,
+            pen=pg.mkPen(C0_COLOR, width=2, style=Qt.PenStyle.SolidLine),
+        )
+        self.raster_trace_c0 = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            movable=True,
+            pen=pg.mkPen(C0_COLOR, width=2, style=Qt.PenStyle.SolidLine),
+        )
+        self.raster_view.getView().addItem(self.raster_c0)
+        self.raster_c0.setZValue(20)
+        self.plot_raster_trace.addItem(self.raster_trace_c0)
+        self.raster_c0.sigPositionChanged.connect(self._on_raster_c0_moved)
+        self.raster_trace_c0.sigPositionChanged.connect(self._on_raster_c0_moved)
+        raster_layout.addWidget(self.plot_raster_trace, stretch=1)
+
+        self.lower_stack.addWidget(inspect_panel)
+        self.lower_stack.addWidget(raster_panel)
 
         root_layout.addWidget(self._build_right_panel(), stretch=0)
 
@@ -615,6 +697,72 @@ class MainWindow(QMainWindow):
         roi_form.addRow(self.chk_iscell)
         roi_form.addRow("x (F−x·Fneu)", self.spin_x)
         layout.addWidget(roi)
+
+        raster = QGroupBox("Raster Tools")
+        raster_form = QFormLayout(raster)
+        raster_on_row = QHBoxLayout()
+        raster_on_row.addWidget(QLabel("OFF"))
+        self.slider_raster_on = QSlider(Qt.Orientation.Horizontal)
+        self.slider_raster_on.setMinimum(0)
+        self.slider_raster_on.setMaximum(1)
+        self.slider_raster_on.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider_raster_on.setTickInterval(1)
+        self.slider_raster_on.setSingleStep(1)
+        self.slider_raster_on.setPageStep(1)
+        self.slider_raster_on.setFixedWidth(80)
+        self.slider_raster_on.setEnabled(False)
+        self.slider_raster_on.setToolTip(
+            "OFF: traces + C1–C4 zooms. ON: raster plot + example / Co-Activity trace."
+        )
+        raster_on_row.addWidget(self.slider_raster_on)
+        raster_on_row.addWidget(QLabel("ON"))
+        raster_on_row.addStretch(1)
+
+        self.cmb_raster_show = QComboBox()
+        for key, label in FILTER_LABELS.items():
+            self.cmb_raster_show.addItem(label, key)
+        self.cmb_raster_show.setCurrentIndex(self.cmb_overlay.currentIndex())
+        self.cmb_raster_show.setEnabled(False)
+
+        self.cmb_raster_lut = QComboBox()
+        self.cmb_raster_lut.addItems(list(LUT_NAMES))
+        self.cmb_raster_lut.setEnabled(False)
+
+        self.chk_raster_revert = QCheckBox("Revert LUT")
+        self.chk_raster_revert.setEnabled(False)
+        self.chk_raster_revert.setToolTip("Flip the 0↔1 mapping of the current LUT")
+
+        raster_mode_row = QHBoxLayout()
+        raster_mode_row.addWidget(QLabel("Single"))
+        self.slider_raster_batch = QSlider(Qt.Orientation.Horizontal)
+        self.slider_raster_batch.setMinimum(0)
+        self.slider_raster_batch.setMaximum(1)
+        self.slider_raster_batch.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider_raster_batch.setTickInterval(1)
+        self.slider_raster_batch.setSingleStep(1)
+        self.slider_raster_batch.setPageStep(1)
+        self.slider_raster_batch.setFixedWidth(80)
+        self.slider_raster_batch.setEnabled(False)
+        self.slider_raster_batch.setToolTip(
+            "Single: selected ROI's tc_norm. Batch: mean of rows in the raster (Co-Activity)."
+        )
+        raster_mode_row.addWidget(self.slider_raster_batch)
+        raster_mode_row.addWidget(QLabel("Batch"))
+        raster_mode_row.addStretch(1)
+
+        self.btn_rebuild_tc_norm = QPushButton("Rebuild tc_norm")
+        self.btn_rebuild_tc_norm.setEnabled(False)
+        self.btn_rebuild_tc_norm.setToolTip(
+            "Recompute stored [0, 1] traces from current trace_comp and LED+Shutter ranges"
+        )
+
+        raster_form.addRow("Raster-mode", raster_on_row)
+        raster_form.addRow("Show", self.cmb_raster_show)
+        raster_form.addRow("LUT", self.cmb_raster_lut)
+        raster_form.addRow(self.chk_raster_revert)
+        raster_form.addRow("Mode", raster_mode_row)
+        raster_form.addRow(self.btn_rebuild_tc_norm)
+        layout.addWidget(raster)
         layout.addStretch(1)
 
         # connections
@@ -622,16 +770,22 @@ class MainWindow(QMainWindow):
         self.cmb_fov_lut.currentIndexChanged.connect(self._refresh_fov)
         self.spin_fov_lo.valueChanged.connect(self._refresh_fov)
         self.spin_fov_hi.valueChanged.connect(self._refresh_fov)
-        self.cmb_overlay.currentIndexChanged.connect(self._refresh_fov)
+        self.cmb_overlay.currentIndexChanged.connect(self._on_overlay_combo)
         self.cmb_mov_lut.currentIndexChanged.connect(self._refresh_movie_views)
         self.spin_mov_lo.valueChanged.connect(self._refresh_movie_views)
         self.spin_mov_hi.valueChanged.connect(self._refresh_movie_views)
         self.spin_roi.valueChanged.connect(self._on_roi_spin)
-        self.btn_roi_up.clicked.connect(lambda: self.spin_roi.setValue(self.spin_roi.value() + 1))
-        self.btn_roi_down.clicked.connect(lambda: self.spin_roi.setValue(self.spin_roi.value() - 1))
+        self.btn_roi_up.clicked.connect(lambda: self._roi_step(+1))
+        self.btn_roi_down.clicked.connect(lambda: self._roi_step(-1))
         self.chk_iscell.toggled.connect(self._on_iscell_toggled)
         self.spin_x.valueChanged.connect(self._on_x_changed)
         self.slider_mode.valueChanged.connect(self._on_mode_slider)
+        self.slider_raster_on.valueChanged.connect(self._on_raster_mode_slider)
+        self.cmb_raster_show.currentIndexChanged.connect(self._on_overlay_combo)
+        self.cmb_raster_lut.currentIndexChanged.connect(self._on_raster_display_changed)
+        self.chk_raster_revert.toggled.connect(self._on_raster_display_changed)
+        self.slider_raster_batch.valueChanged.connect(self._on_raster_batch_slider)
+        self.btn_rebuild_tc_norm.clicked.connect(self._rebuild_tc_norm)
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -925,6 +1079,9 @@ class MainWindow(QMainWindow):
                 idx = self.cmb_overlay.findData(str(filt))
                 if idx >= 0:
                     self.cmb_overlay.setCurrentIndex(idx)
+                    idx2 = self.cmb_raster_show.findData(str(filt))
+                    if idx2 >= 0:
+                        self.cmb_raster_show.setCurrentIndex(idx2)
             if lut := s.get("mov_lut"):
                 idx = self.cmb_mov_lut.findText(str(lut))
                 if idx >= 0:
@@ -1001,7 +1158,16 @@ class MainWindow(QMainWindow):
         self._init_display_levels()
         self._init_cursors()
         self._updating = False
+        self._raster_mode = False
+        self._raster_batch = False
+        self._raster_last_shape = None
+        self._updating = True
+        self.slider_raster_on.setValue(0)
+        self.slider_raster_batch.setValue(0)
+        self._updating = False
+        self.lower_stack.setCurrentIndex(0)
         self._select_roi(0, force=True)
+        self._ensure_active_roi_in_filter()
         self._persist_ui_settings(suite2p_dir=suite2p_dir)
         self.btn_modify.setEnabled(True)
         self.btn_add_mask.setEnabled(True)
@@ -1023,6 +1189,9 @@ class MainWindow(QMainWindow):
         w1.lasso_enabled = False
         w1.clear_lasso_drawing()
         self._apply_mode_controls()
+        self._tc_norm_stale = tc_norm_is_stale(doc)
+        self._update_rebuild_button()
+        self._set_raster_controls_enabled(True)
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -1121,6 +1290,7 @@ class MainWindow(QMainWindow):
             return
         reset_roi_from_suite2p(self.doc, self.suite2p_dir, self.active_roi_id)
         self.dirty = True
+        self._mark_tc_norm_stale()
         self._select_roi(self.active_roi_id, force=True)
         self.statusBar().showMessage(f"Reset ROI {self.active_roi_id} from suite2p")
 
@@ -1182,7 +1352,10 @@ class MainWindow(QMainWindow):
         self.btn_roi_down.setEnabled(single_ok)
         self.chk_iscell.setEnabled(not active and not self._batch_mode)
         self.spin_x.setEnabled(single_ok)
-        self.slider_mode.setEnabled(not active and self.doc is not None)
+        self.slider_mode.setEnabled(
+            not active and self.doc is not None and not self._raster_mode
+        )
+        self.slider_raster_on.setEnabled(not active and self.doc is not None)
         is_add = self._mask_edit_kind == "add"
         for w in (
             self.lbl_zoom_side,
@@ -1349,6 +1522,15 @@ class MainWindow(QMainWindow):
             return
         append_roi(self.doc, row)
         new_id = int(row["roi_id"])
+        if any(r.get("tc_norm") is not None for r in self.doc["rois"]):
+            was_stale = self._tc_norm_stale or tc_norm_is_stale(self.doc)
+            fill_missing_tc_norm(self.doc)
+            if was_stale:
+                self._tc_norm_stale = True
+            else:
+                self.doc.setdefault("meta", {})["tc_norm_sig"] = tc_norm_sig(self.doc)
+                self._tc_norm_stale = False
+            self._update_rebuild_button()
         self._add_mask_draft = None
         self._add_mask_center = None
         self._mask_edit_kind = None
@@ -1409,6 +1591,8 @@ class MainWindow(QMainWindow):
             self._mask_roi_changed = False
             self._mask_neu_changed = False
             self.dirty = True
+            if self._mask_edit_kind != "add":
+                self._mark_tc_norm_stale()
             self._refresh_traces(autoscale=True)
             self.extract_progress.setValue(100)
             self.statusBar().showMessage("Traces re-calculated from data.bin")
@@ -1487,10 +1671,66 @@ class MainWindow(QMainWindow):
     def _overlay_filter(self) -> OverlayFilter:
         return self.cmb_overlay.currentData()  # type: ignore[return-value]
 
+    def _filtered_roi_ids(self) -> list[int]:
+        if self.doc is None:
+            return []
+        return [int(r["roi_id"]) for r in rois_for_raster(self.doc["rois"], self._overlay_filter())]
+
+    def _on_overlay_combo(self) -> None:
+        if self._updating:
+            return
+        sender = self.sender()
+        key = None
+        if sender is self.cmb_overlay or sender is self.cmb_raster_show:
+            key = sender.currentData()  # type: ignore[union-attr]
+        if key is None:
+            key = self.cmb_overlay.currentData()
+        self._updating = True
+        for cmb in (self.cmb_overlay, self.cmb_raster_show):
+            idx = cmb.findData(key)
+            if idx >= 0 and cmb.currentIndex() != idx:
+                cmb.setCurrentIndex(idx)
+        self._updating = False
+        jumped = self._ensure_active_roi_in_filter()
+        if not jumped:
+            self._refresh_fov()
+            if self._raster_mode:
+                self._refresh_raster()
+
+    def _ensure_active_roi_in_filter(self) -> bool:
+        """If the active ROI is hidden by Show ROIs, jump to the nearest visible one."""
+        if self.doc is None or self._mask_edit_active or self._batch_mode:
+            return False
+        ids = self._filtered_roi_ids()
+        if not ids:
+            return False
+        if self.active_roi_id in ids:
+            return False
+        arr = np.asarray(ids, dtype=np.int64)
+        nearest = int(arr[int(np.argmin(np.abs(arr - self.active_roi_id)))])
+        self._select_roi(nearest)
+        return True
+
     def _on_roi_spin(self, value: int) -> None:
         if self._updating or self.doc is None or self._mask_edit_active or self._batch_mode:
             return
-        self._select_roi(value)
+        ids = self._filtered_roi_ids()
+        if value in ids or not ids:
+            self._select_roi(value)
+            return
+        prev = self.active_roi_id
+        direction = 1 if value > prev else -1
+        if direction > 0:
+            candidates = [i for i in ids if i > prev]
+            nxt = min(candidates) if candidates else prev
+        else:
+            candidates = [i for i in ids if i < prev]
+            nxt = max(candidates) if candidates else prev
+        self._updating = True
+        self.spin_roi.setValue(nxt)
+        self._updating = False
+        if nxt != self.active_roi_id:
+            self._select_roi(nxt)
 
     def _select_roi(self, roi_id: int, force: bool = False) -> None:
         if self.doc is None:
@@ -1546,6 +1786,11 @@ class MainWindow(QMainWindow):
     def _on_mode_slider(self, value: int) -> None:
         if self._updating:
             return
+        if self._raster_mode and int(value) == 1:
+            self._updating = True
+            self.slider_mode.setValue(0)
+            self._updating = False
+            return
         batch = int(value) == 1
         if batch == self._batch_mode:
             return
@@ -1579,7 +1824,9 @@ class MainWindow(QMainWindow):
         self.btn_modify.setEnabled(single and self.doc is not None)
         self.btn_add_mask.setEnabled(single and self.doc is not None)
         self.chk_iscell.setEnabled(not self._mask_edit_active and self.doc is not None)
-        self.slider_mode.setEnabled(not self._mask_edit_active and self.doc is not None)
+        self.slider_mode.setEnabled(
+            not self._mask_edit_active and self.doc is not None and not self._raster_mode
+        )
         # Grey out W3 chrome in batch mode
         self.w3.setEnabled(not self._batch_mode)
         for w in (
@@ -1627,20 +1874,260 @@ class MainWindow(QMainWindow):
             return
         self._row()["iscell"] = bool(checked)
         self.dirty = True
-        self._refresh_fov()
+        jumped = self._ensure_active_roi_in_filter()
+        if not jumped:
+            self._refresh_fov()
+            if self._raster_mode:
+                self._refresh_raster()
 
     def _on_x_changed(self, value: float) -> None:
         if self._updating or self.doc is None or self._batch_mode:
             return
         set_compensation_x(self._row(), float(value))
         self.dirty = True
+        self._mark_tc_norm_stale()
         self._refresh_traces(autoscale=True)
+
+    def _set_raster_controls_enabled(self, enabled: bool) -> None:
+        self.slider_raster_on.setEnabled(enabled and not self._mask_edit_active)
+        self.cmb_raster_show.setEnabled(enabled)
+        self.cmb_raster_lut.setEnabled(enabled)
+        self.chk_raster_revert.setEnabled(enabled)
+        self.slider_raster_batch.setEnabled(enabled)
+        self._update_rebuild_button()
+
+    def _update_rebuild_button(self) -> None:
+        self.btn_rebuild_tc_norm.setEnabled(
+            self.doc is not None and self._tc_norm_stale
+        )
+
+    def _mark_tc_norm_stale(self) -> None:
+        if self.doc is None:
+            return
+        has_any = any(row.get("tc_norm") is not None for row in self.doc["rois"])
+        if not has_any:
+            self._tc_norm_stale = False
+            self._update_rebuild_button()
+            return
+        self._tc_norm_stale = True
+        self._update_rebuild_button()
+
+    def _on_raster_mode_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        self._set_raster_mode(int(value) == 1)
+
+    def _on_raster_batch_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        self._raster_batch = int(value) == 1
+        if self._raster_mode:
+            self._refresh_raster(auto_range=False)
+
+    def _on_raster_display_changed(self) -> None:
+        if self._updating or not self._raster_mode:
+            return
+        self._refresh_raster(auto_range=False)
+
+    def _set_raster_mode(self, on: bool) -> None:
+        on = bool(on)
+        self._raster_mode = on
+        self._updating = True
+        self.slider_raster_on.setValue(1 if on else 0)
+        self._updating = False
+        if on:
+            if self._batch_mode:
+                self._updating = True
+                self.slider_mode.setValue(0)
+                self._updating = False
+                self._batch_mode = False
+                self._batch_roi_ids = []
+                w1: ClickableImageView = self.w1.image_view  # type: ignore[attr-defined]
+                w1.lasso_enabled = False
+                w1.clear_lasso_drawing()
+            if self.doc is not None:
+                has = [row.get("tc_norm") is not None for row in self.doc["rois"]]
+                if self.doc["rois"] and not any(has):
+                    rebuild_all_tc_norm(self.doc)
+                    self.dirty = True
+                    self._tc_norm_stale = False
+                elif any(has) and not all(has):
+                    if fill_missing_tc_norm(self.doc):
+                        self.dirty = True
+                    self._tc_norm_stale = True
+                else:
+                    self._tc_norm_stale = tc_norm_is_stale(self.doc)
+                self._update_rebuild_button()
+            self.lower_stack.setCurrentIndex(1)
+            self._ensure_active_roi_in_filter()
+            self._refresh_raster()
+            self.statusBar().showMessage("Raster-mode ON")
+        else:
+            self.lower_stack.setCurrentIndex(0)
+            if self.doc is not None:
+                self._refresh_traces()
+                self._debounce.start()
+            self.statusBar().showMessage("Raster-mode OFF")
+        self._apply_mode_controls()
+
+    def _rebuild_tc_norm(self) -> None:
+        if self.doc is None:
+            return
+        rebuild_all_tc_norm(self.doc)
+        self.dirty = True
+        self._tc_norm_stale = False
+        self._update_rebuild_button()
+        if self._raster_mode:
+            self._refresh_raster()
+        self.statusBar().showMessage("Rebuilt tc_norm from trace_comp and LED+Shutter")
+
+    def _clear_raster_boxes(self) -> None:
+        view = self.raster_view.getView()
+        for item in self._raster_box_items:
+            try:
+                view.removeItem(item)
+            except Exception:
+                pass
+        self._raster_box_items.clear()
+
+    def _add_raster_group_box(
+        self, x: float, y: float, w: float, h: float, color: str
+    ) -> None:
+        if w <= 0 or h <= 0:
+            return
+        rect = QtWidgets.QGraphicsRectItem(x, y, w, h)
+        rect.setPen(pg.mkPen(color, width=1))
+        rect.setBrush(QtGui.QBrush(Qt.BrushStyle.NoBrush))
+        rect.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        rect.setZValue(10)
+        self.raster_view.getView().addItem(rect)
+        self._raster_box_items.append(rect)
+
+    def _refresh_raster(self, auto_range: bool = False) -> None:
+        if self.doc is None or not self._raster_mode:
+            return
+        nframes = int(self.doc["meta"]["nframes"])
+        if fill_missing_tc_norm(self.doc):
+            self.dirty = True
+            self._tc_norm_stale = True
+            self._update_rebuild_button()
+        rows = rois_for_raster(self.doc["rois"], self._overlay_filter())
+        self._raster_row_ids = [int(r["roi_id"]) for r in rows]
+        n_sel = sum(1 for r in rows if bool(r.get("iscell", True)))
+        n_unsel = len(rows) - n_sel
+        if rows:
+            matrix = stack_tc_norm(rows, nframes)
+        else:
+            matrix = np.full((1, nframes), np.nan, dtype=np.float64)
+        lut = lut_with_revert(self.cmb_raster_lut.currentText(), self.chk_raster_revert.isChecked())
+        highlight_row: int | None = None
+        highlight_lut = None
+        if not self._raster_batch and rows:
+            try:
+                highlight_row = self._raster_row_ids.index(self.active_roi_id)
+            except ValueError:
+                highlight_row = None
+            if highlight_row is not None:
+                highlight_lut = selected_row_lut(self.chk_raster_revert.isChecked())
+        rgb = colorize_raster(
+            matrix, lut, highlight_row=highlight_row, highlight_lut=highlight_lut
+        )
+        shape = (rgb.shape[0], rgb.shape[1])
+        vb = self.raster_view.getView()
+        prev_range = vb.viewRange() if self._raster_last_shape is not None else None
+        do_range = auto_range or self._raster_last_shape != shape
+        self.raster_view.setImage(
+            rgb, autoLevels=False, levels=(0, 255), autoRange=do_range
+        )
+        if not do_range and prev_range is not None:
+            vb.setRange(xRange=prev_range[0], yRange=prev_range[1], padding=0)
+        self._raster_last_shape = shape
+        self._clear_raster_boxes()
+        if rows:
+            self._add_raster_group_box(-0.5, -0.5, float(nframes), float(n_sel), "#e74c3c")
+            self._add_raster_group_box(
+                -0.5, float(n_sel) - 0.5, float(nframes), float(n_unsel), "#3498db"
+            )
+        self.raster_c0.setZValue(20)
+        self._updating = True
+        self.raster_c0.setValue(self.cursor_c0.value())
+        self.raster_trace_c0.setValue(self.cursor_c0.value())
+        self._updating = False
+        self._refresh_raster_trace(rows, matrix, reset_view=do_range)
+
+    def _refresh_raster_trace(
+        self,
+        rows: list[dict[str, Any]],
+        matrix: np.ndarray,
+        *,
+        reset_view: bool = True,
+    ) -> None:
+        nframes = matrix.shape[1]
+        xs = np.arange(nframes)
+        if self._raster_batch:
+            if rows:
+                valid = np.isfinite(matrix)
+                counts = valid.sum(axis=0)
+                sums = np.nansum(np.where(valid, matrix, 0.0), axis=0)
+                y = np.divide(
+                    sums,
+                    counts,
+                    out=np.full(counts.shape, np.nan, dtype=np.float64),
+                    where=counts > 0,
+                )
+            else:
+                y = np.full(nframes, np.nan, dtype=np.float64)
+            self.plot_raster_trace.setTitle("Co-Activity")
+        else:
+            y = np.full(nframes, np.nan, dtype=np.float64)
+            try:
+                row = self._row()
+                tr = row.get("tc_norm")
+                if tr is not None:
+                    arr = np.asarray(tr, dtype=np.float64)
+                    n_copy = min(arr.shape[0], nframes)
+                    y[:n_copy] = arr[:n_copy]
+            except Exception:
+                pass
+            self.plot_raster_trace.setTitle(f"tc_norm — ROI {self.active_roi_id}")
+        self.curve_raster_trace.setData(xs, y)
+        if reset_view:
+            self._updating = True
+            self.plot_raster_trace.enableAutoRange(axis="y")
+            self.plot_raster_trace.setXRange(0, max(nframes - 1, 1), padding=0.02)
+            self._updating = False
+
+    def _on_raster_click(self, y: int, x: int) -> None:
+        if not self._raster_mode or self.doc is None or self._mask_edit_active:
+            return
+        if not self._raster_row_ids:
+            return
+        row = int(y)
+        if 0 <= row < len(self._raster_row_ids):
+            self._select_roi(self._raster_row_ids[row])
+
+    def _on_raster_c0_moved(self) -> None:
+        if self._updating or self.doc is None:
+            return
+        sender = self.sender()
+        pos = float(sender.value()) if sender is not None else float(self.raster_c0.value())
+        n = int(self.doc["meta"]["nframes"])
+        val = float(np.clip(pos, 0, max(n - 1, 0)))
+        self._updating = True
+        self.cursor_c0.setValue(val)
+        self.raster_c0.setValue(val)
+        self.raster_trace_c0.setValue(val)
+        self._updating = False
+        self._sync_cursor_clones()
+        self._refresh_movie_views()
 
     # ------------------------------------------------------------- rendering
     def _refresh_all(self) -> None:
         self._refresh_fov()
         self._refresh_movie_views()
         self._refresh_traces(autoscale=True)
+        if self._raster_mode:
+            self._refresh_raster(auto_range=False)
         self._update_cursor_labels()
         self._debounce.start()
 
@@ -2203,6 +2690,8 @@ class MainWindow(QMainWindow):
                 self.list_ann.setCurrentItem(item)
                 break
         self._refresh_traces(autoscale=False)
+        if prop == "LED+Shutter":
+            self._mark_tc_norm_stale()
         self.statusBar().showMessage(
             f"Added {prop} annotation [{s}–{e}] (inclusive)"
         )
@@ -2214,10 +2703,13 @@ class MainWindow(QMainWindow):
         if not ids:
             return
         anns = ensure_annotations(self.doc)
+        dropped = [a for a in anns if int(a["ann_id"]) in ids]
         self.doc["annotations"] = [a for a in anns if int(a["ann_id"]) not in ids]
         self.dirty = True
         self._rebuild_ann_list()
         self._refresh_traces(autoscale=False)
+        if any(str(a["property"]) == "LED+Shutter" for a in dropped):
+            self._mark_tc_norm_stale()
         self.statusBar().showMessage(f"Deleted {len(ids)} annotation(s)")
 
     def _on_ann_selection_changed(self) -> None:
@@ -2266,6 +2758,14 @@ class MainWindow(QMainWindow):
         for i, pos in enumerate(positions):
             self._cursor_clones["f"][i].setValue(pos)
             self._cursor_clones["bleach"][i].setValue(pos)
+        if hasattr(self, "raster_c0"):
+            was = self._updating
+            self._updating = True
+            try:
+                self.raster_c0.setValue(self.cursor_c0.value())
+                self.raster_trace_c0.setValue(self.cursor_c0.value())
+            finally:
+                self._updating = was
 
     def _on_c0_moved(self) -> None:
         if self._updating or self.doc is None:
@@ -2309,7 +2809,7 @@ class MainWindow(QMainWindow):
             label.setPos(fi, val)
 
     def _update_thumbnails(self) -> None:
-        if self.doc is None:
+        if self.doc is None or self._raster_mode:
             return
         if self._batch_mode:
             grey = np.full((64, 64, 3), 80, dtype=np.uint8)

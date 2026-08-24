@@ -6,6 +6,9 @@ import numpy as np
 
 LUT_NAMES = ("grey", "turbo", "viridis", "magma", "jet")
 
+# LED+Shutter / missing samples in the raster (all LUTs)
+RASTER_NAN_RGB = (128, 128, 128)
+
 
 def _lerp_table(stops: list[tuple[float, tuple[int, int, int]]], n: int = 256) -> np.ndarray:
     xs = np.array([s[0] for s in stops], dtype=np.float64)
@@ -65,6 +68,57 @@ def make_lut(name: str) -> np.ndarray:
             ]
         )
     raise ValueError(f"Unknown LUT: {name}")
+
+
+def lut_with_revert(name: str, revert: bool) -> np.ndarray:
+    """LUT for raster values in [0, 1].
+
+    Grey defaults to inverted (0=white, 1=black). ``revert`` flips 0↔1 for
+    any LUT, so grey+revert is conventional black-to-white.
+    """
+    lut = make_lut(name)
+    invert = (name.lower() in ("grey", "gray")) != bool(revert)
+    if invert:
+        return lut[::-1].copy()
+    return lut
+
+
+def selected_row_lut(revert: bool) -> np.ndarray:
+    """Highlight LUT: 0=red, 1=black (flipped when ``revert`` is on)."""
+    t = np.linspace(0.0, 1.0, 256, dtype=np.float64)[:, None]
+    red = np.array([255.0, 0.0, 0.0], dtype=np.float64)
+    black = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    if not revert:
+        colors = (1.0 - t) * red + t * black
+    else:
+        colors = (1.0 - t) * black + t * red
+    return np.clip(colors, 0, 255).astype(np.uint8)
+
+
+def colorize_raster(
+    matrix: np.ndarray,
+    lut: np.ndarray,
+    *,
+    highlight_row: int | None = None,
+    highlight_lut: np.ndarray | None = None,
+) -> np.ndarray:
+    """Map (n_roi, nframes) unit values to RGB; NaNs → mid-grey."""
+    img = np.asarray(matrix, dtype=np.float64)
+    if img.ndim != 2:
+        raise ValueError("raster matrix must be 2D")
+    finite = np.isfinite(img)
+    scaled = np.clip(np.nan_to_num(img, nan=0.0), 0.0, 1.0)
+    idx = (scaled * 255.0).astype(np.uint8)
+    rgb = lut[idx]
+    if (
+        highlight_row is not None
+        and highlight_lut is not None
+        and 0 <= int(highlight_row) < rgb.shape[0]
+    ):
+        r = int(highlight_row)
+        rgb[r] = highlight_lut[idx[r]]
+    rgb[~finite] = np.asarray(RASTER_NAN_RGB, dtype=np.uint8)
+    return rgb
 
 
 def apply_lut(
