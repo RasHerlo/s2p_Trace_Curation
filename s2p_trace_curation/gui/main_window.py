@@ -111,6 +111,13 @@ from s2p_trace_curation.user_settings import (
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
 
+# Default window size as a fraction of the current screen work area.
+# Tuned to 2456×1100 on a 3440×1392 ultrawide work area.
+_DEFAULT_SCREEN_W_FRAC = 2456 / 3440
+_DEFAULT_SCREEN_H_FRAC = 1100 / 1392
+_MIN_WINDOW_W = 960
+_MIN_WINDOW_H = 700
+
 FILTER_LABELS = {
     "noncell": "non-selected (iscell=0)",
     "cell": "selected (iscell=1)",
@@ -298,7 +305,6 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("s2p Trace Curation")
-        self.resize(1920, 1100)
 
         self.suite2p_dir: Path | None = None
         self.doc: dict[str, Any] | None = None
@@ -350,6 +356,23 @@ class MainWindow(QMainWindow):
         self._apply_saved_settings()
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Open a suite2p folder to begin.")
+        self._apply_default_window_size()
+
+    def _apply_default_window_size(self) -> None:
+        """Size and center the window from the current screen work area."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(2456, 1100)
+            return
+        avail = screen.availableGeometry()
+        w = int(round(avail.width() * _DEFAULT_SCREEN_W_FRAC))
+        h = int(round(avail.height() * _DEFAULT_SCREEN_H_FRAC))
+        w = max(_MIN_WINDOW_W, min(w, avail.width() - 16))
+        h = max(_MIN_WINDOW_H, min(h, avail.height() - 16))
+        self.resize(w, h)
+        frame = self.frameGeometry()
+        frame.moveCenter(avail.center())
+        self.move(frame.topLeft())
 
     # ------------------------------------------------------------------ UI
     def _build_menu(self) -> None:
