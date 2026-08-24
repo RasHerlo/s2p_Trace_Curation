@@ -314,11 +314,91 @@ Toolkit: **pyqtgraph + Qt bindings** (PyQt5 preferred on Windows/conda; PySide6 
 | L4 | Open = choose suite2p folder; load existing `trc_curation.pkl` if present, else generate from `plane0` |
 
 ### Future GUI features (parked)
-- **Modify mask** tools (paint/erase, neuropil ring, lam weights)
 - Bleach-correction panel + lower trace
 - Manual Y-scale controls
-- Merge / split / draw new ROIs
+- Merge / split / draw **new** ROIs within one plane (distinct from folder merge)
 - Multi-plane or cross-recording comparison
+
+---
+
+## Session 2026-08-23 — Merge s2p folders (design)
+
+### Intent (draft)
+File menu → **Merge s2p folders**: dialog to pick two suite2p folders + output parent + name (default `suite2p_merged`). Write a normal suite2p tree (`plane0/` + files) plus `merge_note.txt` beside `plane0/`. Typical case: merge `_anat` / `_temp` (or temporal vs Cellpose) arms under the same Chan folder onto one shared movie.
+
+Aligned with handoff note: intercalate ROI sets on the **same** registered movie; do not re-run suite2p registration here.
+
+### UI (draft)
+- Inputs: Folder A, Folder B (each = suite2p dir containing `plane0/`)
+- Output parent: if A and B share a parent, suggest that parent; editable
+- Output name: default `suite2p_merged`; editable
+- Result path: `{output_parent}/{output_name}/`
+
+### Open questions (merge)
+| # | Topic | Status |
+|---|--------|--------|
+| M1 | Merge = concatenate ROI catalogs; require **identical** `data.bin` | **Agreed** |
+| M2 | Canonical movie = copy from Folder A (identical under check) | **Agreed** |
+| M3 | `Ly`/`Lx`/`nframes` must match | **Agreed** |
+| M4 | ROI order = dialog pick order (A then B) | **Agreed** |
+| M5 | Keep overlapping ROIs | **Agreed** |
+| M6 | Provenance: `merge_note.txt` only for now | **Agreed** |
+| M7 | No input pickles; clean merged folder; pickle on first Open | **Agreed** |
+| M8 | If output exists: warn and ask (overwrite / abort) | **Agreed** |
+| M9 | Auto-Open merged folder after success | **Agreed** |
+| M10 | Write zero `spks.npy` for merged ROI count | **Agreed** |
+| M11 | `data.bin` check toggle: **sample** (default) vs **full**; persist in settings | **Agreed** |
+
+### Implementation (2026-08-23)
+- `s2p_trace_curation/merge_suite2p.py` — compare + merge
+- `s2p_trace_curation/gui/merge_dialog.py` — File → Merge s2p folders…
+
+---
+
+## Session 2026-08-23 — Batch iscell selection (design)
+
+### Intent (draft)
+Button **batch-select** beside the iscell control. Enter batch mode → freehand region on **W1** → ROIs in that region become the batch. iscell checkbox applies to **all** in the batch (default on). Traces show **mean F** and **mean Fneu**. **W3** disabled/greyed until returning to single-ROI mode.
+
+### Open questions (batch)
+| # | Topic | Status |
+|---|--------|--------|
+| B1 | Single↔Batch **slide toggle** | **Agreed** |
+| B2 | Closed **lasso** on W1 | **Agreed** |
+| B3 | Include if **>50%** of ROI pixels inside | **Agreed** |
+| B4 | Only ROIs shown by W1 overlay filter | **Agreed** |
+| B5 | Snap all batch ROIs to iscell **checked** on lasso | **Agreed** |
+| B6 | Mean F, mean Fneu, mean display `trace_comp` with **x=1** (stored x unchanged) | **Agreed** |
+| B7 | New lasso replaces previous batch | **Agreed** |
+| B8 | Disable Modify mask + ROI # (+ x edit) in batch | **Agreed** |
+| B9 | W3 greyed / disabled in batch | **Agreed** |
+
+### Implementation
+- `s2p_trace_curation/batch_select.py`
+- Main window: mode slider, lasso on W1, batch iscell, mean traces
+
+---
+
+## Session 2026-08-23 — Add Mask / new ROI (design)
+
+### Intent (draft)
+**Mask tools → Add Mask** (under Modify Mask). Pick a point on **W1** with a small red cross cursor → **W3** shows a square zoom centered there (size from typical pickle zoom / ROI∪neuropil scale). Paint new F and Fneu masks from scratch (same brush modes as Modify Mask). Extra zoom in/out on W3. Finish with **Save Mask** (not Apply) → append ROI + extracted traces to `trc_curation.pkl`.
+
+### Open questions (add mask)
+| # | Topic | Status |
+|---|--------|--------|
+| N1 | Initial W3 square = **median** of existing zooms; then adjustable | **Agreed** |
+| N2 | Zoom: **wheel + +/-** (and side spin) | **Agreed** |
+| N3 | `roi_id` = max+1 | **Agreed** |
+| N4 | Default `iscell=True`, `x=1.0` | **Agreed** |
+| N5 | Forbid empty F / Fneu on Save | **Agreed** |
+| N6 | Pickle-only (no suite2p file rewrite) | **Agreed** |
+| N7 | Click again moves center **before painting**; Cancel discards | **Agreed** |
+| N8 | Disable Add Mask in batch mode | **Agreed** |
+
+### Implementation
+- Mask tools: **Add Mask** → W1 red cross → W3 paint → **Save Mask**
+- `empty_roi_draft` / `append_roi` in `curation.py`; brush allows empty-start builds
 
 ---
 
@@ -327,13 +407,12 @@ Toolkit: **pyqtgraph + Qt bindings** (PyQt5 preferred on Windows/conda; PySide6 
 - Compensation: `trace_comp = F - x * Fneu`
 - Portability: USB / cross-machine folder moves with co-located pickle
 - Multi-cursor trace inspection + debounced frame thumbnails
+- Handoff: temporal vs Cellpose / anat vs temp ROI intercalation on shared `data.bin`
 
 ---
 
 ## Implementation status
-- **v1 shell in place** (2026-08-09):
-  - `s2p_trace_curation/curation.py` — create/load/save `trc_curation.pkl`, reset ROI, set `x`
-  - `s2p_trace_curation/suite2p_io.py` — ops/stat/traces/`data.bin` + zoom geometry
-  - `s2p_trace_curation/gui/main_window.py` — FOV / movie / zoom / traces / cursors / thumbnails
-- Placeholders: Modify mask, bleach subplot
+- **v1 shell in place** (2026-08-09 + later remote updates):
+  - curation I/O, suite2p_io, main GUI, mask edit, user settings
+- **Merge s2p folders:** design only (2026-08-23)
 - Run: `python -m s2p_trace_curation`

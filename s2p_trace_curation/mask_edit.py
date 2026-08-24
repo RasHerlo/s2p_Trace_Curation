@@ -111,7 +111,8 @@ def apply_brush(
         if not to_add:
             return False, ""
         steal = [y * Lx + x for y, x in to_add if (y * Lx + x) in neu_set]
-        if len(neu_set) - len(set(steal)) < 1:
+        # Allow building F from empty when Fneu is still empty (new ROI).
+        if neu_set and len(neu_set) - len(set(steal)) < 1:
             return False, "Cannot add to F: would empty Fneu-ROI"
         for y, x in to_add:
             neu_set.discard(y * Lx + x)
@@ -119,7 +120,10 @@ def apply_brush(
         for (y, x), w in zip(to_add, new_lam.tolist()):
             roi_map[(y, x)] = float(w)
         _pack_roi(row, list(roi_map.keys()), [roi_map[k] for k in roi_map])
-        _pack_neu(row, sorted(neu_set))
+        if neu_set:
+            _pack_neu(row, sorted(neu_set))
+        else:
+            row["neuropil"]["ipix"] = np.zeros(0, dtype=np.int32)
         return True, f"Added {len(to_add)} F pixel(s)"
 
     if mode == "remove_f":
@@ -138,13 +142,19 @@ def apply_brush(
         if not to_add_lin:
             return False, ""
         steal_coords = [(i // Lx, i % Lx) for i in to_add_lin if (i // Lx, i % Lx) in roi_map]
-        if len(roi_map) - len(steal_coords) < 1:
+        # Allow building Fneu from empty when F is still empty (new ROI).
+        if roi_map and len(roi_map) - len(steal_coords) < 1:
             return False, "Cannot add to Fneu: would empty F-ROI"
         for y, x in steal_coords:
             del roi_map[(y, x)]
         for i in to_add_lin:
             neu_set.add(i)
-        _pack_roi(row, list(roi_map.keys()), [roi_map[k] for k in roi_map])
+        if roi_map:
+            _pack_roi(row, list(roi_map.keys()), [roi_map[k] for k in roi_map])
+        else:
+            row["roi"]["ypix"] = np.zeros(0, dtype=np.int32)
+            row["roi"]["xpix"] = np.zeros(0, dtype=np.int32)
+            row["roi"]["lam"] = np.zeros(0, dtype=np.float32)
         _pack_neu(row, sorted(neu_set))
         return True, f"Added {len(to_add_lin)} Fneu pixel(s)"
 

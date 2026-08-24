@@ -8,22 +8,22 @@ Needs NumPy, pyqtgraph, and a Qt binding (**PyQt5** in this project’s venv).
 
 ```powershell
 # from the repo root — prefer a non-Anaconda Python so Cursor accepts the env
-# e.g. "C:\Program Files\Python310\python.exe" -m venv .venv
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+# e.g. "C:\Program Files\Python310\python.exe" -m venv venv_s2p_tc
+python -m venv venv_s2p_tc
+.\venv_s2p_tc\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install -e .
 ```
 
-`.venv` is gitignored. Recreate it anytime with the commands above.
+`venv_s2p_tc` is gitignored. Recreate it anytime with the commands above.
 
 **Note:** If Cursor says the environment/module is not supported, the venv was likely created from Anaconda. Recreate it with a stock CPython install (above), then select  
-`.venv\Scripts\python.exe` as the interpreter.
+`venv_s2p_tc\Scripts\python.exe` as the interpreter.
 
 ## Run
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
+.\venv_s2p_tc\Scripts\Activate.ps1
 python -m s2p_trace_curation
 ```
 
