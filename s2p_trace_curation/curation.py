@@ -103,6 +103,7 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
             "source_suite2p_abspath": str(suite2p_dir),
         },
         "rois": rois,
+        "annotations": [],
     }
     return doc
 
@@ -131,13 +132,14 @@ def load_curation(path: Path) -> dict[str, Any]:
     if not isinstance(doc, dict) or "rois" not in doc or "meta" not in doc:
         raise ValueError(f"Invalid curation pickle: {path}")
     version = int(doc.get("schema_version", 0))
-    if version != SCHEMA_VERSION:
-        # Placeholder for future migrations
-        if version > SCHEMA_VERSION:
-            raise ValueError(
-                f"Pickle schema_version {version} is newer than supported {SCHEMA_VERSION}"
-            )
-        doc["schema_version"] = SCHEMA_VERSION
+    if version > SCHEMA_VERSION:
+        raise ValueError(
+            f"Pickle schema_version {version} is newer than supported {SCHEMA_VERSION}"
+        )
+    # Migrations
+    if "annotations" not in doc or doc["annotations"] is None:
+        doc["annotations"] = []
+    doc["schema_version"] = SCHEMA_VERSION
     return doc
 
 

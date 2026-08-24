@@ -25,6 +25,8 @@ QGroupBox = QtWidgets.QGroupBox
 QHBoxLayout = QtWidgets.QHBoxLayout
 QLabel = QtWidgets.QLabel
 QLineEdit = QtWidgets.QLineEdit
+QListWidget = QtWidgets.QListWidget
+QListWidgetItem = QtWidgets.QListWidgetItem
 QMainWindow = QtWidgets.QMainWindow
 QMessageBox = QtWidgets.QMessageBox
 QProgressBar = QtWidgets.QProgressBar
@@ -40,6 +42,16 @@ QWidget = QtWidgets.QWidget
 
 from copy import deepcopy
 
+from s2p_trace_curation.annotations import (
+    ANNOTATION_PROPERTIES,
+    PROPERTY_SPEC,
+    apply_nan_mask,
+    ensure_annotations,
+    make_annotation,
+    nan_mask_from_annotations,
+    next_ann_id,
+    validate_annotation_frames,
+)
 from s2p_trace_curation.batch_select import mean_traces_for_rois, rois_in_lasso
 from s2p_trace_curation.curation import (
     append_roi,
@@ -257,6 +269,11 @@ class MainWindow(QMainWindow):
         self._w3_x0 = 0
         self._w3_side = 1
 
+        self._ann_panel_open = False
+        self._ann_span_items: list[pg.LinearRegionItem] = []
+        self._trace_x_user_zoomed = False
+        self._trace_y_locked = {"f": False, "comp": False, "bleach": False}
+
         self._lut_cache = {name: make_lut(name) for name in LUT_NAMES}
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -365,6 +382,15 @@ class MainWindow(QMainWindow):
         self.plot_comp.setXLink(self.plot_f)
         self.plot_bleach.setXLink(self.plot_f)
         self.plot_bleach.setLabel("bottom", "frame")
+        for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
+            plot.setMouseEnabled(x=True, y=True)
+            plot.showGrid(x=True, y=False, alpha=0.2)
+            vb = plot.getViewBox()
+            vb.setMouseMode(pg.ViewBox.PanMode)
+        self.plot_f.sigXRangeChanged.connect(self._on_trace_x_range_changed)
+        self.plot_f.sigYRangeChanged.connect(lambda *_: self._on_trace_y_range_changed("f"))
+        self.plot_comp.sigYRangeChanged.connect(lambda *_: self._on_trace_y_range_changed("comp"))
+        self.plot_bleach.sigYRangeChanged.connect(lambda *_: self._on_trace_y_range_changed("bleach"))
         self.plot_f.addLegend(offset=(10, 10))
         self.curve_f = self.plot_f.plot(pen=pg.mkPen("#1f77b4", width=1), name="F")
         self.curve_fneu = self.plot_f.plot(pen=pg.mkPen("#ff7f0e", width=1), name="x·Fneu")
@@ -677,6 +703,106 @@ class MainWindow(QMainWindow):
         actions_layout.addStretch(1)
         layout.addWidget(actions)
 
+        # Annotation tools
+        ann = QGroupBox("Annotation tools")
+        ann_outer = QVBoxLayout(ann)
+        self.btn_ann_tools = QPushButton("Annotation Tools")
+        self.btn_ann_tools.setEnabled(False)
+        self.btn_ann_tools.setToolTip("Add global time-range annotations on traces")
+        self.btn_ann_tools.clicked.connect(self._toggle_ann_panel)
+        ann_outer.addWidget(self.btn_ann_tools)
+
+        self.ann_panel = QWidget()
+        ann_layout = QVBoxLayout(self.ann_panel)
+        ann_layout.setContentsMargins(0, 0, 0, 0)
+
+        ann_form = QFormLayout()
+        self.cmb_ann_prop = QComboBox()
+        for name in ANNOTATION_PROPERTIES:
+            self.cmb_ann_prop.addItem(name)
+        self.spin_ann_start = QSpinBox()
+        self.spin_ann_end = QSpinBox()
+        for s in (self.spin_ann_start, self.spin_ann_end):
+            s.setRange(0, 0)
+        ann_form.addRow("Property", self.cmb_ann_prop)
+        ann_form.addRow("Start frame", self.spin_ann_start)
+        ann_form.addRow("End frame", self.spin_ann_end)
+        ann_layout.addLayout(ann_form)
+
+        c0_row = QHBoxLayout()
+        self.btn_ann_start_c0 = QPushButton("Start ← C0")
+        self.btn_ann_end_c0 = QPushButton("End ← C0")
+        self.btn_ann_start_c0.clicked.connect(self._ann_start_from_c0)
+        self.btn_ann_end_c0.clicked.connect(self._ann_end_from_c0)
+        c0_row.addWidget(self.btn_ann_start_c0)
+        c0_row.addWidget(self.btn_ann_end_c0)
+        ann_layout.addLayout(c0_row)
+
+        self.btn_ann_add = QPushButton("Add annotation")
+        self.btn_ann_add.clicked.connect(self._add_annotation)
+        ann_layout.addWidget(self.btn_ann_add)
+
+        self.list_ann = QListWidget()
+        self.list_ann.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_ann.itemSelectionChanged.connect(self._on_ann_selection_changed)
+        ann_layout.addWidget(self.list_ann)
+
+        self.lbl_ann_hint = QLabel(
+            "Select LED+Shutter to NaN that range for display/Y-scale."
+        )
+        self.lbl_ann_hint.setWordWrap(True)
+        ann_layout.addWidget(self.lbl_ann_hint)
+
+        self.btn_ann_delete = QPushButton("Delete selected")
+        self.btn_ann_delete.clicked.connect(self._delete_selected_annotations)
+        ann_layout.addWidget(self.btn_ann_delete)
+
+        zoom_trace_row = QHBoxLayout()
+        self.btn_trace_fit = QPushButton("Fit X")
+        self.btn_trace_fit.setToolTip("Reset X range to full recording (plots stay linked)")
+        self.btn_trace_fit.clicked.connect(self._fit_trace_x)
+        zoom_trace_row.addWidget(self.btn_trace_fit)
+        ann_layout.addLayout(zoom_trace_row)
+
+        self.ann_panel.setVisible(False)
+        ann_outer.addWidget(self.ann_panel)
+        layout.addWidget(ann)
+
+        # Independent Y scales for the three linked-X trace plots
+        yscale = QGroupBox("Trace Y scale")
+        yscale_layout = QVBoxLayout(yscale)
+        self._trace_y_spins: dict[str, tuple[QDoubleSpinBox, QDoubleSpinBox]] = {}
+        for key, label in (
+            ("f", "F / Fneu"),
+            ("comp", "trace_comp"),
+            ("bleach", "bleach"),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            spin_lo = QDoubleSpinBox()
+            spin_hi = QDoubleSpinBox()
+            for s in (spin_lo, spin_hi):
+                s.setRange(-1e12, 1e12)
+                s.setDecimals(2)
+                s.setMaximumWidth(90)
+            spin_lo.setToolTip(f"{label}: Y lower")
+            spin_hi.setToolTip(f"{label}: Y upper")
+            btn_set = QPushButton("Set")
+            btn_set.setFixedWidth(36)
+            btn_set.setToolTip(f"Apply Y range to {label} only")
+            btn_fit = QPushButton("Fit")
+            btn_fit.setFixedWidth(36)
+            btn_fit.setToolTip(f"Autoscale Y for {label} only")
+            row.addWidget(spin_lo)
+            row.addWidget(spin_hi)
+            row.addWidget(btn_set)
+            row.addWidget(btn_fit)
+            yscale_layout.addLayout(row)
+            self._trace_y_spins[key] = (spin_lo, spin_hi)
+            btn_set.clicked.connect(lambda _=False, k=key: self._apply_trace_y_spins(k))
+            btn_fit.clicked.connect(lambda _=False, k=key: self._fit_trace_y(k))
+        layout.addWidget(yscale)
+
         layout.addStretch(1)
 
         self.btn_save = QPushButton("Save")
@@ -787,7 +913,14 @@ class MainWindow(QMainWindow):
         self._persist_ui_settings(suite2p_dir=suite2p_dir)
         self.btn_modify.setEnabled(True)
         self.btn_add_mask.setEnabled(True)
+        self.btn_ann_tools.setEnabled(True)
         self.btn_save.setEnabled(True)
+        nframes = int(doc["meta"]["nframes"])
+        self.spin_ann_start.setRange(0, max(0, nframes - 1))
+        self.spin_ann_end.setRange(0, max(0, nframes - 1))
+        self.spin_ann_end.setValue(max(0, nframes - 1))
+        ensure_annotations(doc)
+        self._rebuild_ann_list()
         self._batch_mode = False
         self._batch_roi_ids = []
         self._updating = True
@@ -1610,9 +1743,12 @@ class MainWindow(QMainWindow):
                 F = Fneu = comp = np.zeros(int(self.doc["meta"]["nframes"]), dtype=np.float64)
                 x_disp = 1.0
             xs = np.arange(F.shape[0])
-            self.curve_f.setData(xs, F)
-            self.curve_fneu.setData(xs, x_disp * Fneu)
-            self.curve_comp.setData(xs, comp)
+            F_d = self._display_trace(F)
+            Fneu_d = self._display_trace(x_disp * Fneu)
+            comp_d = self._display_trace(comp)
+            self.curve_f.setData(xs, F_d)
+            self.curve_fneu.setData(xs, Fneu_d)
+            self.curve_comp.setData(xs, comp_d)
             self.plot_f.setTitle(
                 f"mean F / mean Fneu (batch n={len(self._batch_roi_ids)}, display x=1)"
             )
@@ -1624,18 +1760,222 @@ class MainWindow(QMainWindow):
             x = float(row["compensation"]["x"])
             comp = np.asarray(row["compensation"]["trace_comp"], dtype=np.float64)
             xs = np.arange(F.shape[0])
-            self.curve_f.setData(xs, F)
-            self.curve_fneu.setData(xs, x * Fneu)
-            self.curve_comp.setData(xs, comp)
+            self.curve_f.setData(xs, self._display_trace(F))
+            self.curve_fneu.setData(xs, self._display_trace(x * Fneu))
+            self.curve_comp.setData(xs, self._display_trace(comp))
             self.plot_f.setTitle("F / Fneu")
             self.plot_comp.setTitle("trace_comp = F − x·Fneu")
+        self._refresh_ann_spans()
         if autoscale:
-            self.plot_f.enableAutoRange(axis="y")
-            self.plot_comp.enableAutoRange(axis="y")
+            for k in self._trace_y_locked:
+                self._trace_y_locked[k] = False
+            self._autoscale_trace_y("f")
+            self._autoscale_trace_y("comp")
+            self._autoscale_trace_y("bleach")
             self.plot_f.enableAutoRange(axis="x", enable=False)
             self.plot_comp.enableAutoRange(axis="x", enable=False)
-            self.plot_f.setXRange(0, max(len(F) - 1, 1), padding=0.02)
+            if not self._trace_x_user_zoomed:
+                n = int(self.doc["meta"]["nframes"])
+                self.plot_f.setXRange(0, max(n - 1, 1), padding=0.02)
+        else:
+            # Respect per-plot Y locks; only autoscale unlocked plots (e.g. after LED NaNs)
+            for key in ("f", "comp", "bleach"):
+                if not self._trace_y_locked[key]:
+                    self._autoscale_trace_y(key)
+        self._sync_trace_y_spins_from_plots()
         self._update_cursor_labels()
+
+    def _trace_plot(self, key: str) -> pg.PlotItem:
+        return {"f": self.plot_f, "comp": self.plot_comp, "bleach": self.plot_bleach}[key]
+
+    def _on_trace_y_range_changed(self, which: str) -> None:
+        if self._updating:
+            return
+        self._trace_y_locked[which] = True
+        self._sync_trace_y_spins_from_plots(which)
+
+    def _autoscale_trace_y(self, key: str) -> None:
+        self._updating = True
+        self._trace_plot(key).enableAutoRange(axis="y")
+        self._updating = False
+        self._trace_y_locked[key] = False
+        self._sync_trace_y_spins_from_plots(key)
+
+    def _fit_trace_y(self, key: str) -> None:
+        self._autoscale_trace_y(key)
+
+    def _apply_trace_y_spins(self, key: str) -> None:
+        spin_lo, spin_hi = self._trace_y_spins[key]
+        lo = float(spin_lo.value())
+        hi = float(spin_hi.value())
+        if hi <= lo:
+            hi = lo + 1.0
+            spin_hi.setValue(hi)
+        self._updating = True
+        self._trace_plot(key).setYRange(lo, hi, padding=0)
+        self._updating = False
+        self._trace_y_locked[key] = True
+
+    def _sync_trace_y_spins_from_plots(self, only: str | None = None) -> None:
+        keys = (only,) if only is not None else ("f", "comp", "bleach")
+        for key in keys:
+            if key not in self._trace_y_spins:
+                continue
+            _, (ymin, ymax) = self._trace_plot(key).viewRange()
+            spin_lo, spin_hi = self._trace_y_spins[key]
+            spin_lo.blockSignals(True)
+            spin_hi.blockSignals(True)
+            spin_lo.setValue(float(ymin))
+            spin_hi.setValue(float(ymax))
+            spin_lo.blockSignals(False)
+            spin_hi.blockSignals(False)
+
+    def _display_trace(self, trace: np.ndarray) -> np.ndarray:
+        """Copy of trace with NaNs for selected LED+Shutter annotations (display only)."""
+        if self.doc is None:
+            return np.asarray(trace, dtype=np.float64)
+        anns = ensure_annotations(self.doc)
+        active = self._selected_ann_ids()
+        if not active:
+            return np.asarray(trace, dtype=np.float64)
+        mask = nan_mask_from_annotations(len(trace), anns, active)
+        if not mask.any():
+            return np.asarray(trace, dtype=np.float64)
+        return apply_nan_mask(trace, mask)
+
+    def _selected_ann_ids(self) -> set[int]:
+        ids: set[int] = set()
+        for item in self.list_ann.selectedItems():
+            ann_id = item.data(Qt.ItemDataRole.UserRole)
+            if ann_id is not None:
+                ids.add(int(ann_id))
+        return ids
+
+    def _toggle_ann_panel(self) -> None:
+        self._ann_panel_open = not self._ann_panel_open
+        self.ann_panel.setVisible(self._ann_panel_open)
+        if self._ann_panel_open:
+            self._rebuild_ann_list()
+            self._refresh_ann_spans()
+
+    def _ann_start_from_c0(self) -> None:
+        self.spin_ann_start.setValue(int(round(self.cursor_c0.value())))
+
+    def _ann_end_from_c0(self) -> None:
+        self.spin_ann_end.setValue(int(round(self.cursor_c0.value())))
+
+    def _on_trace_x_range_changed(self, *_args: object) -> None:
+        if self._updating:
+            return
+        self._trace_x_user_zoomed = True
+
+    def _fit_trace_x(self) -> None:
+        if self.doc is None:
+            return
+        n = int(self.doc["meta"]["nframes"])
+        self._updating = True
+        self._trace_x_user_zoomed = False
+        self.plot_f.setXRange(0, max(n - 1, 1), padding=0.02)
+        self._updating = False
+
+    def _rebuild_ann_list(self) -> None:
+        self.list_ann.blockSignals(True)
+        self.list_ann.clear()
+        if self.doc is None:
+            self.list_ann.blockSignals(False)
+            return
+        for ann in ensure_annotations(self.doc):
+            prop = str(ann["property"])
+            text = (
+                f"#{ann['ann_id']}  {prop}  "
+                f"[{ann['start_frame']}–{ann['end_frame']}]"
+            )
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, int(ann["ann_id"]))
+            color = PROPERTY_SPEC.get(prop, {}).get("color", "#888888")
+            item.setForeground(QtGui.QColor(color))
+            self.list_ann.addItem(item)
+        self.list_ann.blockSignals(False)
+
+    def _add_annotation(self) -> None:
+        if self.doc is None:
+            return
+        nframes = int(self.doc["meta"]["nframes"])
+        try:
+            s, e = validate_annotation_frames(
+                self.spin_ann_start.value(), self.spin_ann_end.value(), nframes
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid frames", str(exc))
+            return
+        prop = self.cmb_ann_prop.currentText()
+        ann = make_annotation(next_ann_id(self.doc), prop, s, e)
+        ensure_annotations(self.doc).append(ann)
+        self.dirty = True
+        self._rebuild_ann_list()
+        # Select the new item
+        for i in range(self.list_ann.count()):
+            item = self.list_ann.item(i)
+            if item is not None and int(item.data(Qt.ItemDataRole.UserRole)) == ann["ann_id"]:
+                self.list_ann.setCurrentItem(item)
+                break
+        self._refresh_traces(autoscale=False)
+        self.statusBar().showMessage(
+            f"Added {prop} annotation [{s}–{e}] (inclusive)"
+        )
+
+    def _delete_selected_annotations(self) -> None:
+        if self.doc is None:
+            return
+        ids = self._selected_ann_ids()
+        if not ids:
+            return
+        anns = ensure_annotations(self.doc)
+        self.doc["annotations"] = [a for a in anns if int(a["ann_id"]) not in ids]
+        self.dirty = True
+        self._rebuild_ann_list()
+        self._refresh_traces(autoscale=False)
+        self.statusBar().showMessage(f"Deleted {len(ids)} annotation(s)")
+
+    def _on_ann_selection_changed(self) -> None:
+        # Selecting LED+Shutter applies display NaNs; rescale Y accordingly.
+        self._refresh_traces(autoscale=False)
+
+    def _clear_ann_spans(self) -> None:
+        for item in self._ann_span_items:
+            try:
+                item.scene().removeItem(item)  # type: ignore[union-attr]
+            except Exception:
+                for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
+                    try:
+                        plot.removeItem(item)
+                    except Exception:
+                        pass
+        self._ann_span_items.clear()
+
+    def _refresh_ann_spans(self) -> None:
+        self._clear_ann_spans()
+        if self.doc is None:
+            return
+        selected = self._selected_ann_ids()
+        for ann in ensure_annotations(self.doc):
+            prop = str(ann["property"])
+            color = PROPERTY_SPEC.get(prop, {}).get("color", "#888888")
+            s = float(ann["start_frame"])
+            e = float(ann["end_frame"]) + 1.0  # through inclusive end
+            alpha = 90 if int(ann["ann_id"]) in selected else 45
+            c = QtGui.QColor(color)
+            c.setAlpha(alpha)
+            for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
+                region = pg.LinearRegionItem(
+                    values=(s, e),
+                    movable=False,
+                    brush=c,
+                    pen=pg.mkPen(color, width=1),
+                )
+                region.setZValue(-10)
+                plot.addItem(region)
+                self._ann_span_items.append(region)
 
     # -------------------------------------------------------------- cursors
     def _sync_cursor_clones(self) -> None:
