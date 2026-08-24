@@ -22,6 +22,7 @@ QDoubleSpinBox = QtWidgets.QDoubleSpinBox
 QFileDialog = QtWidgets.QFileDialog
 QFormLayout = QtWidgets.QFormLayout
 QGroupBox = QtWidgets.QGroupBox
+QGraphicsProxyWidget = QtWidgets.QGraphicsProxyWidget
 QHBoxLayout = QtWidgets.QHBoxLayout
 QLabel = QtWidgets.QLabel
 QLineEdit = QtWidgets.QLineEdit
@@ -37,6 +38,7 @@ QSlider = QtWidgets.QSlider
 QSpinBox = QtWidgets.QSpinBox
 QSplitter = QtWidgets.QSplitter
 QStatusBar = QtWidgets.QStatusBar
+QToolButton = QtWidgets.QToolButton
 QVBoxLayout = QtWidgets.QVBoxLayout
 QWidget = QtWidgets.QWidget
 
@@ -102,6 +104,44 @@ FILTER_LABELS = {
 # Analysis cursor colors (dotted)
 C_COLORS = ["#ff8c00", "#da70d6", "#7fffd4", "#ffa07a"]
 C0_COLOR = "#ffff66"  # solid movie cursor
+
+_NUDGE_FRAC = 0.05  # fraction of visible span per axis-arrow click
+
+
+class _NudgePair(QWidget):
+    """Two tiny arrow buttons at one end of an axis."""
+
+    def __init__(self, vertical: bool, on_plus, on_minus, tooltip: str) -> None:
+        super().__init__()
+        self.setToolTip(tooltip)
+        layout: QVBoxLayout | QHBoxLayout
+        if vertical:
+            layout = QVBoxLayout(self)
+            plus = self._arrow(Qt.ArrowType.UpArrow, on_plus)
+            minus = self._arrow(Qt.ArrowType.DownArrow, on_minus)
+            layout.addWidget(plus)
+            layout.addWidget(minus)
+        else:
+            layout = QHBoxLayout(self)
+            minus = self._arrow(Qt.ArrowType.LeftArrow, on_minus)
+            plus = self._arrow(Qt.ArrowType.RightArrow, on_plus)
+            layout.addWidget(minus)
+            layout.addWidget(plus)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("background: rgba(40, 40, 40, 180);")
+
+    @staticmethod
+    def _arrow(kind: Qt.ArrowType, slot) -> QToolButton:
+        btn = QToolButton()
+        btn.setArrowType(kind)
+        btn.setFixedSize(14, 14)
+        btn.setAutoRepeat(True)
+        btn.setAutoRepeatDelay(250)
+        btn.setAutoRepeatInterval(50)
+        btn.clicked.connect(slot)
+        return btn
 
 
 class ClickableImageView(pg.ImageView):
@@ -270,9 +310,11 @@ class MainWindow(QMainWindow):
         self._w3_side = 1
 
         self._ann_panel_open = False
+        self._scale_panel_open = False
         self._ann_span_items: list[pg.LinearRegionItem] = []
         self._trace_x_user_zoomed = False
         self._trace_y_locked = {"f": False, "comp": False, "bleach": False}
+        self._scale_nudges: dict[str, dict[str, QGraphicsProxyWidget]] = {}
 
         self._lut_cache = {name: make_lut(name) for name in LUT_NAMES}
         self._debounce = QTimer(self)
@@ -324,7 +366,7 @@ class MainWindow(QMainWindow):
 
     def _focus_owns_arrows_or_space(self) -> bool:
         w = QApplication.focusWidget()
-        return isinstance(w, (QAbstractSpinBox, QComboBox, QLineEdit))
+        return isinstance(w, (QAbstractSpinBox, QComboBox, QLineEdit, QToolButton))
 
     def _roi_step(self, delta: int) -> None:
         if (
@@ -385,12 +427,16 @@ class MainWindow(QMainWindow):
         for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
             plot.setMouseEnabled(x=True, y=True)
             plot.showGrid(x=True, y=False, alpha=0.2)
+            plot.hideButtons()
             vb = plot.getViewBox()
             vb.setMouseMode(pg.ViewBox.PanMode)
+            vb.sigResized.connect(self._reposition_scale_nudges)
         self.plot_f.sigXRangeChanged.connect(self._on_trace_x_range_changed)
         self.plot_f.sigYRangeChanged.connect(lambda *_: self._on_trace_y_range_changed("f"))
         self.plot_comp.sigYRangeChanged.connect(lambda *_: self._on_trace_y_range_changed("comp"))
         self.plot_bleach.sigYRangeChanged.connect(lambda *_: self._on_trace_y_range_changed("bleach"))
+        self.trace_widget.scene().sigMouseClicked.connect(self._on_trace_scene_clicked)
+        self._install_scale_nudges()
         self.plot_f.addLegend(offset=(10, 10))
         self.curve_f = self.plot_f.plot(pen=pg.mkPen("#1f77b4", width=1), name="F")
         self.curve_fneu = self.plot_f.plot(pen=pg.mkPen("#ff7f0e", width=1), name="x·Fneu")
@@ -757,21 +803,71 @@ class MainWindow(QMainWindow):
         self.btn_ann_delete.clicked.connect(self._delete_selected_annotations)
         ann_layout.addWidget(self.btn_ann_delete)
 
-        zoom_trace_row = QHBoxLayout()
-        self.btn_trace_fit = QPushButton("Fit X")
-        self.btn_trace_fit.setToolTip("Reset X range to full recording (plots stay linked)")
-        self.btn_trace_fit.clicked.connect(self._fit_trace_x)
-        zoom_trace_row.addWidget(self.btn_trace_fit)
-        ann_layout.addLayout(zoom_trace_row)
-
         self.ann_panel.setVisible(False)
         ann_outer.addWidget(self.ann_panel)
         layout.addWidget(ann)
 
-        # Independent Y scales for the three linked-X trace plots
-        yscale = QGroupBox("Trace Y scale")
-        yscale_layout = QVBoxLayout(yscale)
+        # Scaling tools (fold-out, same pattern as Annotation tools)
+        scale = QGroupBox("Scaling tools")
+        scale_outer = QVBoxLayout(scale)
+        self.btn_scale_tools = QPushButton("Scaling Tools")
+        self.btn_scale_tools.setEnabled(False)
+        self.btn_scale_tools.setToolTip("Trace X/Y limits, box zoom, and Reset")
+        self.btn_scale_tools.clicked.connect(self._toggle_scale_panel)
+        scale_outer.addWidget(self.btn_scale_tools)
+
+        self.scale_panel = QWidget()
+        scale_layout = QVBoxLayout(self.scale_panel)
+        scale_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.chk_box_zoom = QCheckBox("Box zoom")
+        self.chk_box_zoom.setToolTip(
+            "On: left-drag a rectangle to zoom (shared X, that plot's Y).\n"
+            "Off: left-drag pans."
+        )
+        self.chk_box_zoom.toggled.connect(self._on_box_zoom_toggled)
+        scale_layout.addWidget(self.chk_box_zoom)
+
+        self.btn_reset_all_traces = QPushButton("Reset all")
+        self.btn_reset_all_traces.setToolTip(
+            "Restore original autoscale: full time axis and Y on all traces"
+        )
+        self.btn_reset_all_traces.clicked.connect(self._reset_all_trace_scales)
+        scale_layout.addWidget(self.btn_reset_all_traces)
+
+        hint = QLabel(
+            "Reset returns that axis to autoscale. Double-click a plot to Reset Y."
+        )
+        hint.setWordWrap(True)
+        scale_layout.addWidget(hint)
+
         self._trace_y_spins: dict[str, tuple[QDoubleSpinBox, QDoubleSpinBox]] = {}
+
+        def _limit_spin(decimals: int = 2) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
+            spin.setRange(-1e12, 1e12)
+            spin.setDecimals(decimals)
+            spin.setMaximumWidth(90)
+            spin.setKeyboardTracking(False)
+            return spin
+
+        x_row = QHBoxLayout()
+        x_row.addWidget(QLabel("Time (X)"))
+        self.spin_x_lo = _limit_spin(1)
+        self.spin_x_hi = _limit_spin(1)
+        self.spin_x_lo.setToolTip("X lower (frame)")
+        self.spin_x_hi.setToolTip("X upper (frame)")
+        self.spin_x_lo.valueChanged.connect(self._apply_trace_x_spins)
+        self.spin_x_hi.valueChanged.connect(self._apply_trace_x_spins)
+        btn_reset_x = QPushButton("Reset")
+        btn_reset_x.setFixedWidth(52)
+        btn_reset_x.setToolTip("Autoscale X to the full recording (plots stay linked)")
+        btn_reset_x.clicked.connect(self._fit_trace_x)
+        x_row.addWidget(self.spin_x_lo)
+        x_row.addWidget(self.spin_x_hi)
+        x_row.addWidget(btn_reset_x)
+        scale_layout.addLayout(x_row)
+
         for key, label in (
             ("f", "F / Fneu"),
             ("comp", "trace_comp"),
@@ -779,29 +875,25 @@ class MainWindow(QMainWindow):
         ):
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
-            spin_lo = QDoubleSpinBox()
-            spin_hi = QDoubleSpinBox()
-            for s in (spin_lo, spin_hi):
-                s.setRange(-1e12, 1e12)
-                s.setDecimals(2)
-                s.setMaximumWidth(90)
+            spin_lo = _limit_spin()
+            spin_hi = _limit_spin()
             spin_lo.setToolTip(f"{label}: Y lower")
             spin_hi.setToolTip(f"{label}: Y upper")
-            btn_set = QPushButton("Set")
-            btn_set.setFixedWidth(36)
-            btn_set.setToolTip(f"Apply Y range to {label} only")
-            btn_fit = QPushButton("Fit")
-            btn_fit.setFixedWidth(36)
-            btn_fit.setToolTip(f"Autoscale Y for {label} only")
+            btn_reset = QPushButton("Reset")
+            btn_reset.setFixedWidth(52)
+            btn_reset.setToolTip(f"Autoscale Y for {label} only")
             row.addWidget(spin_lo)
             row.addWidget(spin_hi)
-            row.addWidget(btn_set)
-            row.addWidget(btn_fit)
-            yscale_layout.addLayout(row)
+            row.addWidget(btn_reset)
+            scale_layout.addLayout(row)
             self._trace_y_spins[key] = (spin_lo, spin_hi)
-            btn_set.clicked.connect(lambda _=False, k=key: self._apply_trace_y_spins(k))
-            btn_fit.clicked.connect(lambda _=False, k=key: self._fit_trace_y(k))
-        layout.addWidget(yscale)
+            spin_lo.valueChanged.connect(lambda _=0.0, k=key: self._apply_trace_y_spins(k))
+            spin_hi.valueChanged.connect(lambda _=0.0, k=key: self._apply_trace_y_spins(k))
+            btn_reset.clicked.connect(lambda _=False, k=key: self._fit_trace_y(k))
+
+        self.scale_panel.setVisible(False)
+        scale_outer.addWidget(self.scale_panel)
+        layout.addWidget(scale)
 
         layout.addStretch(1)
 
@@ -914,6 +1006,7 @@ class MainWindow(QMainWindow):
         self.btn_modify.setEnabled(True)
         self.btn_add_mask.setEnabled(True)
         self.btn_ann_tools.setEnabled(True)
+        self.btn_scale_tools.setEnabled(True)
         self.btn_save.setEnabled(True)
         nframes = int(doc["meta"]["nframes"])
         self.spin_ann_start.setRange(0, max(0, nframes - 1))
@@ -1805,18 +1898,24 @@ class MainWindow(QMainWindow):
         self._autoscale_trace_y(key)
 
     def _apply_trace_y_spins(self, key: str) -> None:
+        if self._updating or key not in self._trace_y_spins:
+            return
         spin_lo, spin_hi = self._trace_y_spins[key]
         lo = float(spin_lo.value())
         hi = float(spin_hi.value())
         if hi <= lo:
             hi = lo + 1.0
+            spin_hi.blockSignals(True)
             spin_hi.setValue(hi)
+            spin_hi.blockSignals(False)
         self._updating = True
         self._trace_plot(key).setYRange(lo, hi, padding=0)
         self._updating = False
         self._trace_y_locked[key] = True
 
     def _sync_trace_y_spins_from_plots(self, only: str | None = None) -> None:
+        if not hasattr(self, "_trace_y_spins"):
+            return
         keys = (only,) if only is not None else ("f", "comp", "bleach")
         for key in keys:
             if key not in self._trace_y_spins:
@@ -1829,6 +1928,180 @@ class MainWindow(QMainWindow):
             spin_hi.setValue(float(ymax))
             spin_lo.blockSignals(False)
             spin_hi.blockSignals(False)
+        if only is None:
+            self._sync_trace_x_spins_from_plots()
+
+    def _apply_trace_x_spins(self, *_args: object) -> None:
+        if self._updating or self.doc is None:
+            return
+        lo = float(self.spin_x_lo.value())
+        hi = float(self.spin_x_hi.value())
+        if hi <= lo:
+            hi = lo + 1.0
+            self.spin_x_hi.blockSignals(True)
+            self.spin_x_hi.setValue(hi)
+            self.spin_x_hi.blockSignals(False)
+        self._updating = True
+        self.plot_f.setXRange(lo, hi, padding=0)
+        self._updating = False
+        self._trace_x_user_zoomed = True
+
+    def _sync_trace_x_spins_from_plots(self) -> None:
+        if not hasattr(self, "spin_x_lo"):
+            return
+        (xmin, xmax), _ = self.plot_f.viewRange()
+        self.spin_x_lo.blockSignals(True)
+        self.spin_x_hi.blockSignals(True)
+        self.spin_x_lo.setValue(float(xmin))
+        self.spin_x_hi.setValue(float(xmax))
+        self.spin_x_lo.blockSignals(False)
+        self.spin_x_hi.blockSignals(False)
+
+    def _toggle_scale_panel(self) -> None:
+        self._scale_panel_open = not self._scale_panel_open
+        self.scale_panel.setVisible(self._scale_panel_open)
+        if self._scale_panel_open:
+            self._sync_trace_y_spins_from_plots()
+            self._sync_trace_x_spins_from_plots()
+
+    def _on_box_zoom_toggled(self, checked: bool) -> None:
+        mode = pg.ViewBox.RectMode if checked else pg.ViewBox.PanMode
+        for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
+            plot.getViewBox().setMouseMode(mode)
+        if checked:
+            self.statusBar().showMessage(
+                "Box zoom on — left-drag a rectangle on a trace"
+            )
+        else:
+            self.statusBar().showMessage("Box zoom off — left-drag pans")
+
+    def _on_trace_scene_clicked(self, ev) -> None:
+        if not ev.double():
+            return
+        pos = ev.scenePos()
+        for key in ("f", "comp", "bleach"):
+            vb = self._trace_plot(key).getViewBox()
+            if vb.sceneBoundingRect().contains(pos):
+                self._fit_trace_y(key)
+                ev.accept()
+                return
+
+    def _install_scale_nudges(self) -> None:
+        self._scale_nudges = {}
+        for key, plot in (
+            ("f", self.plot_f),
+            ("comp", self.plot_comp),
+            ("bleach", self.plot_bleach),
+        ):
+            pairs = {
+                "y_hi": _NudgePair(
+                    True,
+                    lambda _=False, k=key: self._nudge_y(k, "hi", +1),
+                    lambda _=False, k=key: self._nudge_y(k, "hi", -1),
+                    "Nudge Y upper limit",
+                ),
+                "y_lo": _NudgePair(
+                    True,
+                    lambda _=False, k=key: self._nudge_y(k, "lo", +1),
+                    lambda _=False, k=key: self._nudge_y(k, "lo", -1),
+                    "Nudge Y lower limit",
+                ),
+                "x_lo": _NudgePair(
+                    False,
+                    lambda _=False, k=key: self._nudge_x("lo", +1),
+                    lambda _=False, k=key: self._nudge_x("lo", -1),
+                    "Nudge X lower limit (all traces)",
+                ),
+                "x_hi": _NudgePair(
+                    False,
+                    lambda _=False, k=key: self._nudge_x("hi", +1),
+                    lambda _=False, k=key: self._nudge_x("hi", -1),
+                    "Nudge X upper limit (all traces)",
+                ),
+            }
+            proxies: dict[str, QGraphicsProxyWidget] = {}
+            left = plot.getAxis("left")
+            bottom = plot.getAxis("bottom")
+            for name, widget in pairs.items():
+                proxy = QGraphicsProxyWidget()
+                proxy.setWidget(widget)
+                proxy.setZValue(1000)
+                proxy.setParentItem(left if name.startswith("y") else bottom)
+                proxies[name] = proxy
+            self._scale_nudges[key] = proxies
+        QTimer.singleShot(0, self._reposition_scale_nudges)
+
+    def _reposition_scale_nudges(self, *_args: object) -> None:
+        if not self._scale_nudges:
+            return
+        for key, plot in (
+            ("f", self.plot_f),
+            ("comp", self.plot_comp),
+            ("bleach", self.plot_bleach),
+        ):
+            nudges = self._scale_nudges[key]
+            left = plot.getAxis("left")
+            bottom = plot.getAxis("bottom")
+            lr = left.boundingRect()
+            br = bottom.boundingRect()
+
+            y_hi = nudges["y_hi"]
+            wh = y_hi.widget()
+            if wh is not None:
+                wh.adjustSize()
+                y_hi.setPos(lr.center().x() - wh.width() / 2, lr.top())
+            y_lo = nudges["y_lo"]
+            wl = y_lo.widget()
+            if wl is not None:
+                wl.adjustSize()
+                y_lo.setPos(lr.center().x() - wl.width() / 2, lr.bottom() - wl.height())
+            x_lo = nudges["x_lo"]
+            wxl = x_lo.widget()
+            if wxl is not None:
+                wxl.adjustSize()
+                x_lo.setPos(br.left(), br.center().y() - wxl.height() / 2)
+            x_hi = nudges["x_hi"]
+            wxh = x_hi.widget()
+            if wxh is not None:
+                wxh.adjustSize()
+                x_hi.setPos(br.right() - wxh.width(), br.center().y() - wxh.height() / 2)
+
+    def _nudge_y(self, key: str, end: str, direction: int) -> None:
+        plot = self._trace_plot(key)
+        _, (ymin, ymax) = plot.viewRange()
+        span = max(ymax - ymin, 1e-6)
+        step = span * _NUDGE_FRAC
+        if end == "hi":
+            ymax = ymax + direction * step
+        else:
+            ymin = ymin + direction * step
+        if ymax <= ymin:
+            return
+        self._updating = True
+        plot.setYRange(ymin, ymax, padding=0)
+        self._updating = False
+        self._trace_y_locked[key] = True
+        self._sync_trace_y_spins_from_plots(key)
+
+    def _nudge_x(self, end: str, direction: int) -> None:
+        (xmin, xmax), _ = self.plot_f.viewRange()
+        span = max(xmax - xmin, 1.0)
+        step = span * _NUDGE_FRAC
+        if end == "hi":
+            xmax = xmax + direction * step
+        else:
+            xmin = xmin + direction * step
+        if self.doc is not None:
+            n = int(self.doc["meta"]["nframes"])
+            xmin = max(0.0, xmin)
+            xmax = min(float(max(n - 1, 1)), xmax)
+        if xmax <= xmin:
+            return
+        self._updating = True
+        self.plot_f.setXRange(xmin, xmax, padding=0)
+        self._updating = False
+        self._trace_x_user_zoomed = True
+        self._sync_trace_x_spins_from_plots()
 
     def _display_trace(self, trace: np.ndarray) -> np.ndarray:
         """Copy of trace with NaNs for selected LED+Shutter annotations (display only)."""
@@ -1868,6 +2141,7 @@ class MainWindow(QMainWindow):
         if self._updating:
             return
         self._trace_x_user_zoomed = True
+        self._sync_trace_x_spins_from_plots()
 
     def _fit_trace_x(self) -> None:
         if self.doc is None:
@@ -1877,6 +2151,15 @@ class MainWindow(QMainWindow):
         self._trace_x_user_zoomed = False
         self.plot_f.setXRange(0, max(n - 1, 1), padding=0.02)
         self._updating = False
+        self._sync_trace_x_spins_from_plots()
+
+    def _reset_all_trace_scales(self) -> None:
+        if self.doc is None:
+            return
+        self._fit_trace_x()
+        for key in ("f", "comp", "bleach"):
+            self._fit_trace_y(key)
+        self.statusBar().showMessage("Trace scales reset to autoscale")
 
     def _rebuild_ann_list(self) -> None:
         self.list_ann.blockSignals(True)
