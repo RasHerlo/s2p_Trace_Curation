@@ -27,6 +27,12 @@ from s2p_trace_curation.analyses import (
     set_raster_sort,
 )
 from s2p_trace_curation.gui.colormaps import make_lut
+from s2p_trace_curation.trace_processing import (
+    TRACE_FIELD_LABELS,
+    TRACE_FIELD_NORM,
+    TRACE_FIELD_SM_BC,
+    TRACE_FIELDS,
+)
 from s2p_trace_curation.hac import (
     DEFAULT_HAC_PARAMS,
     HAC_LINKAGE_LABELS,
@@ -88,7 +94,7 @@ class AnalysisToolsWindow(QDialog):
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_rebuild = QPushButton("Rebuild")
         self.btn_rebuild.setToolTip(
-            "Recompute this saved run from current iscell / tc_norm using saved params"
+            "Recompute this saved run from current iscell / chosen traces using saved params"
         )
         self.btn_rebuild.clicked.connect(self._on_rebuild)
         btn_row.addWidget(self.btn_new)
@@ -107,10 +113,17 @@ class AnalysisToolsWindow(QDialog):
         self.cmb_kind = QComboBox()
         for kind, text in KIND_LABELS.items():
             self.cmb_kind.addItem(text, kind)
+        self.cmb_trace_field = QComboBox()
+        for field in TRACE_FIELDS:
+            self.cmb_trace_field.addItem(TRACE_FIELD_LABELS[field], field)
+        self.cmb_trace_field.setToolTip(
+            "Trace stored in the pickle used for this run (HAC and fingerprint)"
+        )
         self.lbl_status = QLabel("New draft — Run, then Save")
         self.lbl_status.setWordWrap(True)
         form.addRow("Label", self.edit_label)
         form.addRow("Kind", self.cmb_kind)
+        form.addRow("Trace", self.cmb_trace_field)
         form.addRow("Status", self.lbl_status)
         right_layout.addLayout(form)
 
@@ -138,7 +151,7 @@ class AnalysisToolsWindow(QDialog):
         for key, text in HAC_METRIC_LABELS.items():
             self.cmb_hac_metric.addItem(text, key)
         self.cmb_hac_metric.setToolTip(
-            "Ružička: shared positive mass on tc_norm.\n"
+            "Ružička: shared positive mass on the chosen trace field.\n"
             "Euclidean: L2 of finite frames (required for Ward)."
         )
         self.cmb_hac_linkage = QComboBox()
@@ -177,6 +190,7 @@ class AnalysisToolsWindow(QDialog):
         self.cmb_hac_metric.currentIndexChanged.connect(self._on_hac_metric_changed)
         self.cmb_hac_linkage.currentIndexChanged.connect(self._on_hac_linkage_changed)
         self.cmb_kind.currentIndexChanged.connect(self._on_kind_changed)
+        self.cmb_trace_field.currentIndexChanged.connect(self._on_trace_field_changed)
 
         self.lbl_preview = QLabel("No preview yet.")
         self.lbl_preview.setWordWrap(True)
@@ -267,6 +281,9 @@ class AnalysisToolsWindow(QDialog):
         if idx >= 0:
             self.cmb_kind.setCurrentIndex(idx)
         self._apply_hac_params(DEFAULT_HAC_PARAMS)
+        idx_f = self.cmb_trace_field.findData(TRACE_FIELD_SM_BC)
+        if idx_f >= 0:
+            self.cmb_trace_field.setCurrentIndex(idx_f)
         self._sync_kind_page()
         self._clear_hac_plots()
         self.lbl_status.setText("New draft — Run, then Save")
@@ -302,6 +319,10 @@ class AnalysisToolsWindow(QDialog):
             idx = self.cmb_kind.findData(kind)
         self.cmb_kind.setCurrentIndex(max(0, idx))
         self._apply_hac_params(run.get("params") or {})
+        field = str((run.get("params") or {}).get("trace_field") or TRACE_FIELD_NORM)
+        fi = self.cmb_trace_field.findData(field)
+        if fi >= 0:
+            self.cmb_trace_field.setCurrentIndex(fi)
         self._sync_kind_page()
         self._clear_hac_plots()
         n = len(run.get("roi_ids") or [])
@@ -319,12 +340,19 @@ class AnalysisToolsWindow(QDialog):
         return str(kind) if kind else KIND_PLACEHOLDER
 
     def _form_params(self) -> dict[str, Any]:
+        field = str(self.cmb_trace_field.currentData() or TRACE_FIELD_SM_BC)
         if self._form_kind() != KIND_HAC:
-            return {}
+            return {"trace_field": field}
         return {
             "metric": str(self.cmb_hac_metric.currentData() or METRIC_RUZICKA),
             "linkage": str(self.cmb_hac_linkage.currentData() or LINKAGE_AVERAGE),
+            "trace_field": field,
         }
+
+    def _on_trace_field_changed(self) -> None:
+        if self._loading:
+            return
+        self._preview = None
 
     def _on_kind_changed(self) -> None:
         if self._loading:
@@ -351,6 +379,10 @@ class AnalysisToolsWindow(QDialog):
         li = self.cmb_hac_linkage.findData(norm["linkage"])
         if li >= 0:
             self.cmb_hac_linkage.setCurrentIndex(li)
+        field = str(norm.get("trace_field") or TRACE_FIELD_SM_BC)
+        fi = self.cmb_trace_field.findData(field)
+        if fi >= 0:
+            self.cmb_trace_field.setCurrentIndex(fi)
         self._loading = was
         self._apply_hac_linkage_constraint()
 
@@ -461,7 +493,8 @@ class AnalysisToolsWindow(QDialog):
         self.btn_new.setEnabled(has_doc)
 
     def _ensure_inputs(self) -> bool:
-        return bool(self.main._ensure_analysis_inputs())
+        field = str(self.cmb_trace_field.currentData() or TRACE_FIELD_SM_BC)
+        return bool(self.main._ensure_analysis_inputs(field))
 
     def _on_run(self) -> None:
         doc = self._doc()

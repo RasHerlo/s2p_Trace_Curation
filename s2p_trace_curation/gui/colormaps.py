@@ -124,10 +124,13 @@ def colorize_raster(
 def apply_lut(
     image: np.ndarray, lut: np.ndarray, vmin: float, vmax: float
 ) -> np.ndarray:
-    """Map 2D image through LUT → RGB uint8."""
+    """Map 2D image through LUT → RGB uint8. Non-finite pixels → mid-grey."""
     img = np.asarray(image, dtype=np.float64)
     if vmax <= vmin:
         vmax = vmin + 1.0
-    norm = np.clip((img - vmin) / (vmax - vmin), 0.0, 1.0)
+    finite = np.isfinite(img)
+    norm = np.clip((np.nan_to_num(img, nan=vmin) - vmin) / (vmax - vmin), 0.0, 1.0)
     idx = (norm * 255.0).astype(np.uint8)
-    return lut[idx]
+    rgb = lut[idx]
+    rgb[~finite] = np.asarray((128, 128, 128), dtype=np.uint8)
+    return rgb

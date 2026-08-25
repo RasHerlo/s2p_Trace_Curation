@@ -547,4 +547,44 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
   - curation I/O, suite2p_io, main GUI, mask edit, user settings
 - **Merge s2p folders / batch iscell / Add Mask:** implemented (2026-08-23+)
 - **Analysis Tools:** schema + window shell; **HAC** (Ružička/average default, Euclidean/Ward) implemented 2026-08-24; PCA / k-means / rastermap parked
+- **Trace processing + heatmaps (schema 4, 2026-08-25):** SG → `tc_norm_sm`; bleach → `tc_norm_sm_bc`; HAC trace-field choice; named heatmaps in Image dropdowns
 - Run: `python -m s2p_trace_curation`
+
+---
+
+## Session 2026-08-25 — Trace processing + heatmaps (locked)
+
+Inspiration from BitsAndBobs `stack_analyzer` (SG, biexponential bleach, pixel area heatmap). Algorithms reimplemented here; no shared package, no Mark Events, no multi-experiment collect.
+
+### Pipeline
+LED+Shutter frames are **excised** (illumination time). Results are scattered back as NaN.
+
+```
+trace_comp → SG → min-max → tc_norm_sm
+tc_norm_sm → subtract biexponential (or conservative constant) → min-max → tc_norm_sm_bc
+```
+
+Neuropil `x` already plays the role of local BG. Auto-shift / Man. Adj. are not ported (constants vanish after min-max).
+
+| Mode | Behaviour |
+|------|-----------|
+| Bleach **off** (conservative) | \(A_1=A_2=0\); `tc_norm_sm_bc` matches `tc_norm_sm` after min-max |
+| **On**, shared τ | τ from mean of selected `tc_norm_sm`; per-ROI amplitudes |
+| **On**, independent | Full 5-param fit per ROI; failed fit → conservative for that ROI |
+
+SG params are session-wide. Missing `tc_norm_sm` → warn + default SG. Missing `tc_norm_sm_bc` → warn + conservative BC.
+
+### HAC / raster
+Each analysis run stores `params.trace_field` ∈ `{tc_norm, tc_norm_sm, tc_norm_sm_bc}` (default preference `tc_norm_sm_bc`). Raster Tools has a **Trace** dropdown, independent of the HAC field.
+
+### Heatmaps
+Named maps in `doc["heatmaps"]`, computed only in **Edit HeatMaps** from `data.bin`. Independent of ROI/trace edits. LED+Shutter frames skipped. Starts / extension / Area L–R typed in that window (not taken from annotations); annotation spans are **shown** as a guide. Appear as `HeatMap: <name>` on W1 and W3 **Image** dropdowns; LUT remains the colormap.
+
+### UI
+- Right panel below Scaling Tools: **Trace Processing** window
+- Raster Tools: **Edit HeatMaps**; bleach subplot shows `tc_norm_sm`, fit, `tc_norm_sm_bc`
+- Stale/rebuild: `x` / mask / LED → `tc_norm` → `tc_norm_sm` → `tc_norm_sm_bc`; explicit rebuild only
+
+### Schema 4
+`meta.trace_processing`, `meta.raster_trace_field`, per-ROI `tc_norm_sm` / `tc_norm_sm_bc` / `bleach`, top-level `heatmaps: []`.
+

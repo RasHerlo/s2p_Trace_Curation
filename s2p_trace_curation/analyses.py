@@ -13,7 +13,12 @@ from typing import Any
 import numpy as np
 
 from s2p_trace_curation.annotations import ensure_annotations
-from s2p_trace_curation.raster import tc_norm_is_stale
+from s2p_trace_curation.trace_processing import (
+    TRACE_FIELD_NORM,
+    TRACE_FIELDS,
+    field_has_any,
+    trace_field_is_stale,
+)
 
 PICKLE_SORT_ID = "pickle"
 FIGURES_DIRNAME = "figures"
@@ -100,13 +105,16 @@ def analysis_input_sig(
     params: dict[str, Any],
 ) -> dict[str, Any]:
     by_id = {int(r["roi_id"]): r for r in doc["rois"]}
+    field = str((params or {}).get("trace_field") or TRACE_FIELD_NORM)
+    if field not in TRACE_FIELDS:
+        field = TRACE_FIELD_NORM
     sums: list[float | None] = []
     for i in roi_ids:
         row = by_id.get(int(i))
         if row is None:
             sums.append(None)
             continue
-        tr = row.get("tc_norm")
+        tr = row.get(field)
         if tr is None:
             sums.append(None)
         else:
@@ -115,6 +123,7 @@ def analysis_input_sig(
         "kind": str(kind),
         "params": deepcopy(params),
         "ids": [int(i) for i in roi_ids],
+        "trace_field": field,
         "tc_sums": sums,
         "led": _led_spans(doc),
     }
@@ -128,6 +137,10 @@ def _sigs_equal(a: Any, b: Any) -> bool:
     if not isinstance(a, dict) or not isinstance(b, dict):
         return False
     if str(a.get("kind")) != str(b.get("kind")):
+        return False
+    field_a = str(a.get("trace_field") or TRACE_FIELD_NORM)
+    field_b = str(b.get("trace_field") or TRACE_FIELD_NORM)
+    if field_a != field_b:
         return False
     if not _params_equal(a.get("params") or {}, b.get("params") or {}):
         return False
@@ -154,7 +167,10 @@ def _led_list(raw: Any) -> list[list[int]]:
 
 
 def is_run_stale(doc: dict[str, Any], run: dict[str, Any]) -> bool:
-    if tc_norm_is_stale(doc):
+    field = str((run.get("params") or {}).get("trace_field") or TRACE_FIELD_NORM)
+    if field not in TRACE_FIELDS:
+        field = TRACE_FIELD_NORM
+    if not field_has_any(doc, field) or trace_field_is_stale(doc, field):
         return True
     stored_ids = [int(i) for i in (run.get("roi_ids") or [])]
     if stored_ids != current_iscell_ids(doc):

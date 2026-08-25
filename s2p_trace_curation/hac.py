@@ -28,24 +28,36 @@ HAC_LINKAGE_LABELS = {
 DEFAULT_HAC_PARAMS: dict[str, str] = {
     "metric": METRIC_RUZICKA,
     "linkage": LINKAGE_AVERAGE,
+    "trace_field": "tc_norm_sm_bc",
 }
 
 
 def normalize_hac_params(params: dict[str, Any] | None) -> dict[str, str]:
+    from s2p_trace_curation.trace_processing import TRACE_FIELD_NORM, TRACE_FIELDS
+
     raw = dict(params or {})
     metric = str(raw.get("metric") or METRIC_RUZICKA)
     linkage_name = str(raw.get("linkage") or LINKAGE_AVERAGE)
+    field = raw.get("trace_field")
+    if field is None or str(field) == "":
+        field = TRACE_FIELD_NORM
+    else:
+        field = str(field)
+    if field not in TRACE_FIELDS:
+        field = TRACE_FIELD_NORM
     if metric not in HAC_METRICS:
         raise ValueError(f"Unknown HAC metric: {metric}")
     if linkage_name not in HAC_LINKAGES:
         raise ValueError(f"Unknown HAC linkage: {linkage_name}")
     if linkage_name == LINKAGE_WARD and metric != METRIC_EUCLIDEAN:
         raise ValueError("Ward linkage requires Euclidean distance")
-    return {"metric": metric, "linkage": linkage_name}
+    return {"metric": metric, "linkage": linkage_name, "trace_field": field}
 
 
-def tc_norm_stack_for_ids(doc: dict[str, Any], roi_ids: list[int]) -> np.ndarray:
-    """Stack tc_norm for roi_ids as (n_roi, nframes). Missing → NaN rows."""
+def trace_stack_for_ids(
+    doc: dict[str, Any], roi_ids: list[int], field: str = "tc_norm"
+) -> np.ndarray:
+    """Stack a stored trace field for roi_ids as (n_roi, nframes). Missing → NaN rows."""
     nframes = int(doc["meta"]["nframes"])
     by_id = {int(r["roi_id"]): r for r in doc["rois"]}
     out = np.full((len(roi_ids), nframes), np.nan, dtype=np.float64)
@@ -53,13 +65,18 @@ def tc_norm_stack_for_ids(doc: dict[str, Any], roi_ids: list[int]) -> np.ndarray
         row = by_id.get(int(rid))
         if row is None:
             continue
-        tr = row.get("tc_norm")
+        tr = row.get(field)
         if tr is None:
             continue
         arr = np.asarray(tr, dtype=np.float64)
         n_copy = min(arr.shape[0], nframes)
         out[i, :n_copy] = arr[:n_copy]
     return out
+
+
+def tc_norm_stack_for_ids(doc: dict[str, Any], roi_ids: list[int]) -> np.ndarray:
+    """Stack tc_norm for roi_ids as (n_roi, nframes). Missing → NaN rows."""
+    return trace_stack_for_ids(doc, roi_ids, "tc_norm")
 
 
 def drop_nan_frames(X: np.ndarray) -> np.ndarray:
@@ -103,7 +120,7 @@ def run_hac(doc: dict[str, Any], params: dict[str, Any] | None = None) -> dict[s
     roi_ids = current_iscell_ids(doc)
     if len(roi_ids) < 2:
         raise ValueError("HAC needs at least two selected (iscell=True) ROIs")
-    X = drop_nan_frames(tc_norm_stack_for_ids(doc, roi_ids))
+    X = drop_nan_frames(trace_stack_for_ids(doc, roi_ids, params["trace_field"]))
     if not np.isfinite(X).all():
         raise ValueError("Some selected traces still contain NaNs after dropping LED frames")
 

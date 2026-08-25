@@ -77,6 +77,8 @@ from s2p_trace_curation.curation import (
     set_compensation_x,
 )
 from s2p_trace_curation.gui.analysis_dialog import AnalysisToolsWindow
+from s2p_trace_curation.gui.heatmap_dialog import HeatmapEditorWindow
+from s2p_trace_curation.gui.trace_processing_dialog import TraceProcessingWindow
 from s2p_trace_curation.gui.colormaps import (
     LUT_NAMES,
     apply_lut,
@@ -85,13 +87,37 @@ from s2p_trace_curation.gui.colormaps import (
     make_lut,
     selected_row_lut,
 )
+from s2p_trace_curation.heatmaps import (
+    ensure_heatmaps,
+    get_heatmap,
+    heatmap_combo_data,
+    heatmap_combo_label,
+    parse_heatmap_combo_data,
+)
 from s2p_trace_curation.raster import (
     fill_missing_tc_norm,
+    led_shutter_nan_mask,
     rebuild_all_tc_norm,
     rois_for_raster,
-    stack_tc_norm,
     tc_norm_is_stale,
     tc_norm_sig,
+)
+from s2p_trace_curation.trace_processing import (
+    TRACE_FIELD_LABELS,
+    TRACE_FIELD_NORM,
+    TRACE_FIELD_SM,
+    TRACE_FIELD_SM_BC,
+    TRACE_FIELDS,
+    bleach_fit_curve,
+    ensure_trace_processing,
+    field_has_any,
+    raster_trace_field,
+    rebuild_all_tc_norm_sm,
+    rebuild_all_tc_norm_sm_bc,
+    set_raster_trace_field,
+    stack_trace_field,
+    tc_norm_sm_bc_is_stale,
+    tc_norm_sm_is_stale,
 )
 from s2p_trace_curation.gui.overlays import (
     OverlayFilter,
@@ -332,6 +358,8 @@ class MainWindow(QMainWindow):
         self._raster_box_items: list[Any] = []
         self._raster_last_shape: tuple[int, int] | None = None
         self._analysis_window: AnalysisToolsWindow | None = None
+        self._trace_proc_window: TraceProcessingWindow | None = None
+        self._heatmap_window: HeatmapEditorWindow | None = None
 
         self._mask_edit_active = False
         self._mask_edit_kind: str | None = None  # "modify" | "add"
@@ -499,7 +527,7 @@ class MainWindow(QMainWindow):
         inspect_layout.addWidget(self.trace_widget, stretch=2)
         self.plot_f = self.trace_widget.addPlot(row=0, col=0, title="F / x·Fneu")
         self.plot_comp = self.trace_widget.addPlot(row=1, col=0, title="trace_comp = F − x·Fneu")
-        self.plot_bleach = self.trace_widget.addPlot(row=2, col=0, title="Bleach-corrected (placeholder)")
+        self.plot_bleach = self.trace_widget.addPlot(row=2, col=0, title="tc_norm_sm / bleach")
         self.plot_comp.setXLink(self.plot_f)
         self.plot_bleach.setXLink(self.plot_f)
         self.plot_bleach.setLabel("bottom", "frame")
@@ -520,6 +548,16 @@ class MainWindow(QMainWindow):
         self.curve_f = self.plot_f.plot(pen=pg.mkPen("#1f77b4", width=1), name="F")
         self.curve_fneu = self.plot_f.plot(pen=pg.mkPen("#ff7f0e", width=1), name="x·Fneu")
         self.curve_comp = self.plot_comp.plot(pen=pg.mkPen("#2ca02c", width=1.5))
+        self.plot_bleach.addLegend(offset=(10, 10))
+        self.curve_bleach_sm = self.plot_bleach.plot(
+            pen=pg.mkPen("#1f77b4", width=1.0), name="tc_norm_sm"
+        )
+        self.curve_bleach_fit = self.plot_bleach.plot(
+            pen=pg.mkPen("#ff7f0e", width=1.0, style=Qt.PenStyle.DashLine), name="fit"
+        )
+        self.curve_bleach_bc = self.plot_bleach.plot(
+            pen=pg.mkPen("#2ca02c", width=1.5), name="tc_norm_sm_bc"
+        )
 
         self.cursors: list[pg.InfiniteLine] = []
         self.cursor_labels: list[pg.TextItem] = []
@@ -665,7 +703,8 @@ class MainWindow(QMainWindow):
         fov = QGroupBox("FOV (W1)")
         fov_form = QFormLayout(fov)
         self.cmb_fov_src = QComboBox()
-        self.cmb_fov_src.addItems(["meanImg", "meanImgE", "VCorr"])
+        for key in ("meanImg", "meanImgE", "VCorr"):
+            self.cmb_fov_src.addItem(key, key)
         self.cmb_fov_lut = QComboBox()
         self.cmb_fov_lut.addItems(list(LUT_NAMES))
         self.spin_fov_lo = QDoubleSpinBox()
@@ -769,6 +808,14 @@ class MainWindow(QMainWindow):
         )
         self.cmb_raster_sort.addItem("Pickle", PICKLE_SORT_ID)
 
+        self.cmb_raster_trace = QComboBox()
+        self.cmb_raster_trace.setEnabled(False)
+        self.cmb_raster_trace.setToolTip(
+            "Which stored [0, 1] trace fills the raster (independent of HAC runs)"
+        )
+        for field in TRACE_FIELDS:
+            self.cmb_raster_trace.addItem(TRACE_FIELD_LABELS[field], field)
+
         self.cmb_raster_lut = QComboBox()
         self.cmb_raster_lut.addItems(list(LUT_NAMES))
         self.cmb_raster_lut.setEnabled(False)
@@ -808,14 +855,23 @@ class MainWindow(QMainWindow):
         )
         self.btn_analysis_tools.clicked.connect(self._open_analysis_tools)
 
+        self.btn_edit_heatmaps = QPushButton("Edit HeatMaps")
+        self.btn_edit_heatmaps.setEnabled(False)
+        self.btn_edit_heatmaps.setToolTip(
+            "Named FOV maps from data.bin; appear as HeatMap: <name> in Image dropdowns"
+        )
+        self.btn_edit_heatmaps.clicked.connect(self._open_heatmap_editor)
+
         raster_form.addRow("Raster-mode", raster_on_row)
         raster_form.addRow("Show", self.cmb_raster_show)
         raster_form.addRow("Sort", self.cmb_raster_sort)
+        raster_form.addRow("Trace", self.cmb_raster_trace)
         raster_form.addRow("LUT", self.cmb_raster_lut)
         raster_form.addRow(self.chk_raster_revert)
         raster_form.addRow("Mode", raster_mode_row)
         raster_form.addRow(self.btn_rebuild_tc_norm)
         raster_form.addRow(self.btn_analysis_tools)
+        raster_form.addRow(self.btn_edit_heatmaps)
         layout.addWidget(raster)
         layout.addStretch(1)
 
@@ -840,6 +896,7 @@ class MainWindow(QMainWindow):
         self.chk_raster_revert.toggled.connect(self._on_raster_display_changed)
         self.slider_raster_batch.valueChanged.connect(self._on_raster_batch_slider)
         self.cmb_raster_sort.currentIndexChanged.connect(self._on_raster_sort_changed)
+        self.cmb_raster_trace.currentIndexChanged.connect(self._on_raster_trace_changed)
         self.btn_rebuild_tc_norm.clicked.connect(self._rebuild_tc_norm)
         return panel
 
@@ -852,7 +909,8 @@ class MainWindow(QMainWindow):
         zoom = QGroupBox("ROI zoom (W3)")
         zoom_form = QFormLayout(zoom)
         self.cmb_w3_src = QComboBox()
-        self.cmb_w3_src.addItems(["movie", "meanImg", "meanImgE", "VCorr"])
+        for key in ("movie", "meanImg", "meanImgE", "VCorr"):
+            self.cmb_w3_src.addItem(key, key)
         self.cmb_w3_lut = QComboBox()
         self.cmb_w3_lut.addItems(list(LUT_NAMES))
         self.spin_w3_lo = QDoubleSpinBox()
@@ -1104,6 +1162,15 @@ class MainWindow(QMainWindow):
         scale_outer.addWidget(self.scale_panel)
         layout.addWidget(scale)
 
+        proc = QGroupBox("Trace processing")
+        proc_outer = QVBoxLayout(proc)
+        self.btn_trace_proc = QPushButton("Trace Processing")
+        self.btn_trace_proc.setEnabled(False)
+        self.btn_trace_proc.setToolTip("Savitzky–Golay smoothing and bleach correction")
+        self.btn_trace_proc.clicked.connect(self._open_trace_processing)
+        proc_outer.addWidget(self.btn_trace_proc)
+        layout.addWidget(proc)
+
         layout.addStretch(1)
 
         self.btn_save = QPushButton("Save")
@@ -1123,7 +1190,9 @@ class MainWindow(QMainWindow):
         self._updating = True
         try:
             if src := s.get("fov_src"):
-                idx = self.cmb_fov_src.findText(str(src))
+                idx = self.cmb_fov_src.findData(str(src))
+                if idx < 0:
+                    idx = self.cmb_fov_src.findText(str(src))
                 if idx >= 0:
                     self.cmb_fov_src.setCurrentIndex(idx)
             if lut := s.get("fov_lut"):
@@ -1142,7 +1211,9 @@ class MainWindow(QMainWindow):
                 if idx >= 0:
                     self.cmb_mov_lut.setCurrentIndex(idx)
             if src := s.get("w3_src"):
-                idx = self.cmb_w3_src.findText(str(src))
+                idx = self.cmb_w3_src.findData(str(src))
+                if idx < 0:
+                    idx = self.cmb_w3_src.findText(str(src))
                 if idx >= 0:
                     self.cmb_w3_src.setCurrentIndex(idx)
             if lut := s.get("w3_lut"):
@@ -1154,11 +1225,11 @@ class MainWindow(QMainWindow):
 
     def _persist_ui_settings(self, *, suite2p_dir: Path | None = None) -> None:
         updates: dict[str, Any] = {
-            "fov_src": self.cmb_fov_src.currentText(),
+            "fov_src": self.cmb_fov_src.currentData() or self.cmb_fov_src.currentText(),
             "fov_lut": self.cmb_fov_lut.currentText(),
             "overlay_filter": self.cmb_overlay.currentData(),
             "mov_lut": self.cmb_mov_lut.currentText(),
-            "w3_src": self.cmb_w3_src.currentText(),
+            "w3_src": self.cmb_w3_src.currentData() or self.cmb_w3_src.currentText(),
             "w3_lut": self.cmb_w3_lut.currentText(),
         }
         if suite2p_dir is not None:
@@ -1228,6 +1299,7 @@ class MainWindow(QMainWindow):
         self.btn_add_mask.setEnabled(True)
         self.btn_ann_tools.setEnabled(True)
         self.btn_scale_tools.setEnabled(True)
+        self.btn_trace_proc.setEnabled(True)
         self.btn_save.setEnabled(True)
         nframes = int(doc["meta"]["nframes"])
         self.spin_ann_start.setRange(0, max(0, nframes - 1))
@@ -1246,12 +1318,20 @@ class MainWindow(QMainWindow):
         self._apply_mode_controls()
         self._tc_norm_stale = tc_norm_is_stale(doc)
         ensure_analyses(doc)
+        ensure_trace_processing(doc)
+        ensure_heatmaps(doc)
         refresh_stale_flags(doc)
+        self._fill_image_source_combos()
         self._fill_raster_sort_combo()
+        self._fill_raster_trace_combo()
         self._update_rebuild_button()
         self._set_raster_controls_enabled(True)
         if self._analysis_window is not None:
             self._analysis_window.refresh_from_doc()
+        if self._trace_proc_window is not None:
+            self._trace_proc_window.refresh_from_doc()
+        if self._heatmap_window is not None:
+            self._heatmap_window.refresh_from_doc()
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -1811,6 +1891,8 @@ class MainWindow(QMainWindow):
         self.spin_x.setValue(float(row["compensation"]["x"]))
         self._updating = False
         self._refresh_all()
+        if self._trace_proc_window is not None:
+            self._trace_proc_window._refresh_preview()
 
     def _on_fov_click(self, y: int, x: int) -> None:
         if self.doc is None or self._batch_mode:
@@ -1959,7 +2041,9 @@ class MainWindow(QMainWindow):
         self.chk_raster_revert.setEnabled(enabled)
         self.slider_raster_batch.setEnabled(enabled)
         self.cmb_raster_sort.setEnabled(enabled)
+        self.cmb_raster_trace.setEnabled(enabled)
         self.btn_analysis_tools.setEnabled(enabled)
+        self.btn_edit_heatmaps.setEnabled(enabled)
         self._update_rebuild_button()
 
     def _update_rebuild_button(self) -> None:
@@ -1974,6 +2058,8 @@ class MainWindow(QMainWindow):
         self._fill_raster_sort_combo()
         if self._analysis_window is not None:
             self._analysis_window.reload_run_list()
+        if self._trace_proc_window is not None:
+            self._trace_proc_window.refresh_from_doc()
 
     def _fill_raster_sort_combo(self) -> None:
         if self.doc is None:
@@ -2001,6 +2087,31 @@ class MainWindow(QMainWindow):
         if self._raster_mode:
             self._refresh_raster()
 
+    def _fill_raster_trace_combo(self) -> None:
+        if self.doc is None:
+            return
+        current = raster_trace_field(self.doc)
+        was = self._updating
+        self._updating = True
+        idx = self.cmb_raster_trace.findData(current)
+        self.cmb_raster_trace.setCurrentIndex(idx if idx >= 0 else 0)
+        self._updating = was
+
+    def _on_raster_trace_changed(self) -> None:
+        if self._updating or self.doc is None:
+            return
+        data = self.cmb_raster_trace.currentData()
+        field = str(data) if data else TRACE_FIELD_NORM
+        if raster_trace_field(self.doc) == field:
+            return
+        if not self._ensure_analysis_inputs(field):
+            self._fill_raster_trace_combo()
+            return
+        set_raster_trace_field(self.doc, field)
+        self.dirty = True
+        if self._raster_mode:
+            self._refresh_raster()
+
     def _open_analysis_tools(self) -> None:
         if self.doc is None:
             return
@@ -2016,6 +2127,69 @@ class MainWindow(QMainWindow):
         self._analysis_window.raise_()
         self._analysis_window.activateWindow()
 
+    def _open_trace_processing(self) -> None:
+        if self.doc is None:
+            return
+        if self._trace_proc_window is None:
+            self._trace_proc_window = TraceProcessingWindow(self)
+
+            def _clear(_obj: object = None) -> None:
+                self._trace_proc_window = None
+
+            self._trace_proc_window.destroyed.connect(_clear)
+        self._trace_proc_window.refresh_from_doc()
+        self._trace_proc_window.show()
+        self._trace_proc_window.raise_()
+        self._trace_proc_window.activateWindow()
+
+    def _open_heatmap_editor(self) -> None:
+        if self.doc is None:
+            return
+        if self._heatmap_window is None:
+            self._heatmap_window = HeatmapEditorWindow(self)
+
+            def _clear(_obj: object = None) -> None:
+                self._heatmap_window = None
+
+            self._heatmap_window.destroyed.connect(_clear)
+        self._heatmap_window.refresh_from_doc()
+        self._heatmap_window.show()
+        self._heatmap_window.raise_()
+        self._heatmap_window.activateWindow()
+
+    def _heatmaps_changed(self) -> None:
+        if self.doc is None:
+            return
+        self._fill_image_source_combos()
+        self._refresh_fov()
+        self._refresh_w3_and_thumbs()
+
+    def _fill_image_source_combos(self) -> None:
+        if self.doc is None:
+            return
+        self._fill_one_image_combo(self.cmb_fov_src, ("meanImg", "meanImgE", "VCorr"))
+        self._fill_one_image_combo(
+            self.cmb_w3_src, ("movie", "meanImg", "meanImgE", "VCorr")
+        )
+
+    def _fill_one_image_combo(self, combo: QComboBox, keys: tuple[str, ...]) -> None:
+        current = combo.currentData() or combo.currentText()
+        was = self._updating
+        self._updating = True
+        combo.blockSignals(True)
+        combo.clear()
+        for key in keys:
+            combo.addItem(key, key)
+        if self.doc is not None:
+            for hm in ensure_heatmaps(self.doc):
+                combo.addItem(heatmap_combo_label(hm), heatmap_combo_data(hm))
+        idx = combo.findData(current)
+        if idx < 0:
+            idx = combo.findText(str(current))
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        self._updating = was
+
     def _analysis_runs_changed(self) -> None:
         if self.doc is None:
             return
@@ -2025,18 +2199,69 @@ class MainWindow(QMainWindow):
         if self._raster_mode:
             self._refresh_raster()
 
-    def _ensure_analysis_inputs(self) -> bool:
+    def _ensure_analysis_inputs(self, field: str | None = None) -> bool:
         if self.doc is None:
             return False
         if not self.doc["rois"]:
             QMessageBox.information(self, "Analysis Tools", "No ROIs loaded.")
             return False
+        field = str(field or TRACE_FIELD_NORM)
+        if field not in TRACE_FIELDS:
+            field = TRACE_FIELD_NORM
+
+        if field in (TRACE_FIELD_SM, TRACE_FIELD_SM_BC):
+            if not field_has_any(self.doc, TRACE_FIELD_SM) or tc_norm_sm_is_stale(self.doc):
+                reply = QMessageBox.question(
+                    self,
+                    "Need smoothed traces",
+                    "tc_norm_sm is missing or stale. Rebuild with default SG parameters?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return False
+                ensure_trace_processing(self.doc)
+                rebuild_all_tc_norm_sm(self.doc)
+                self.dirty = True
+            if field == TRACE_FIELD_SM_BC:
+                missing = not field_has_any(self.doc, TRACE_FIELD_SM_BC)
+                stale = tc_norm_sm_bc_is_stale(self.doc)
+                if missing or stale:
+                    if missing:
+                        msg = (
+                            "tc_norm_sm_bc is missing. Build with conservative "
+                            "(no decay removed) bleach?"
+                        )
+                    else:
+                        msg = (
+                            "tc_norm_sm_bc is stale. Rebuild with current "
+                            "Trace Processing settings?"
+                        )
+                    reply = QMessageBox.question(
+                        self,
+                        "Need bleach-corrected traces",
+                        msg,
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return False
+                    tp = ensure_trace_processing(self.doc)
+                    if missing:
+                        tp["bleach_enabled"] = False
+                    rebuild_all_tc_norm_sm_bc(self.doc)
+                    self.dirty = True
+            self._refresh_analysis_stale_ui()
+            if self._trace_proc_window is not None:
+                self._trace_proc_window.refresh_from_doc()
+            return True
+
         has_any = any(row.get("tc_norm") is not None for row in self.doc["rois"])
         if self._tc_norm_stale or (has_any and tc_norm_is_stale(self.doc)):
             reply = QMessageBox.question(
                 self,
                 "tc_norm is stale",
-                "Analyses use tc_norm. Rebuild tc_norm first?",
+                "Rebuild tc_norm first?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
@@ -2174,8 +2399,9 @@ class MainWindow(QMainWindow):
         self._raster_row_ids = [int(r["roi_id"]) for r in rows]
         n_sel = sum(1 for r in rows if bool(r.get("iscell", True)))
         n_unsel = len(rows) - n_sel
+        field = raster_trace_field(self.doc)
         if rows:
-            matrix = stack_tc_norm(rows, nframes)
+            matrix = stack_trace_field(rows, nframes, field)
         else:
             matrix = np.full((1, nframes), np.nan, dtype=np.float64)
         lut = lut_with_revert(self.cmb_raster_lut.currentText(), self.chk_raster_revert.isChecked())
@@ -2257,14 +2483,16 @@ class MainWindow(QMainWindow):
             y = np.full(nframes, np.nan, dtype=np.float64)
             try:
                 row = self._row()
-                tr = row.get("tc_norm")
+                field = raster_trace_field(self.doc)
+                tr = row.get(field)
                 if tr is not None:
                     arr = np.asarray(tr, dtype=np.float64)
                     n_copy = min(arr.shape[0], nframes)
                     y[:n_copy] = arr[:n_copy]
             except Exception:
                 pass
-            self.plot_raster_trace.setTitle(f"tc_norm — ROI {self.active_roi_id}")
+            field = raster_trace_field(self.doc) if self.doc is not None else "tc_norm"
+            self.plot_raster_trace.setTitle(f"{field} — ROI {self.active_roi_id}")
         self.curve_raster_trace.setData(xs, y)
         if reset_view:
             self._updating = True
@@ -2306,10 +2534,25 @@ class MainWindow(QMainWindow):
         self._update_cursor_labels()
         self._debounce.start()
 
-    def _fov_source_image(self) -> np.ndarray | None:
-        assert self.doc is not None
-        key = self.cmb_fov_src.currentText()
+    def _w3_source_is_movie(self) -> bool:
+        return str(self.cmb_w3_src.currentData() or "") == "movie"
+
+    def _image_from_combo(self, combo: QComboBox, *, movie_frame: int | None = None) -> np.ndarray | None:
+        if self.doc is None:
+            return None
+        data = combo.currentData() or combo.currentText()
+        hid = parse_heatmap_combo_data(data)
+        if hid is not None:
+            hm = get_heatmap(self.doc, hid)
+            if hm is None or hm.get("map") is None:
+                return None
+            return np.asarray(hm["map"])
+        key = str(data)
         meta = self.doc["meta"]
+        if key == "movie":
+            if self.stack is None or movie_frame is None:
+                return None
+            return self.stack.read_frame(int(movie_frame))
         mapping = {
             "meanImg": meta.get("meanImg"),
             "meanImgE": meta.get("meanImgE"),
@@ -2320,26 +2563,12 @@ class MainWindow(QMainWindow):
             img = meta.get("meanImg")
         return None if img is None else np.asarray(img)
 
+    def _fov_source_image(self) -> np.ndarray | None:
+        return self._image_from_combo(self.cmb_fov_src)
+
     def _w3_source_image(self, frame_index: int | None = None) -> np.ndarray | None:
-        """Raw 2D image for W3 / thumbnail backdrop (before LUT)."""
-        if self.doc is None:
-            return None
-        key = self.cmb_w3_src.currentText()
-        meta = self.doc["meta"]
-        if key == "movie":
-            if self.stack is None:
-                return None
-            t = self._c0_frame_index() if frame_index is None else int(frame_index)
-            return self.stack.read_frame(t)
-        mapping = {
-            "meanImg": meta.get("meanImg"),
-            "meanImgE": meta.get("meanImgE"),
-            "VCorr": meta.get("VCorr"),
-        }
-        img = mapping.get(key)
-        if img is None:
-            img = meta.get("meanImg")
-        return None if img is None else np.asarray(img)
+        t = self._c0_frame_index() if frame_index is None else int(frame_index)
+        return self._image_from_combo(self.cmb_w3_src, movie_frame=t)
 
     def _w3_rgb(self, frame_index: int | None = None) -> np.ndarray | None:
         img = self._w3_source_image(frame_index=frame_index)
@@ -2472,7 +2701,7 @@ class MainWindow(QMainWindow):
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
         t = self._c0_frame_index()
-        rgb = self._w3_rgb(frame_index=t if self.cmb_w3_src.currentText() == "movie" else None)
+        rgb = self._w3_rgb(frame_index=t if self._w3_source_is_movie() else None)
         if rgb is None:
             return
         y0, x0, side, row = self._zoom_geometry()
@@ -2481,7 +2710,7 @@ class MainWindow(QMainWindow):
         self._set_display_rgb(self.w3.image_view, zoom)  # type: ignore[attr-defined]
         src = self.cmb_w3_src.currentText()
         title = f"ROI zoom (W3) — {src}"
-        if src == "movie":
+        if self._w3_source_is_movie():
             title += f" frame {t}"
         if self._mask_edit_active:
             title += " [editing]"
@@ -2508,6 +2737,29 @@ class MainWindow(QMainWindow):
                 f"mean F / mean Fneu (batch n={len(self._batch_roi_ids)}, display x=1)"
             )
             self.plot_comp.setTitle("mean(F − 1·Fneu) — batch display")
+            self.curve_bleach_sm.setData(xs, np.full_like(xs, np.nan, dtype=float))
+            self.curve_bleach_fit.setData(xs, np.full_like(xs, np.nan, dtype=float))
+            nframes = int(self.doc["meta"]["nframes"])
+            bc_acc = []
+            sm_acc = []
+            for row in self.doc["rois"]:
+                if int(row["roi_id"]) not in set(self._batch_roi_ids):
+                    continue
+                if row.get(TRACE_FIELD_SM) is not None:
+                    sm_acc.append(np.asarray(row[TRACE_FIELD_SM], dtype=np.float64))
+                if row.get(TRACE_FIELD_SM_BC) is not None:
+                    bc_acc.append(np.asarray(row[TRACE_FIELD_SM_BC], dtype=np.float64))
+            if sm_acc:
+                with np.errstate(all="ignore"):
+                    sm_mean = np.nanmean(np.vstack(sm_acc), axis=0)
+                self.curve_bleach_sm.setData(xs[: sm_mean.shape[0]], sm_mean[: xs.shape[0]])
+            if bc_acc:
+                with np.errstate(all="ignore"):
+                    bc_mean = np.nanmean(np.vstack(bc_acc), axis=0)
+                self.curve_bleach_bc.setData(xs[: bc_mean.shape[0]], bc_mean[: xs.shape[0]])
+            else:
+                self.curve_bleach_bc.setData(xs, np.full_like(xs, np.nan, dtype=float))
+            self.plot_bleach.setTitle("mean tc_norm_sm / tc_norm_sm_bc — batch")
         else:
             row = self._row()
             F = np.asarray(row["roi"]["F"], dtype=np.float64)
@@ -2520,6 +2772,22 @@ class MainWindow(QMainWindow):
             self.curve_comp.setData(xs, self._display_trace(comp))
             self.plot_f.setTitle("F / Fneu")
             self.plot_comp.setTitle("trace_comp = F − x·Fneu")
+            nframes = int(self.doc["meta"]["nframes"])
+            mask = led_shutter_nan_mask(self.doc, nframes)
+            sm = row.get(TRACE_FIELD_SM)
+            bc = row.get(TRACE_FIELD_SM_BC)
+            fit = bleach_fit_curve(row, mask, nframes)
+            nan_y = np.full(xs.shape, np.nan, dtype=np.float64)
+            self.curve_bleach_sm.setData(
+                xs, self._display_trace(sm) if sm is not None else nan_y
+            )
+            self.curve_bleach_fit.setData(xs, fit if fit is not None else nan_y)
+            self.curve_bleach_bc.setData(
+                xs, self._display_trace(bc) if bc is not None else nan_y
+            )
+            cons = bool((row.get("bleach") or {}).get("conservative", False)) if bc is not None else False
+            extra = " (conservative)" if cons else ""
+            self.plot_bleach.setTitle(f"tc_norm_sm / tc_norm_sm_bc{extra}")
         self._refresh_ann_spans()
         if autoscale:
             for k in self._trace_y_locked:
@@ -2997,16 +3265,17 @@ class MainWindow(QMainWindow):
         y0, x0, side, row = self._zoom_geometry()
         n = int(meta["nframes"])
         src = self.cmb_w3_src.currentText()
+        movie = self._w3_source_is_movie()
         for i, (line, view, lab) in enumerate(
             zip(self.cursors, self.thumb_views, self.thumb_labels)
         ):
             fi = int(np.clip(round(line.value()), 0, max(n - 1, 0)))
-            rgb = self._w3_rgb(frame_index=fi if src == "movie" else None)
+            rgb = self._w3_rgb(frame_index=fi if movie else None)
             if rgb is None:
                 continue
             zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
             self._set_display_rgb(view, zoom)
-            if src == "movie":
+            if movie:
                 lab.setText(f"C{i + 1} — frame {fi}")
             else:
                 lab.setText(f"C{i + 1} — {src}")
