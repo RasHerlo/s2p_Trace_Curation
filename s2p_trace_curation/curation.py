@@ -14,6 +14,7 @@ from s2p_trace_curation import PICKLE_NAME, SCHEMA_VERSION
 from s2p_trace_curation.suite2p_io import (
     PLANE_NAME,
     BinaryStack,
+    enhanced_mean_from_ops,
     fov_images_from_ops,
     load_iscell,
     load_ops,
@@ -118,7 +119,33 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
 def sync_fov_images_from_ops(doc: dict[str, Any], suite2p_dir: Path) -> None:
     """Refresh meanImg / meanImgE / VCorr from plane0/ops.npy (full-FOV embeds)."""
     ops = load_ops(plane_dir(resolve_suite2p_dir(suite2p_dir)))
-    doc["meta"].update(fov_images_from_ops(ops))
+    imgs = fov_images_from_ops(ops)
+    meta = doc["meta"]
+    cached = meta.get("meanImgE_computed") and meta.get("meanImgE") is not None
+    if imgs["meanImgE"] is None and cached:
+        del imgs["meanImgE"]  # keep the one we built ourselves
+    else:
+        meta.pop("meanImgE_computed", None)
+    meta.update(imgs)
+
+
+def ensure_meanimge(doc: dict[str, Any], suite2p_dir: Path) -> np.ndarray | None:
+    """
+    meanImgE for the display dropdowns, computing it when ops.npy has none.
+
+    Returns None if there is no meanImg to derive it from. The result is cached
+    in meta and flagged, so it survives the ops resync on the next open.
+    """
+    meta = doc["meta"]
+    if meta.get("meanImgE") is not None:
+        return np.asarray(meta["meanImgE"])
+    ops = load_ops(plane_dir(resolve_suite2p_dir(suite2p_dir)))
+    img = enhanced_mean_from_ops(ops)
+    if img is None:
+        return None
+    meta["meanImgE"] = img
+    meta["meanImgE_computed"] = True
+    return img
 
 
 def save_curation(doc: dict[str, Any], suite2p_dir: Path) -> Path:

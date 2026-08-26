@@ -69,6 +69,7 @@ from s2p_trace_curation.batch_select import mean_traces_for_rois, rois_in_lasso
 from s2p_trace_curation.curation import (
     append_roi,
     empty_roi_draft,
+    ensure_meanimge,
     next_roi_id,
     open_suite2p_session,
     reextract_after_mask_edit,
@@ -348,6 +349,8 @@ class MainWindow(QMainWindow):
         self.stack: BinaryStack | None = None
         self.dirty = False
         self.active_roi_id = 0
+        self._meanimge_failed = False
+        self._meanimge_busy = False
         self._updating = False
         self._batch_mode = False
         self._batch_roi_ids: list[int] = []
@@ -1275,6 +1278,7 @@ class MainWindow(QMainWindow):
         self.suite2p_dir = suite2p_dir
         self.doc = doc
         self.dirty = created
+        self._meanimge_failed = False
         self.stack = BinaryStack(plane_dir(suite2p_dir))
         n = len(doc["rois"])
         self._updating = True
@@ -2572,9 +2576,42 @@ class MainWindow(QMainWindow):
             "VCorr": meta.get("VCorr"),
         }
         img = mapping.get(key)
+        if img is None and key == "meanImgE":
+            img = self._build_meanimge()
         if img is None and key != "meanImg":
             img = meta.get("meanImg")
         return None if img is None else np.asarray(img)
+
+    def _build_meanimge(self) -> np.ndarray | None:
+        """Derive meanImgE once for ops.npy files that never stored one."""
+        if self.doc is None or self.suite2p_dir is None or self._meanimge_failed:
+            return None
+        if self._meanimge_busy:  # processEvents below can re-enter through a refresh
+            return None
+        self._meanimge_busy = True
+        self.statusBar().showMessage(
+            "ops.npy has no meanImgE — computing the enhanced mean image…"
+        )
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            img = ensure_meanimge(self.doc, self.suite2p_dir)
+        except Exception as exc:
+            self._meanimge_failed = True
+            self.statusBar().showMessage(f"Could not build meanImgE: {exc}")
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._meanimge_busy = False
+        if img is None:
+            self._meanimge_failed = True
+            self.statusBar().showMessage("ops.npy has no meanImg — cannot build meanImgE")
+            return None
+        self.dirty = True
+        self.statusBar().showMessage(
+            "meanImgE was missing from ops.npy — computed here and cached in the pickle"
+        )
+        return img
 
     def _fov_source_image(self) -> np.ndarray | None:
         return self._image_from_combo(self.cmb_fov_src)

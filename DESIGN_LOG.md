@@ -83,7 +83,8 @@ Future schema versions bump `schema_version` and migrate on load. Still one port
 | `nframes` | `int` | Cached from `ops` / traces |
 | `fs` | `float` or `None` | Sampling rate if available in `ops` |
 | `meanImg` | `np.ndarray` | Cached display image (optional but agreed as OK if straightforward) |
-| `meanImgE` | `np.ndarray` | Cached enhanced mean |
+| `meanImgE` | `np.ndarray` | Cached enhanced mean (rebuilt locally when `ops` has none — see below) |
+| `meanImgE_computed` | `bool` | Present only when `meanImgE` was derived here rather than read from `ops` |
 | `VCorr` | `np.ndarray` | Cached correlation image |
 | `notes` | `str` | Free-form session notes (optional empty) |
 
@@ -231,6 +232,7 @@ Toolkit: **pyqtgraph + Qt bindings** (PyQt5 preferred on Windows/conda; PySide6 
 
 **FOV display block (W1)**
 - Dropdown: image source — `meanImg` | `meanImgE` | `VCorr`
+- Missing sources fall back to `meanImg`. **meanImgE (2026-08-26):** some runs never write it (anatomical / Cellpose detection skips the step), so on first request it is rebuilt with suite2p's recipe — median-filter `meanImg` at ~4× the cell diameter, subtract, divide by the median-filtered absolute residual, clip to ±6 → 0–1 (`suite2p_io.enhanced_mean_image`). ~3–5 s for 512×512, so it is lazy, runs behind a wait cursor, and is cached in `meta` with a `meanImgE_computed` flag that survives the ops resync; a real `meanImgE` appearing in `ops` later takes precedence again. Note that merged folders inherit `ops` (and therefore all FOV images) from source 1, so an anatomical parent also hands over a `VCorr` that is near-identical to `meanImg`.
 - Dropdown: LUT — `grey` (default), `turbo`, `viridis`, `magma`, `jet`
 - Sliders: lower / upper display bounds (brightness–contrast)
 - Overlay filter: **non-selected** (`iscell=False`) | **selected** (`iscell=True`) | **both**
@@ -594,6 +596,8 @@ AUC is a trapezoid sum over each contiguous run of included frames, divided by t
 The window mirrors Raster Tools (Show / Sort / Trace / LUT) with its own Single↔Batch toggle: **Single** plots the selected ROI's trace, **Batch** the Co-Activity mean of the visible rows. Ranges are dragged as regions on that trace or typed as Start/End, and are mirrored onto the raster as non-movable spans (movable there would swallow the row-select click). Annotation spans are drawn underneath as a guide only — ranges are never derived from them. Clicking a raster row selects that ROI in the main window; main-window raster changes push back into the open editor.
 
 **ROI outlines** checkbox overlays 1-px ROI boundaries on the map preview as a separate RGBA `ImageItem` above it, following Show ROIs; active ROI cyan, others red (matching the FOV convention), highlight dropped in Batch.
+
+Editor raster (2026-08-26): the raster sits in a `PlotItem` so it carries the same x-axis as the trace below it. Redraws pass `autoRange=False` unless the raster geometry changes, so selecting a row or switching ROI keeps the current zoom. An **X units** dropdown (frames / seconds) rescales only the tick labels of both x-axes via `AxisItem.setScale(1/fs)`; plot coordinates, ranges and spinboxes stay in frames, and the range list gains a seconds annotation. Seconds needs `meta.fs` (from `ops.npy`) and falls back to frames with a notice when it is missing. The choice persists in user settings as `heatmap_x_units`. Saved maps can be relabelled with **Rename** next to New / Delete.
 
 Superseded 2026-08-26: the earlier starts / extension / Area L–R segment-alignment parameters (ported from `stack_analyzer`) were dropped before use. Saved records without `ranges` normalize to an empty range list and report "legacy" until recomputed.
 

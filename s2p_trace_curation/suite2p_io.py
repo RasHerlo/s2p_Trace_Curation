@@ -313,3 +313,97 @@ def fov_images_from_ops(ops: dict[str, Any]) -> dict[str, np.ndarray | None]:
         VCorr = embed_into_fov(np.asarray(vcorr_raw), Ly, Lx, yrange, xrange)
 
     return {"meanImg": meanImg, "meanImgE": meanImgE, "VCorr": VCorr}
+
+
+def ops_cell_diameter(ops: dict[str, Any]) -> tuple[float, float]:
+    """(diameter_px, aspect) for filter sizing; falls back to the suite2p default."""
+    diameter = 0.0
+    for key in ("spatscale_pix", "diameter"):
+        raw = ops.get(key)
+        if raw is None:
+            continue
+        arr = np.atleast_1d(np.asarray(raw, dtype=np.float64)).ravel()
+        arr = arr[np.isfinite(arr) & (arr > 0)]
+        if arr.size:
+            diameter = float(arr[-1])
+            break
+    if diameter <= 0:
+        diameter = 12.0
+
+    aspect = 1.0
+    raw_aspect = ops.get("aspect")
+    try:
+        val = float(raw_aspect)
+        if np.isfinite(val) and val > 0:
+            aspect = val
+    except (TypeError, ValueError):
+        pass
+    return diameter, aspect
+
+
+def enhanced_mean_image(
+    mean_img: np.ndarray,
+    Ly: int,
+    Lx: int,
+    yrange: Any = None,
+    xrange: Any = None,
+    diameter: float = 12.0,
+    aspect: float = 1.0,
+) -> np.ndarray:
+    """
+    Rebuild suite2p's meanImgE for ops.npy files that never stored one.
+
+    Follows suite2p's recipe: median-filter meanImg at ~4x the cell diameter,
+    subtract it, divide by the median-filtered absolute residual, then clip to
+    the fixed -6..6 window and rescale to 0..1. Anatomical (Cellpose) runs skip
+    this step, which is why the key can be missing.
+    """
+    from scipy.ndimage import median_filter
+
+    img = np.asarray(mean_img, dtype=np.float32)
+    if img.ndim != 2:
+        raise ValueError(f"Expected 2D meanImg, got shape {img.shape}")
+
+    def _kernel(extent: float, limit: int) -> int:
+        size = int(4 * np.ceil(max(float(extent), 1.0)) + 1)
+        size = min(size, int(limit))
+        if size % 2 == 0:
+            size -= 1
+        return max(size, 3)
+
+    size = (
+        _kernel(diameter * aspect, img.shape[0]),
+        _kernel(diameter, img.shape[1]),
+    )
+    residual = img - median_filter(img, size=size)
+    scale = median_filter(np.abs(residual), size=size)
+    norm = residual / (1e-10 + scale)
+
+    y0, y1 = 0, img.shape[0]
+    x0, x1 = 0, img.shape[1]
+    if yrange is not None and xrange is not None:
+        cy0, cy1 = int(yrange[0]), int(yrange[1])
+        cx0, cx1 = int(xrange[0]), int(xrange[1])
+        if 0 <= cy0 < cy1 <= img.shape[0] and 0 <= cx0 < cx1 <= img.shape[1]:
+            y0, y1, x0, x1 = cy0, cy1, cx0, cx1
+
+    inner = np.clip((norm[y0:y1, x0:x1] + 6.0) / 12.0, 0.0, 1.0)
+    out = np.full(img.shape, float(inner.min()), dtype=np.float32)
+    out[y0:y1, x0:x1] = inner
+    return embed_into_fov(out, Ly, Lx, yrange, xrange)
+
+
+def enhanced_mean_from_ops(ops: dict[str, Any]) -> np.ndarray | None:
+    """meanImgE computed from ops' meanImg; None when there is no meanImg."""
+    if ops.get("meanImg") is None:
+        return None
+    diameter, aspect = ops_cell_diameter(ops)
+    return enhanced_mean_image(
+        np.asarray(ops["meanImg"]),
+        int(ops["Ly"]),
+        int(ops["Lx"]),
+        ops.get("yrange"),
+        ops.get("xrange"),
+        diameter=diameter,
+        aspect=aspect,
+    )
