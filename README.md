@@ -40,5 +40,6 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
 - FOV, movie, ROI zoom, traces, 4 analysis cursors + movie cursor
 - Per-ROI `x` compensation and `iscell` toggle
 - Trace Processing: Savitzky–Golay (`tc_norm_sm`) and bleach (`tc_norm_sm_bc`)
-- Named heatmaps from `data.bin` (Edit HeatMaps → Image dropdowns)
+- Named heatmaps from `data.bin`: set frame ranges on the raster trace, map is
+  AUC inside / AUC outside (Edit HeatMaps → Image dropdowns)
 - Analysis Tools HAC can use `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc`

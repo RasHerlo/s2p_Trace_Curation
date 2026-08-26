@@ -1837,6 +1837,7 @@ class MainWindow(QMainWindow):
             self._refresh_fov()
             if self._raster_mode:
                 self._refresh_raster()
+        self._notify_heatmap_raster()
 
     def _ensure_active_roi_in_filter(self) -> bool:
         """If the active ROI is hidden by Show ROIs, jump to the nearest visible one."""
@@ -1893,6 +1894,8 @@ class MainWindow(QMainWindow):
         self._refresh_all()
         if self._trace_proc_window is not None:
             self._trace_proc_window._refresh_preview()
+        if self._heatmap_window is not None:
+            self._heatmap_window.on_active_roi_changed()
 
     def _on_fov_click(self, y: int, x: int) -> None:
         if self.doc is None or self._batch_mode:
@@ -2086,6 +2089,7 @@ class MainWindow(QMainWindow):
         self.dirty = True
         if self._raster_mode:
             self._refresh_raster()
+        self._notify_heatmap_raster()
 
     def _fill_raster_trace_combo(self) -> None:
         if self.doc is None:
@@ -2111,6 +2115,7 @@ class MainWindow(QMainWindow):
         self.dirty = True
         if self._raster_mode:
             self._refresh_raster()
+        self._notify_heatmap_raster()
 
     def _open_analysis_tools(self) -> None:
         if self.doc is None:
@@ -2163,6 +2168,11 @@ class MainWindow(QMainWindow):
         self._fill_image_source_combos()
         self._refresh_fov()
         self._refresh_w3_and_thumbs()
+
+    def _notify_heatmap_raster(self) -> None:
+        """Keep the HeatMap editor's mirrored raster in sync with Raster Tools."""
+        if self._heatmap_window is not None:
+            self._heatmap_window.refresh_raster()
 
     def _fill_image_source_combos(self) -> None:
         if self.doc is None:
@@ -2306,7 +2316,10 @@ class MainWindow(QMainWindow):
             self._refresh_raster(auto_range=False)
 
     def _on_raster_display_changed(self) -> None:
-        if self._updating or not self._raster_mode:
+        if self._updating:
+            return
+        self._notify_heatmap_raster()
+        if not self._raster_mode:
             return
         self._refresh_raster(auto_range=False)
 

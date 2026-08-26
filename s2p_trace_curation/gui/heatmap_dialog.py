@@ -1,4 +1,4 @@
-"""Non-modal Edit HeatMaps window: named maps from data.bin."""
+"""Non-modal Edit HeatMaps window: raster + trace ranges → named maps."""
 
 from __future__ import annotations
 
@@ -8,30 +8,37 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from s2p_trace_curation.analyses import active_sort_run, apply_raster_sort
 from s2p_trace_curation.annotations import PROPERTY_SPEC, ensure_annotations
+from s2p_trace_curation.gui.colormaps import (
+    LUT_NAMES,
+    colorize_raster,
+    lut_with_revert,
+    make_lut,
+    selected_row_lut,
+)
 from s2p_trace_curation.heatmaps import (
+    HEATMAP_KIND_LABELS,
+    KIND_AUC_RATIO,
     HeatmapCancelled,
     apply_heatmap_result,
     compute_heatmap_map,
     default_heatmap_params,
     ensure_heatmaps,
-    format_start_frames,
+    format_ranges,
     get_heatmap,
     heatmap_combo_label,
     make_heatmap,
     next_heatmap_id,
     normalize_heatmap_params,
-    parse_start_frames,
+    normalize_ranges,
+    split_frame_weights,
 )
-from s2p_trace_curation.raster import led_shutter_nan_mask
-from s2p_trace_curation.trace_processing import (
-    TRACE_FIELD_NORM,
-    TRACE_FIELD_SM,
-    TRACE_FIELD_SM_BC,
-    raster_trace_field,
-)
+from s2p_trace_curation.raster import led_shutter_nan_mask, rois_for_raster
+from s2p_trace_curation.trace_processing import raster_trace_field, stack_trace_field
 
 Qt = QtCore.Qt
+QComboBox = QtWidgets.QComboBox
 QDialog = QtWidgets.QDialog
 QFormLayout = QtWidgets.QFormLayout
 QGroupBox = QtWidgets.QGroupBox
@@ -44,30 +51,40 @@ QListWidgetItem = QtWidgets.QListWidgetItem
 QMessageBox = QtWidgets.QMessageBox
 QProgressBar = QtWidgets.QProgressBar
 QPushButton = QtWidgets.QPushButton
+QSlider = QtWidgets.QSlider
 QSpinBox = QtWidgets.QSpinBox
 QSplitter = QtWidgets.QSplitter
 QVBoxLayout = QtWidgets.QVBoxLayout
 QWidget = QtWidgets.QWidget
 
+RANGE_BRUSH = (241, 196, 15, 60)
+RANGE_PEN = "#f1c40f"
+
 
 class HeatmapEditorWindow(QDialog):
     def __init__(self, main: Any) -> None:
         super().__init__(main)
+        from s2p_trace_curation.gui.main_window import ClickableImageView
+
         self.main = main
         self.setWindowTitle("Edit HeatMaps")
         self.setModal(False)
-        self.setMinimumSize(980, 620)
+        self.setMinimumSize(1100, 720)
         self._editing_id: str | None = None
         self._preview_map: np.ndarray | None = None
         self._loading = False
         self._cancel = False
         self._computing = False
+        self._batch = False
+        self._ranges: list[list[int]] = []
+        self._range_items: list[pg.LinearRegionItem] = []
         self._ann_spans: list[pg.LinearRegionItem] = []
-        self._start_lines: list[pg.InfiniteLine] = []
+        self._raster_row_ids: list[int] = []
 
         layout = QVBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        outer = QSplitter(Qt.Orientation.Horizontal)
 
+        # ---------------------------------------------------------- left list
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -75,66 +92,116 @@ class HeatmapEditorWindow(QDialog):
         self.list_maps = QListWidget()
         self.list_maps.itemSelectionChanged.connect(self._on_selected)
         left_layout.addWidget(self.list_maps, stretch=1)
-        btn_row = QHBoxLayout()
+        list_btns = QHBoxLayout()
         self.btn_new = QPushButton("New")
         self.btn_new.clicked.connect(self._on_new)
         self.btn_delete = QPushButton("Delete")
         self.btn_delete.clicked.connect(self._on_delete)
-        btn_row.addWidget(self.btn_new)
-        btn_row.addWidget(self.btn_delete)
-        left_layout.addLayout(btn_row)
-        splitter.addWidget(left)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        list_btns.addWidget(self.btn_new)
+        list_btns.addWidget(self.btn_delete)
+        left_layout.addLayout(list_btns)
 
         form = QFormLayout()
         self.edit_label = QLineEdit()
         self.edit_label.setPlaceholderText("Untitled")
-        self.spin_sg_window = QSpinBox()
-        self.spin_sg_window.setRange(3, 999)
-        self.spin_sg_window.setSingleStep(2)
-        self.spin_sg_poly = QSpinBox()
-        self.spin_sg_poly.setRange(1, 7)
-        self.edit_starts = QLineEdit()
-        self.edit_starts.setPlaceholderText("e.g. 200, 400, 600")
-        self.spin_extension = QSpinBox()
-        self.spin_extension.setRange(1, 100000)
-        self.spin_area_l = QSpinBox()
-        self.spin_area_r = QSpinBox()
-        for s in (self.spin_area_l, self.spin_area_r):
-            s.setRange(1, 100000)
-        self.lbl_status = QLabel("New draft — Compute, then Save")
-        self.lbl_status.setWordWrap(True)
+        self.cmb_kind = QComboBox()
+        for kind, text in HEATMAP_KIND_LABELS.items():
+            self.cmb_kind.addItem(text, kind)
+        self.cmb_kind.setToolTip(
+            "AUC ratio: span-normalized AUC inside the ranges divided by the "
+            "span-normalized AUC outside them (shutter frames excluded)"
+        )
         form.addRow("Label", self.edit_label)
-        form.addRow("SG window", self.spin_sg_window)
-        form.addRow("SG poly", self.spin_sg_poly)
-        form.addRow("Starts (frames)", self.edit_starts)
-        form.addRow("Extension", self.spin_extension)
-        form.addRow("Area L", self.spin_area_l)
-        form.addRow("Area R", self.spin_area_r)
-        form.addRow("Status", self.lbl_status)
-        right_layout.addLayout(form)
+        form.addRow("Metric", self.cmb_kind)
+        left_layout.addLayout(form)
+        self.lbl_status = QLabel("New draft — set ranges, Compute, then Save")
+        self.lbl_status.setWordWrap(True)
+        left_layout.addWidget(self.lbl_status)
+        outer.addWidget(left)
 
-        self.edit_starts.editingFinished.connect(self._refresh_guide)
-        self.spin_extension.valueChanged.connect(self._refresh_guide)
+        # ----------------------------------------------------------- right side
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
 
-        viz = QSplitter(Qt.Orientation.Vertical)
-        self.plot_map = pg.PlotWidget(title="Heatmap preview")
+        top = QSplitter(Qt.Orientation.Horizontal)
+
+        map_box = QGroupBox("HeatMap preview")
+        map_layout = QVBoxLayout(map_box)
+        map_ctl = QHBoxLayout()
+        map_ctl.addWidget(QLabel("LUT"))
+        self.cmb_map_lut = QComboBox()
+        self.cmb_map_lut.addItems(list(LUT_NAMES))
+        idx_turbo = self.cmb_map_lut.findText("turbo")
+        if idx_turbo >= 0:
+            self.cmb_map_lut.setCurrentIndex(idx_turbo)
+        self.cmb_map_lut.currentIndexChanged.connect(self._redraw_map)
+        map_ctl.addWidget(self.cmb_map_lut)
+        map_ctl.addStretch(1)
+        map_layout.addLayout(map_ctl)
+        self.plot_map = pg.PlotWidget()
         self.plot_map.invertY(True)
+        self.plot_map.setAspectLocked(True)
         self.map_img = pg.ImageItem()
         self.plot_map.addItem(self.map_img)
-        viz.addWidget(self.plot_map)
+        map_layout.addWidget(self.plot_map)
+        top.addWidget(map_box)
 
-        self.plot_guide = pg.PlotWidget(title="Guide trace + annotations")
-        self.plot_guide.setLabel("bottom", "frame")
-        self.plot_guide.showGrid(x=True, y=False, alpha=0.2)
-        self.curve_guide = self.plot_guide.plot(pen=pg.mkPen("#2ca02c", width=1.2))
-        viz.addWidget(self.plot_guide)
-        viz.setStretchFactor(0, 2)
-        viz.setStretchFactor(1, 1)
-        right_layout.addWidget(viz, stretch=1)
+        raster_box = QGroupBox("Raster (mirrors Raster Tools)")
+        raster_layout = QVBoxLayout(raster_box)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Single"))
+        self.slider_batch = QSlider(Qt.Orientation.Horizontal)
+        self.slider_batch.setMinimum(0)
+        self.slider_batch.setMaximum(1)
+        self.slider_batch.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider_batch.setTickInterval(1)
+        self.slider_batch.setPageStep(1)
+        self.slider_batch.setFixedWidth(80)
+        self.slider_batch.setToolTip(
+            "Single: selected ROI's trace. Batch: Co-Activity mean of raster rows."
+        )
+        self.slider_batch.valueChanged.connect(self._on_batch_slider)
+        mode_row.addWidget(self.slider_batch)
+        mode_row.addWidget(QLabel("Batch"))
+        mode_row.addStretch(1)
+        self.lbl_raster_info = QLabel("")
+        mode_row.addWidget(self.lbl_raster_info)
+        raster_layout.addLayout(mode_row)
+        self.raster_view = ClickableImageView(on_click=self._on_raster_click)
+        self.raster_view.ui.histogram.hide()
+        raster_layout.addWidget(self.raster_view)
+        top.addWidget(raster_box)
+        top.setStretchFactor(0, 1)
+        top.setStretchFactor(1, 1)
+        right_layout.addWidget(top, stretch=3)
+
+        self.plot_trace = pg.PlotWidget(title="Trace")
+        self.plot_trace.setLabel("bottom", "frame")
+        self.plot_trace.showGrid(x=True, y=False, alpha=0.2)
+        self.curve_trace = self.plot_trace.plot(pen=pg.mkPen("#2ca02c", width=1.4))
+        right_layout.addWidget(self.plot_trace, stretch=2)
+
+        ranges_box = QGroupBox("Ranges (inside)")
+        ranges_layout = QHBoxLayout(ranges_box)
+        self.list_ranges = QListWidget()
+        self.list_ranges.setMaximumHeight(110)
+        ranges_layout.addWidget(self.list_ranges, stretch=1)
+        edit_col = QFormLayout()
+        self.spin_start = QSpinBox()
+        self.spin_end = QSpinBox()
+        for s in (self.spin_start, self.spin_end):
+            s.setRange(0, 10**9)
+        self.btn_add_range = QPushButton("Add range")
+        self.btn_add_range.clicked.connect(self._on_add_range)
+        self.btn_remove_range = QPushButton("Remove selected")
+        self.btn_remove_range.clicked.connect(self._on_remove_range)
+        edit_col.addRow("Start", self.spin_start)
+        edit_col.addRow("End", self.spin_end)
+        edit_col.addRow(self.btn_add_range)
+        edit_col.addRow(self.btn_remove_range)
+        ranges_layout.addLayout(edit_col)
+        right_layout.addWidget(ranges_box)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -144,7 +211,7 @@ class HeatmapEditorWindow(QDialog):
 
         action_row = QHBoxLayout()
         self.btn_compute = QPushButton("Compute / Update")
-        self.btn_compute.setToolTip("Read data.bin and build the area map (shutter frames skipped)")
+        self.btn_compute.setToolTip("Stream data.bin once and build the map")
         self.btn_compute.clicked.connect(self._on_compute)
         self.btn_cancel = QPushButton("Cancel compute")
         self.btn_cancel.setEnabled(False)
@@ -153,42 +220,50 @@ class HeatmapEditorWindow(QDialog):
         self.btn_save.clicked.connect(self._on_save)
         self.btn_save_as = QPushButton("Save as")
         self.btn_save_as.clicked.connect(self._on_save_as)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
         action_row.addWidget(self.btn_compute)
         action_row.addWidget(self.btn_cancel)
         action_row.addWidget(self.btn_save)
         action_row.addWidget(self.btn_save_as)
         action_row.addStretch(1)
+        action_row.addWidget(btn_close)
         right_layout.addLayout(action_row)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
-        layout.addWidget(splitter)
-
-        close_row = QHBoxLayout()
-        close_row.addStretch(1)
-        btn_close = QPushButton("Close")
-        btn_close.clicked.connect(self.close)
-        close_row.addWidget(btn_close)
-        layout.addLayout(close_row)
-
         hint = QLabel(
-            "Starts / extension / Area L–R are independent of annotations. "
-            "Annotation spans are shown on the guide so you can avoid shutter and align to events. "
-            "Area L/R are relative frames on the aligned segment (1-based)."
+            "Drag a range edge on the trace, or type Start/End and Add. "
+            "Annotation spans are shown for guidance; LED+Shutter frames are "
+            "dropped from both sides of the ratio."
         )
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        right_layout.addWidget(hint)
+
+        outer.addWidget(right)
+        outer.setStretchFactor(0, 1)
+        outer.setStretchFactor(1, 4)
+        layout.addWidget(outer)
 
         self.refresh_from_doc()
 
+    # ------------------------------------------------------------------ state
     def _doc(self) -> dict[str, Any] | None:
         return self.main.doc
 
+    def _nframes(self) -> int:
+        doc = self._doc()
+        return int(doc["meta"]["nframes"]) if doc is not None else 0
+
     def refresh_from_doc(self) -> None:
         self._preview_map = None
+        doc = self._doc()
+        n = self._nframes()
+        for s in (self.spin_start, self.spin_end):
+            s.setRange(0, max(n - 1, 0))
+        if doc is not None and n:
+            self.spin_start.setValue(int(0.2 * (n - 1)))
+            self.spin_end.setValue(int(0.3 * (n - 1)))
         self.reload_list(load_form=True)
-        self._refresh_guide()
+        self.refresh_raster()
 
     def reload_list(self, *, load_form: bool = False) -> None:
         doc = self._doc()
@@ -222,45 +297,19 @@ class HeatmapEditorWindow(QDialog):
         self.list_maps.clearSelection()
         self._set_draft_form()
 
-    def _default_params(self) -> dict[str, Any]:
-        doc = self._doc()
-        nframes = int(doc["meta"]["nframes"]) if doc is not None else 1000
-        return default_heatmap_params(nframes)
-
     def _set_draft_form(self) -> None:
         self._editing_id = None
         self._preview_map = None
         self.edit_label.setText("")
-        params = self._default_params()
-        self._apply_params(params)
+        params = default_heatmap_params()
+        idx = self.cmb_kind.findData(params["kind"])
+        if idx >= 0:
+            self.cmb_kind.setCurrentIndex(idx)
+        self._ranges = []
+        self._rebuild_ranges_ui()
         self._clear_map()
-        self.lbl_status.setText("New draft — Compute, then Save")
+        self.lbl_status.setText("New draft — set ranges, Compute, then Save")
         self._update_buttons()
-        self._refresh_guide()
-
-    def _apply_params(self, params: dict[str, Any]) -> None:
-        p = normalize_heatmap_params(params)
-        self.spin_sg_window.setValue(int(p["sg_window"]))
-        self.spin_sg_poly.setValue(int(p["sg_poly"]))
-        self.edit_starts.setText(format_start_frames(list(p["starts"])))
-        self.spin_extension.setValue(int(p["extension"]))
-        self.spin_area_l.setValue(int(p["area_left"]))
-        self.spin_area_r.setValue(int(p["area_right"]))
-
-    def _form_params(self) -> dict[str, Any]:
-        doc = self._doc()
-        nframes = int(doc["meta"]["nframes"]) if doc is not None else 10**9
-        p = self._default_params()
-        p["sg_window"] = int(self.spin_sg_window.value())
-        p["sg_poly"] = int(self.spin_sg_poly.value())
-        p["starts"] = parse_start_frames(self.edit_starts.text(), nframes)
-        p["extension"] = int(self.spin_extension.value())
-        p["area_left"] = int(self.spin_area_l.value())
-        p["area_right"] = int(self.spin_area_r.value())
-        return normalize_heatmap_params(p)
-
-    def _form_label(self) -> str:
-        return self.edit_label.text().strip() or "Untitled"
 
     def _on_new(self) -> None:
         self._loading = True
@@ -284,118 +333,280 @@ class HeatmapEditorWindow(QDialog):
         self._editing_id = hid
         self._preview_map = None
         self.edit_label.setText(str(hm.get("label") or ""))
-        self._apply_params(hm.get("params") or {})
+        params = normalize_heatmap_params(hm.get("params") or {}, self._nframes())
+        idx = self.cmb_kind.findData(params["kind"])
+        if idx >= 0:
+            self.cmb_kind.setCurrentIndex(idx)
+        self._ranges = [list(p) for p in params["ranges"]]
+        self._rebuild_ranges_ui()
         stored = hm.get("map")
         if stored is not None:
             self._show_map(np.asarray(stored, dtype=np.float64))
         else:
             self._clear_map()
-        self.lbl_status.setText(f"{hm['id']} — saved. Compute to replace the map.")
+        if not self._ranges:
+            self.lbl_status.setText(
+                f"{hm['id']} — no ranges stored (legacy). Set ranges and Compute."
+            )
+        else:
+            self.lbl_status.setText(f"{hm['id']} — saved. Compute to replace the map.")
         self._update_buttons()
-        self._refresh_guide()
 
     def _update_buttons(self) -> None:
         has = self._doc() is not None and not self._computing
         self.btn_new.setEnabled(has)
         self.btn_delete.setEnabled(has and self._editing_id is not None)
-        self.btn_compute.setEnabled(has)
+        self.btn_compute.setEnabled(has and bool(self._ranges))
         self.btn_save.setEnabled(has)
         self.btn_save_as.setEnabled(has)
+        self.btn_add_range.setEnabled(has)
+        self.btn_remove_range.setEnabled(has and bool(self._ranges))
 
-    def _clear_map(self) -> None:
-        self.map_img.setImage(np.zeros((1, 1), dtype=np.float64), autoLevels=True)
-        self.plot_map.setTitle("Heatmap preview")
+    def _form_params(self) -> dict[str, Any]:
+        return normalize_heatmap_params(
+            {
+                "kind": str(self.cmb_kind.currentData() or KIND_AUC_RATIO),
+                "ranges": self._ranges,
+            },
+            self._nframes(),
+        )
 
-    def _show_map(self, arr: np.ndarray) -> None:
-        img = np.asarray(arr, dtype=np.float64)
-        self.map_img.setImage(img, autoLevels=True)
-        ly, lx = img.shape
-        self.map_img.setRect(QtCore.QRectF(-0.5, -0.5, float(lx), float(ly)))
-        self.plot_map.setTitle(f"Heatmap preview — {ly}×{lx}")
+    def _form_label(self) -> str:
+        return self.edit_label.text().strip() or "Untitled"
 
-    def _guide_trace(self) -> np.ndarray | None:
-        doc = self._doc()
-        if doc is None or not doc.get("rois"):
-            return None
-        nframes = int(doc["meta"]["nframes"])
-        field = raster_trace_field(doc)
-        if not any(r.get(field) is not None for r in doc["rois"]):
-            for cand in (TRACE_FIELD_SM_BC, TRACE_FIELD_SM, TRACE_FIELD_NORM):
-                if any(r.get(cand) is not None for r in doc["rois"]):
-                    field = cand
-                    break
-        acc = []
-        for row in doc["rois"]:
-            if not bool(row.get("iscell", True)):
-                continue
-            tr = row.get(field)
-            if tr is None:
-                continue
-            acc.append(np.asarray(tr, dtype=np.float64))
-        if not acc:
-            return None
-        stacked = np.vstack(acc)
-        with np.errstate(all="ignore"):
-            mean = np.nanmean(stacked, axis=0)
-        out = np.full(nframes, np.nan, dtype=np.float64)
-        n_copy = min(mean.shape[0], nframes)
-        out[:n_copy] = mean[:n_copy]
-        return out
-
-    def _clear_guide_overlays(self) -> None:
-        for item in self._ann_spans + self._start_lines:
+    # ----------------------------------------------------------------- ranges
+    def _clear_range_items(self) -> None:
+        for item in self._range_items:
             try:
-                self.plot_guide.removeItem(item)
+                self.plot_trace.removeItem(item)
+            except Exception:
+                pass
+        self._range_items.clear()
+
+    def _rebuild_ranges_ui(self) -> None:
+        self._ranges = normalize_ranges(self._ranges, self._nframes())
+        self._clear_range_items()
+        for a, b in self._ranges:
+            region = pg.LinearRegionItem(
+                values=(float(a), float(b) + 1.0),
+                movable=True,
+                brush=QtGui.QColor(*RANGE_BRUSH),
+                pen=pg.mkPen(RANGE_PEN, width=1),
+            )
+            region.setZValue(-5)
+            region.sigRegionChangeFinished.connect(self._on_region_changed)
+            self.plot_trace.addItem(region)
+            self._range_items.append(region)
+
+        self.list_ranges.blockSignals(True)
+        self.list_ranges.clear()
+        for i, (a, b) in enumerate(self._ranges):
+            n = int(b) - int(a) + 1
+            item = QListWidgetItem(f"{i}:  {int(a)}–{int(b)}   ({n} frames)")
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            self.list_ranges.addItem(item)
+        self.list_ranges.blockSignals(False)
+        self._update_status_counts()
+        self._update_buttons()
+
+    def _on_region_changed(self) -> None:
+        if self._loading:
+            return
+        last = max(self._nframes() - 1, 0)
+        collected: list[list[int]] = []
+        for region in self._range_items:
+            v0, v1 = region.getRegion()
+            a = int(round(float(v0)))
+            b = int(round(float(v1))) - 1
+            if b < a:
+                b = a
+            collected.append([max(0, min(a, last)), max(0, min(b, last))])
+        self._ranges = collected
+        self._preview_map = None
+        self._rebuild_ranges_ui()
+
+    def _on_add_range(self) -> None:
+        a = int(self.spin_start.value())
+        b = int(self.spin_end.value())
+        if b < a:
+            a, b = b, a
+        self._ranges.append([a, b])
+        self._preview_map = None
+        self._rebuild_ranges_ui()
+
+    def _on_remove_range(self) -> None:
+        items = self.list_ranges.selectedItems()
+        if not items:
+            if self._ranges:
+                self._ranges.pop()
+        else:
+            drop = {int(i.data(Qt.ItemDataRole.UserRole)) for i in items}
+            self._ranges = [r for i, r in enumerate(self._ranges) if i not in drop]
+        self._preview_map = None
+        self._rebuild_ranges_ui()
+
+    def _update_status_counts(self) -> None:
+        doc = self._doc()
+        if doc is None:
+            return
+        n = self._nframes()
+        if not self._ranges:
+            self.plot_trace.setTitle(f"Trace — {format_ranges(self._ranges)}")
+            return
+        mask = led_shutter_nan_mask(doc, n)
+        w_in, w_out = split_frame_weights(self._ranges, mask)
+        self.plot_trace.setTitle(
+            f"Trace — inside {format_ranges(self._ranges)} "
+            f"(span {w_in.sum():.0f} frames, outside {w_out.sum():.0f})"
+        )
+
+    # ----------------------------------------------------------------- raster
+    def _raster_rows(self) -> list[dict[str, Any]]:
+        doc = self._doc()
+        if doc is None:
+            return []
+        rows = rois_for_raster(doc["rois"], self.main._overlay_filter())
+        return apply_raster_sort(rows, active_sort_run(doc))
+
+    def refresh_raster(self) -> None:
+        doc = self._doc()
+        if doc is None:
+            self._raster_row_ids = []
+            self.curve_trace.setData([], [])
+            return
+        n = self._nframes()
+        rows = self._raster_rows()
+        self._raster_row_ids = [int(r["roi_id"]) for r in rows]
+        field = raster_trace_field(doc)
+        if rows:
+            matrix = stack_trace_field(rows, n, field)
+        else:
+            matrix = np.full((1, n), np.nan, dtype=np.float64)
+        lut = lut_with_revert(
+            self.main.cmb_raster_lut.currentText(),
+            self.main.chk_raster_revert.isChecked(),
+        )
+        highlight_row: int | None = None
+        highlight_lut = None
+        if not self._batch and rows:
+            try:
+                highlight_row = self._raster_row_ids.index(int(self.main.active_roi_id))
+            except ValueError:
+                highlight_row = None
+            if highlight_row is not None:
+                highlight_lut = selected_row_lut(self.main.chk_raster_revert.isChecked())
+        rgb = colorize_raster(
+            matrix, lut, highlight_row=highlight_row, highlight_lut=highlight_lut
+        )
+        self.raster_view.setImage(rgb, autoLevels=False, levels=(0, 255))
+        self.lbl_raster_info.setText(f"{len(rows)} row(s) — {field}")
+        self._refresh_trace(rows, matrix, field)
+        self._refresh_ann_spans()
+
+    def _refresh_trace(
+        self, rows: list[dict[str, Any]], matrix: np.ndarray, field: str
+    ) -> None:
+        n = matrix.shape[1]
+        xs = np.arange(n)
+        if self._batch:
+            if rows:
+                valid = np.isfinite(matrix)
+                counts = valid.sum(axis=0)
+                sums = np.nansum(np.where(valid, matrix, 0.0), axis=0)
+                y = np.divide(
+                    sums,
+                    counts,
+                    out=np.full(counts.shape, np.nan, dtype=np.float64),
+                    where=counts > 0,
+                )
+            else:
+                y = np.full(n, np.nan, dtype=np.float64)
+        else:
+            y = np.full(n, np.nan, dtype=np.float64)
+            by_id = {int(r["roi_id"]): r for r in rows}
+            row = by_id.get(int(self.main.active_roi_id))
+            if row is not None and row.get(field) is not None:
+                arr = np.asarray(row[field], dtype=np.float64)
+                n_copy = min(arr.shape[0], n)
+                y[:n_copy] = arr[:n_copy]
+        self.curve_trace.setData(xs, y)
+        self._update_status_counts()
+
+    def _clear_ann_spans(self) -> None:
+        for item in self._ann_spans:
+            try:
+                self.plot_trace.removeItem(item)
             except Exception:
                 pass
         self._ann_spans.clear()
-        self._start_lines.clear()
 
-    def _refresh_guide(self) -> None:
-        if self._loading:
-            return
+    def _refresh_ann_spans(self) -> None:
+        self._clear_ann_spans()
         doc = self._doc()
-        self._clear_guide_overlays()
-        y = self._guide_trace()
-        nframes = int(doc["meta"]["nframes"]) if doc is not None else 1
-        xs = np.arange(nframes)
-        if y is None:
-            self.curve_guide.setData([], [])
-        else:
-            self.curve_guide.setData(xs, y)
         if doc is None:
             return
         for ann in ensure_annotations(doc):
             prop = str(ann["property"])
             color = PROPERTY_SPEC.get(prop, {}).get("color", "#888888")
-            s = float(ann["start_frame"])
-            e = float(ann["end_frame"]) + 1.0
             c = QtGui.QColor(color)
             c.setAlpha(50)
             region = pg.LinearRegionItem(
-                values=(s, e), movable=False, brush=c, pen=pg.mkPen(color, width=1)
+                values=(float(ann["start_frame"]), float(ann["end_frame"]) + 1.0),
+                movable=False,
+                brush=c,
+                pen=pg.mkPen(color, width=1),
             )
             region.setZValue(-10)
-            self.plot_guide.addItem(region)
+            self.plot_trace.addItem(region)
             self._ann_spans.append(region)
-        params = self._form_params()
-        ext = int(params["extension"])
-        for start in params["starts"]:
-            line_a = pg.InfiniteLine(
-                pos=float(start),
-                angle=90,
-                movable=False,
-                pen=pg.mkPen("#f1c40f", width=1.5),
-            )
-            line_b = pg.InfiniteLine(
-                pos=float(start + ext),
-                angle=90,
-                movable=False,
-                pen=pg.mkPen("#f1c40f", width=1, style=Qt.PenStyle.DotLine),
-            )
-            self.plot_guide.addItem(line_a)
-            self.plot_guide.addItem(line_b)
-            self._start_lines.extend([line_a, line_b])
+
+    def _on_batch_slider(self, value: int) -> None:
+        self._batch = int(value) == 1
+        self.refresh_raster()
+
+    def _on_raster_click(self, y: int, x: int) -> None:
+        if not self._raster_row_ids:
+            return
+        row = int(y)
+        if 0 <= row < len(self._raster_row_ids):
+            self.main._select_roi(self._raster_row_ids[row])
+
+    def on_active_roi_changed(self) -> None:
+        if not self._batch:
+            self.refresh_raster()
+
+    # -------------------------------------------------------------------- map
+    def _clear_map(self) -> None:
+        self.map_img.clear()
+        self.plot_map.setTitle("")
+
+    def _redraw_map(self) -> None:
+        arr = self._preview_map
+        if arr is None:
+            doc = self._doc()
+            if doc is not None and self._editing_id is not None:
+                hm = get_heatmap(doc, self._editing_id)
+                if hm is not None and hm.get("map") is not None:
+                    arr = np.asarray(hm["map"], dtype=np.float64)
+        if arr is not None:
+            self._show_map(np.asarray(arr, dtype=np.float64))
+
+    def _show_map(self, arr: np.ndarray) -> None:
+        img = np.asarray(arr, dtype=np.float64)
+        finite = img[np.isfinite(img)]
+        if finite.size:
+            lo, hi = np.percentile(finite, [1, 99])
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = float(finite.min()), float(finite.max())
+            if hi <= lo:
+                hi = lo + 1.0
+        else:
+            lo, hi = 0.0, 1.0
+        self.map_img.setLookupTable(make_lut(self.cmb_map_lut.currentText()))
+        self.map_img.setImage(img, autoLevels=False, levels=(float(lo), float(hi)))
+        ly, lx = img.shape
+        self.map_img.setRect(QtCore.QRectF(-0.5, -0.5, float(lx), float(ly)))
+        self.plot_map.setTitle(f"{ly}×{lx} — levels {lo:.3g} … {hi:.3g}")
 
     def _on_cancel_compute(self) -> None:
         self._cancel = True
@@ -405,24 +616,23 @@ class HeatmapEditorWindow(QDialog):
         if doc is None or self.main.suite2p_dir is None:
             return
         params = self._form_params()
-        if not params["starts"]:
-            QMessageBox.warning(self, "Heatmap", "Enter at least one start frame.")
+        if not params["ranges"]:
+            QMessageBox.warning(self, "HeatMap", "Set at least one range first.")
             return
-        nframes = int(doc["meta"]["nframes"])
-        mask = led_shutter_nan_mask(doc, nframes)
+        mask = led_shutter_nan_mask(doc, self._nframes())
         self._cancel = False
         self._computing = True
         self._update_buttons()
         self.btn_cancel.setEnabled(True)
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        QWidget.repaint(self.progress)
 
         def progress(stage: str, fraction: float) -> None:
             self.progress.setValue(int(round(100.0 * fraction)))
             self.lbl_status.setText(stage)
             QtWidgets.QApplication.processEvents()
 
+        arr: np.ndarray | None
         try:
             arr = compute_heatmap_map(
                 self.main.suite2p_dir,
@@ -435,7 +645,7 @@ class HeatmapEditorWindow(QDialog):
             self.lbl_status.setText("Compute cancelled")
             arr = None
         except Exception as exc:
-            QMessageBox.warning(self, "Heatmap failed", str(exc))
+            QMessageBox.warning(self, "HeatMap failed", str(exc))
             arr = None
         finally:
             self._computing = False
@@ -448,38 +658,48 @@ class HeatmapEditorWindow(QDialog):
         self._show_map(arr)
         self.lbl_status.setText("Preview ready (unsaved)")
 
-    def _save_with_id(self, heatmap_id: str | None) -> None:
+    def _stored_map(self, heatmap_id: str | None) -> np.ndarray | None:
+        doc = self._doc()
+        if doc is None or heatmap_id is None:
+            return None
+        hm = get_heatmap(doc, heatmap_id)
+        if hm is None or hm.get("map") is None:
+            return None
+        return np.asarray(hm["map"])
+
+    def _on_save(self) -> None:
         doc = self._doc()
         if doc is None:
             return
         arr = self._preview_map
-        if arr is None and heatmap_id is not None:
-            hm = get_heatmap(doc, heatmap_id)
-            if hm is not None and hm.get("map") is not None:
-                arr = np.asarray(hm["map"])
+        if arr is None:
+            arr = self._stored_map(self._editing_id)
         if arr is None:
             QMessageBox.information(self, "Save", "Compute a heatmap before saving.")
             return
         params = self._form_params()
         label = self._form_label()
-        if heatmap_id is None:
+        if self._editing_id is None:
             hm = make_heatmap(doc, label=label, params=params, heatmap_map=arr)
             ensure_heatmaps(doc).append(hm)
             self._editing_id = str(hm["id"])
         else:
-            hm = get_heatmap(doc, heatmap_id)
+            hm = get_heatmap(doc, self._editing_id)
             if hm is None:
                 QMessageBox.warning(self, "Save", "That heatmap is no longer in the pickle.")
                 return
-            apply_heatmap_result(hm, label=label, params=params, heatmap_map=arr)
+            apply_heatmap_result(
+                hm,
+                label=label,
+                params=params,
+                heatmap_map=arr,
+                nframes=self._nframes(),
+            )
         self.main.dirty = True
         self.main._heatmaps_changed()
         self.reload_list(load_form=True)
         self.lbl_status.setText(f"Saved {self._editing_id}")
         self.main.statusBar().showMessage(f"Saved heatmap {self._editing_id}")
-
-    def _on_save(self) -> None:
-        self._save_with_id(self._editing_id)
 
     def _on_save_as(self) -> None:
         doc = self._doc()
@@ -494,10 +714,8 @@ class HeatmapEditorWindow(QDialog):
         if not ok:
             return
         arr = self._preview_map
-        if arr is None and self._editing_id is not None:
-            hm = get_heatmap(doc, self._editing_id)
-            if hm is not None and hm.get("map") is not None:
-                arr = np.asarray(hm["map"])
+        if arr is None:
+            arr = self._stored_map(self._editing_id)
         if arr is None:
             QMessageBox.information(self, "Save as", "Compute a heatmap before saving.")
             return

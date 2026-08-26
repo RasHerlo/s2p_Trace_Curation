@@ -548,6 +548,7 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 - **Merge s2p folders / batch iscell / Add Mask:** implemented (2026-08-23+)
 - **Analysis Tools:** schema + window shell; **HAC** (Ružička/average default, Euclidean/Ward) implemented 2026-08-24; PCA / k-means / rastermap parked
 - **Trace processing + heatmaps (schema 4, 2026-08-25):** SG → `tc_norm_sm`; bleach → `tc_norm_sm_bc`; HAC trace-field choice; named heatmaps in Image dropdowns
+- **HeatMap ranges (2026-08-26):** Edit HeatMaps mirrors the raster and takes frame ranges off the trace; metric is `auc_ratio` (inside / outside)
 - Run: `python -m s2p_trace_curation`
 
 ---
@@ -578,7 +579,21 @@ SG params are session-wide. Missing `tc_norm_sm` → warn + default SG. Missing 
 Each analysis run stores `params.trace_field` ∈ `{tc_norm, tc_norm_sm, tc_norm_sm_bc}` (default preference `tc_norm_sm_bc`). Raster Tools has a **Trace** dropdown, independent of the HAC field.
 
 ### Heatmaps
-Named maps in `doc["heatmaps"]`, computed only in **Edit HeatMaps** from `data.bin`. Independent of ROI/trace edits. LED+Shutter frames skipped. Starts / extension / Area L–R typed in that window (not taken from annotations); annotation spans are **shown** as a guide. Appear as `HeatMap: <name>` on W1 and W3 **Image** dropdowns; LUT remains the colormap.
+Named maps in `doc["heatmaps"]`, computed only in **Edit HeatMaps** from `data.bin`. Independent of ROI/trace edits (ranges are frame intervals, so nothing goes stale). Appear as `HeatMap: <name>` on W1 and W3 **Image** dropdowns; LUT remains the colormap.
+
+Each record stores `params = {kind, ranges}`. `ranges` are merged, sorted, inclusive `[start, end]` frame pairs; `kind` names the metric so later calculations are a dropdown entry rather than a schema change.
+
+**`auc_ratio`** (first and currently only kind), per pixel:
+
+```
+span-normalized AUC inside the ranges / span-normalized AUC outside them
+```
+
+AUC is a trapezoid sum over each contiguous run of included frames, divided by the integrated span, so both sides are per-frame levels and the ratio is a dimensionless fold-change (unresponsive pixel ≈ 1). LED+Shutter frames are dropped from *both* sides. Non-positive or empty denominators → NaN → mid-grey. One streaming pass over `data.bin` in ~32 MB frame blocks, with progress and cancel; no per-pixel SG (a linear filter barely moves a windowed mean).
+
+The window mirrors Raster Tools (Show / Sort / Trace / LUT) with its own Single↔Batch toggle: **Single** plots the selected ROI's trace, **Batch** the Co-Activity mean of the visible rows. Ranges are dragged as regions on that trace or typed as Start/End. Annotation spans are drawn underneath as a guide only — ranges are never derived from them. Clicking a raster row selects that ROI in the main window; main-window raster changes push back into the open editor.
+
+Superseded 2026-08-26: the earlier starts / extension / Area L–R segment-alignment parameters (ported from `stack_analyzer`) were dropped before use. Saved records without `ranges` normalize to an empty range list and report "legacy" until recomputed.
 
 ### UI
 - Right panel below Scaling Tools: **Trace Processing** window
