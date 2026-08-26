@@ -591,7 +591,9 @@ span-normalized AUC inside the ranges / span-normalized AUC outside them
 
 AUC is a trapezoid sum over each contiguous run of included frames, divided by the integrated span, so both sides are per-frame levels and the ratio is a dimensionless fold-change (unresponsive pixel ≈ 1). LED+Shutter frames are dropped from *both* sides. Non-positive or empty denominators → NaN → mid-grey. One streaming pass over `data.bin` in ~32 MB frame blocks, with progress and cancel; no per-pixel SG (a linear filter barely moves a windowed mean).
 
-The window mirrors Raster Tools (Show / Sort / Trace / LUT) with its own Single↔Batch toggle: **Single** plots the selected ROI's trace, **Batch** the Co-Activity mean of the visible rows. Ranges are dragged as regions on that trace or typed as Start/End. Annotation spans are drawn underneath as a guide only — ranges are never derived from them. Clicking a raster row selects that ROI in the main window; main-window raster changes push back into the open editor.
+The window mirrors Raster Tools (Show / Sort / Trace / LUT) with its own Single↔Batch toggle: **Single** plots the selected ROI's trace, **Batch** the Co-Activity mean of the visible rows. Ranges are dragged as regions on that trace or typed as Start/End, and are mirrored onto the raster as non-movable spans (movable there would swallow the row-select click). Annotation spans are drawn underneath as a guide only — ranges are never derived from them. Clicking a raster row selects that ROI in the main window; main-window raster changes push back into the open editor.
+
+**ROI outlines** checkbox overlays 1-px ROI boundaries on the map preview as a separate RGBA `ImageItem` above it, following Show ROIs; active ROI cyan, others red (matching the FOV convention), highlight dropped in Batch.
 
 Superseded 2026-08-26: the earlier starts / extension / Area L–R segment-alignment parameters (ported from `stack_analyzer`) were dropped before use. Saved records without `ranges` normalize to an empty range list and report "legacy" until recomputed.
 

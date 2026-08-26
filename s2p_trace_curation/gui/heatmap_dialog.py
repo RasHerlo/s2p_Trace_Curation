@@ -34,10 +34,12 @@ from s2p_trace_curation.heatmaps import (
     normalize_ranges,
     split_frame_weights,
 )
+from s2p_trace_curation.gui.overlays import iter_visible_rois, thick_outline_mask
 from s2p_trace_curation.raster import led_shutter_nan_mask, rois_for_raster
 from s2p_trace_curation.trace_processing import raster_trace_field, stack_trace_field
 
 Qt = QtCore.Qt
+QCheckBox = QtWidgets.QCheckBox
 QComboBox = QtWidgets.QComboBox
 QDialog = QtWidgets.QDialog
 QFormLayout = QtWidgets.QFormLayout
@@ -58,7 +60,10 @@ QVBoxLayout = QtWidgets.QVBoxLayout
 QWidget = QtWidgets.QWidget
 
 RANGE_BRUSH = (241, 196, 15, 60)
+RANGE_RASTER_BRUSH = (241, 196, 15, 45)
 RANGE_PEN = "#f1c40f"
+OUTLINE_RGB = (255, 0, 0)
+OUTLINE_ACTIVE_RGB = (0, 255, 255)
 
 
 class HeatmapEditorWindow(QDialog):
@@ -78,6 +83,7 @@ class HeatmapEditorWindow(QDialog):
         self._batch = False
         self._ranges: list[list[int]] = []
         self._range_items: list[pg.LinearRegionItem] = []
+        self._raster_range_items: list[pg.LinearRegionItem] = []
         self._ann_spans: list[pg.LinearRegionItem] = []
         self._raster_row_ids: list[int] = []
 
@@ -137,6 +143,13 @@ class HeatmapEditorWindow(QDialog):
             self.cmb_map_lut.setCurrentIndex(idx_turbo)
         self.cmb_map_lut.currentIndexChanged.connect(self._redraw_map)
         map_ctl.addWidget(self.cmb_map_lut)
+        self.chk_outlines = QCheckBox("ROI outlines")
+        self.chk_outlines.setToolTip(
+            "Draw outlines of the ROIs passing Show ROIs on top of the map "
+            "(active ROI in cyan)"
+        )
+        self.chk_outlines.toggled.connect(self._refresh_map_overlay)
+        map_ctl.addWidget(self.chk_outlines)
         map_ctl.addStretch(1)
         map_layout.addLayout(map_ctl)
         self.plot_map = pg.PlotWidget()
@@ -144,6 +157,9 @@ class HeatmapEditorWindow(QDialog):
         self.plot_map.setAspectLocked(True)
         self.map_img = pg.ImageItem()
         self.plot_map.addItem(self.map_img)
+        self.map_outlines = pg.ImageItem()
+        self.map_outlines.setZValue(10)
+        self.plot_map.addItem(self.map_outlines)
         map_layout.addWidget(self.plot_map)
         top.addWidget(map_box)
 
@@ -231,9 +247,9 @@ class HeatmapEditorWindow(QDialog):
         right_layout.addLayout(action_row)
 
         hint = QLabel(
-            "Drag a range edge on the trace, or type Start/End and Add. "
-            "Annotation spans are shown for guidance; LED+Shutter frames are "
-            "dropped from both sides of the ratio."
+            "Drag a range edge on the trace, or type Start/End and Add; ranges "
+            "are mirrored onto the raster. Annotation spans are shown for "
+            "guidance; LED+Shutter frames are dropped from both sides of the ratio."
         )
         hint.setWordWrap(True)
         right_layout.addWidget(hint)
@@ -383,6 +399,30 @@ class HeatmapEditorWindow(QDialog):
                 pass
         self._range_items.clear()
 
+    def _clear_raster_range_items(self) -> None:
+        view = self.raster_view.getView()
+        for item in self._raster_range_items:
+            try:
+                view.removeItem(item)
+            except Exception:
+                pass
+        self._raster_range_items.clear()
+
+    def _rebuild_raster_range_items(self) -> None:
+        """Mirror the ranges onto the raster (display only, so clicks still select)."""
+        self._clear_raster_range_items()
+        view = self.raster_view.getView()
+        for a, b in self._ranges:
+            region = pg.LinearRegionItem(
+                values=(float(a) - 0.5, float(b) + 0.5),
+                movable=False,
+                brush=QtGui.QColor(*RANGE_RASTER_BRUSH),
+                pen=pg.mkPen(RANGE_PEN, width=1),
+            )
+            region.setZValue(20)
+            view.addItem(region)
+            self._raster_range_items.append(region)
+
     def _rebuild_ranges_ui(self) -> None:
         self._ranges = normalize_ranges(self._ranges, self._nframes())
         self._clear_range_items()
@@ -406,6 +446,7 @@ class HeatmapEditorWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, i)
             self.list_ranges.addItem(item)
         self.list_ranges.blockSignals(False)
+        self._rebuild_raster_range_items()
         self._update_status_counts()
         self._update_buttons()
 
@@ -473,6 +514,7 @@ class HeatmapEditorWindow(QDialog):
         if doc is None:
             self._raster_row_ids = []
             self.curve_trace.setData([], [])
+            self._refresh_map_overlay()
             return
         n = self._nframes()
         rows = self._raster_rows()
@@ -502,6 +544,8 @@ class HeatmapEditorWindow(QDialog):
         self.lbl_raster_info.setText(f"{len(rows)} row(s) — {field}")
         self._refresh_trace(rows, matrix, field)
         self._refresh_ann_spans()
+        self._rebuild_raster_range_items()
+        self._refresh_map_overlay()
 
     def _refresh_trace(
         self, rows: list[dict[str, Any]], matrix: np.ndarray, field: str
@@ -579,6 +623,31 @@ class HeatmapEditorWindow(QDialog):
     def _clear_map(self) -> None:
         self.map_img.clear()
         self.plot_map.setTitle("")
+        self._refresh_map_overlay()
+
+    def _refresh_map_overlay(self) -> None:
+        doc = self._doc()
+        if doc is None or not self.chk_outlines.isChecked():
+            self.map_outlines.clear()
+            return
+        Ly = int(doc["meta"]["Ly"])
+        Lx = int(doc["meta"]["Lx"])
+        rgba = np.zeros((Ly, Lx, 4), dtype=np.uint8)
+        active = int(self.main.active_roi_id)
+        for row in iter_visible_rois(doc["rois"], self.main._overlay_filter()):
+            ys, xs = thick_outline_mask(
+                Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=1
+            )
+            if not ys.size:
+                continue
+            highlight = not self._batch and int(row["roi_id"]) == active
+            color = OUTLINE_ACTIVE_RGB if highlight else OUTLINE_RGB
+            rgba[ys, xs, 0] = color[0]
+            rgba[ys, xs, 1] = color[1]
+            rgba[ys, xs, 2] = color[2]
+            rgba[ys, xs, 3] = 255
+        self.map_outlines.setImage(rgba, autoLevels=False)
+        self.map_outlines.setRect(QtCore.QRectF(-0.5, -0.5, float(Lx), float(Ly)))
 
     def _redraw_map(self) -> None:
         arr = self._preview_map
@@ -607,6 +676,7 @@ class HeatmapEditorWindow(QDialog):
         ly, lx = img.shape
         self.map_img.setRect(QtCore.QRectF(-0.5, -0.5, float(lx), float(ly)))
         self.plot_map.setTitle(f"{ly}×{lx} — levels {lo:.3g} … {hi:.3g}")
+        self._refresh_map_overlay()
 
     def _on_cancel_compute(self) -> None:
         self._cancel = True
