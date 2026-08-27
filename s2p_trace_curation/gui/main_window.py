@@ -3126,8 +3126,10 @@ class MainWindow(QMainWindow):
             nudges = self._scale_nudges[key]
             left = plot.getAxis("left")
             bottom = plot.getAxis("bottom")
-            lr = left.boundingRect()
-            br = bottom.boundingRect()
+            # Not boundingRect(): a gridded AxisItem reports the whole ViewBox,
+            # which would park these widgets in the middle of the data.
+            lr = left.mapRectFromParent(left.geometry())
+            br = bottom.mapRectFromParent(bottom.geometry())
 
             y_hi = nudges["y_hi"]
             wh = y_hi.widget()
