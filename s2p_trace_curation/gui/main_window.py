@@ -168,6 +168,16 @@ C0_COLOR = "#ffff66"  # solid movie cursor
 
 _NUDGE_FRAC = 0.05  # fraction of visible span per axis-arrow click
 
+# Rows of trace_widget, and how much height one may claim when expanded alone
+_TRACE_ROWS = {"f": 0, "comp": 1, "bleach": 2}
+_ROW_MAX_HEIGHT = 100000.0
+_INSPECT_FOCUS_NAMES = {
+    "f": "F / x·Fneu",
+    "comp": "trace_comp",
+    "bleach": "tc_norm_sm / bleach",
+    "thumbs": "ROI zooms",
+}
+
 
 class _NudgePair(QWidget):
     """Two tiny arrow buttons at one end of an axis."""
@@ -356,6 +366,7 @@ class MainWindow(QMainWindow):
         self._batch_roi_ids: list[int] = []
         self._raster_mode = False
         self._raster_batch = False
+        self._inspect_focus: str | None = None
         self._tc_norm_stale = False
         self._raster_row_ids: list[int] = []
         self._raster_box_items: list[Any] = []
@@ -504,8 +515,12 @@ class MainWindow(QMainWindow):
         center_layout.setSpacing(6)
         root_layout.addWidget(center, stretch=1)
 
+        self.center_split = QSplitter(Qt.Orientation.Vertical)
+        self.center_split.setChildrenCollapsible(False)
+        center_layout.addWidget(self.center_split, stretch=1)
+
         top_split = QSplitter(Qt.Orientation.Horizontal)
-        center_layout.addWidget(top_split, stretch=3)
+        self.center_split.addWidget(top_split)
 
         self.w1 = self._make_image_panel("FOV (W1)", clickable=True)
         self.w2 = self._make_image_panel("Movie (W2)")
@@ -518,10 +533,13 @@ class MainWindow(QMainWindow):
         top_split.setStretchFactor(2, 1)
 
         self.lower_stack = QStackedWidget()
-        center_layout.addWidget(self.lower_stack, stretch=2)
+        self.center_split.addWidget(self.lower_stack)
+        self.center_split.setStretchFactor(0, 3)
+        self.center_split.setStretchFactor(1, 2)
 
         inspect_panel = QWidget()
-        inspect_layout = QVBoxLayout(inspect_panel)
+        self.inspect_layout = QVBoxLayout(inspect_panel)
+        inspect_layout = self.inspect_layout
         inspect_layout.setContentsMargins(0, 0, 0, 0)
         inspect_layout.setSpacing(6)
 
@@ -533,7 +551,13 @@ class MainWindow(QMainWindow):
         self.plot_bleach = self.trace_widget.addPlot(row=2, col=0, title="tc_norm_sm / bleach")
         self.plot_comp.setXLink(self.plot_f)
         self.plot_bleach.setXLink(self.plot_f)
-        self.plot_bleach.setLabel("bottom", "frame")
+        for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
+            plot.titleLabel.setToolTip(
+                "Click this title to expand the plot; click again to show all"
+            )
+        # Only the bottom-most visible plot may have a bottom axis. setLabel on
+        # the X-linked upper plots makes pyqtgraph paint those axes over the data.
+        self._sync_trace_bottom_axes("bleach")
         for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
             plot.setMouseEnabled(x=True, y=True)
             plot.showGrid(x=True, y=False, alpha=0.2)
@@ -611,10 +635,10 @@ class MainWindow(QMainWindow):
                 self._cursor_clones[key].append(clone)
 
         # Thumbnails (aligned with W1–W3 via center column)
-        thumb_wrap = QWidget()
-        thumb_row = QHBoxLayout(thumb_wrap)
+        self.thumb_wrap = QWidget()
+        thumb_row = QHBoxLayout(self.thumb_wrap)
         thumb_row.setContentsMargins(0, 0, 0, 0)
-        inspect_layout.addWidget(thumb_wrap)
+        inspect_layout.addWidget(self.thumb_wrap)
         self.thumb_views: list[pg.ImageView] = []
         self.thumb_labels: list[QLabel] = []
         for i in range(4):
@@ -626,6 +650,10 @@ class MainWindow(QMainWindow):
             view.ui.menuBtn.hide()
             view.ui.histogram.hide()
             view.setMinimumHeight(120)
+            view.setToolTip(
+                "Click to expand the four ROI zooms; click again to show all"
+            )
+            view.scene.sigMouseClicked.connect(self._on_thumb_clicked)
             box.addWidget(lab)
             box.addWidget(view)
             wrap = QWidget()
@@ -2862,7 +2890,7 @@ class MainWindow(QMainWindow):
         return {"f": self.plot_f, "comp": self.plot_comp, "bleach": self.plot_bleach}[key]
 
     def _on_trace_y_range_changed(self, which: str) -> None:
-        if self._updating:
+        if self._updating or self.doc is None:
             return
         self._trace_y_locked[which] = True
         self._sync_trace_y_spins_from_plots(which)
@@ -2956,15 +2984,91 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Box zoom off — left-drag pans")
 
     def _on_trace_scene_clicked(self, ev) -> None:
-        if not ev.double():
-            return
         pos = ev.scenePos()
+        if not ev.double():
+            # Title bar click toggles focus; the plot area keeps its own gestures
+            for key in ("f", "comp", "bleach"):
+                label = self._trace_plot(key).titleLabel
+                if label.isVisible() and label.sceneBoundingRect().contains(pos):
+                    self._toggle_inspect_focus(key)
+                    ev.accept()
+                    return
+            return
         for key in ("f", "comp", "bleach"):
             vb = self._trace_plot(key).getViewBox()
             if vb.sceneBoundingRect().contains(pos):
                 self._fit_trace_y(key)
                 ev.accept()
                 return
+
+    def _on_thumb_clicked(self, ev) -> None:
+        if ev.double():
+            return
+        self._toggle_inspect_focus("thumbs")
+        ev.accept()
+
+    def _toggle_inspect_focus(self, key: str) -> None:
+        self._inspect_focus = None if self._inspect_focus == key else key
+        self._apply_inspect_focus()
+        if self._inspect_focus is None:
+            self.statusBar().showMessage("Trace panel: showing all")
+        else:
+            self.statusBar().showMessage(
+                f"Trace panel: {_INSPECT_FOCUS_NAMES[key]} expanded — "
+                "click it again to show all"
+            )
+
+    def _apply_inspect_focus(self) -> None:
+        """Give one of the four inspect items the whole lower panel height."""
+        was = self._updating
+        self._updating = True
+        try:
+            self._apply_inspect_focus_layout()
+        finally:
+            self._updating = was
+        QTimer.singleShot(0, self._reposition_scale_nudges)
+
+    def _apply_inspect_focus_layout(self) -> None:
+        focus = self._inspect_focus
+        show_traces = focus is None or focus in _TRACE_ROWS
+        show_thumbs = focus is None or focus == "thumbs"
+        self.trace_widget.setVisible(show_traces)
+        self.thumb_wrap.setVisible(show_thumbs)
+
+        layout = self.trace_widget.ci.layout
+        bottom_most = "bleach" if focus is None else focus
+        for key, row in _TRACE_ROWS.items():
+            plot = self._trace_plot(key)
+            on = focus is None or focus == key
+            plot.setVisible(on and show_traces)
+            # Hidden rows need a zero max height: an invisible graphics item
+            # still claims its share of a QGraphicsGridLayout.
+            layout.setRowMinimumHeight(row, 0.0)
+            layout.setRowPreferredHeight(row, 0.0)
+            layout.setRowMaximumHeight(row, _ROW_MAX_HEIGHT if on else 0.0)
+            layout.setRowStretchFactor(row, 1 if on else 0)
+        layout.invalidate()
+        layout.activate()
+        self._sync_trace_bottom_axes(bottom_most if show_traces else None)
+
+        self.inspect_layout.setStretchFactor(self.trace_widget, 2)
+        self.inspect_layout.setStretchFactor(
+            self.thumb_wrap, 1 if focus == "thumbs" else 0
+        )
+
+    def _sync_trace_bottom_axes(self, bottom_key: str | None) -> None:
+        """Give only the bottom-most visible plot an X-axis.
+
+        setLabel on extra X-linked plots makes pyqtgraph stretch those axes
+        over the ViewBox, which paints permanent horizontal lines on the data.
+        """
+        for key in _TRACE_ROWS:
+            plot = self._trace_plot(key)
+            if key == bottom_key:
+                plot.showAxis("bottom", True)
+                plot.setLabel("bottom", "frame")
+            else:
+                plot.hideAxis("bottom")
 
     def _install_scale_nudges(self) -> None:
         self._scale_nudges = {}
@@ -3035,6 +3139,8 @@ class MainWindow(QMainWindow):
             if wl is not None:
                 wl.adjustSize()
                 y_lo.setPos(lr.center().x() - wl.width() / 2, lr.bottom() - wl.height())
+            if not plot.getAxis("bottom").isVisible():
+                continue
             x_lo = nudges["x_lo"]
             wxl = x_lo.widget()
             if wxl is not None:
@@ -3118,7 +3224,7 @@ class MainWindow(QMainWindow):
         self.spin_ann_end.setValue(int(round(self.cursor_c0.value())))
 
     def _on_trace_x_range_changed(self, *_args: object) -> None:
-        if self._updating:
+        if self._updating or self.doc is None:
             return
         self._trace_x_user_zoomed = True
         self._sync_trace_x_spins_from_plots()

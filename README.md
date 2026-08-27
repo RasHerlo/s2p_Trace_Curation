@@ -43,3 +43,5 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
 - Named heatmaps from `data.bin`: set frame ranges on the raster trace, map is
   AUC inside / AUC outside (Edit HeatMaps → Image dropdowns)
 - Analysis Tools HAC can use `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc`
+- Draggable divider above the trace panel; click a plot title (or a C1–C4 zoom)
+  to expand it to full height, click again to show all four

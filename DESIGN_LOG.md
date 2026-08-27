@@ -551,7 +551,22 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 - **Analysis Tools:** schema + window shell; **HAC** (Ružička/average default, Euclidean/Ward) implemented 2026-08-24; PCA / k-means / rastermap parked
 - **Trace processing + heatmaps (schema 4, 2026-08-25):** SG → `tc_norm_sm`; bleach → `tc_norm_sm_bc`; HAC trace-field choice; named heatmaps in Image dropdowns
 - **HeatMap ranges (2026-08-26):** Edit HeatMaps mirrors the raster and takes frame ranges off the trace; metric is `auc_ratio` (inside / outside)
+- **Inspect panel space (2026-08-27):** draggable W1–W3 / lower-panel divider; click a plot title (or a zoom) to expand one of the four items
 - Run: `python -m s2p_trace_curation`
+
+---
+
+## Session 2026-08-27 — Inspect panel vertical space
+
+The trace plots were starved: `center_layout` gave the W1–W3 row a hard `stretch=3` against the lower panel's `stretch=2`, and since the lower panel's size hint is far larger than the image row's, the three viewboxes were squeezed to **0 px** at a 900-px-tall window (13 px at 1100, 109 px at 1800).
+
+**Divider.** `top_split` and `lower_stack` now sit in a vertical `QSplitter` (`center_split`, non-collapsible). Stretch factors stay 3:2 but a splitter honours size hints first, which alone takes the viewboxes to 104 px at 900 and 341 px at 1800 while holding a stable ratio across window heights. Do *not* seed `setSizes([3000, 2000])` to force a literal 3:2 — that reproduces the old starvation.
+
+**Focus toggle.** Clicking a plot's **title** expands one of the four inspect items to the panel's full height; clicking it again restores all four. State lives in `_inspect_focus` ∈ `{None, f, comp, bleach, thumbs}`, applied by `_apply_inspect_focus()`.
+
+Why the title and not the plot area: double-click in these plots already means "autoscale Y" (`_fit_trace_y`), and pyqtgraph emits a single click *before* the double, so a plot-area binding would fire on every fit-Y. Titles sit outside the viewbox and span its full width (~845 × 30 px), and a collapsed plot has an empty title rect, so it cannot be hit by accident. The zoom row has no double-click behaviour, so there the images themselves are clickable.
+
+Collapsing a row needs `setRowMaximumHeight(row, 0)` **plus** `invalidate()` + `activate()` — an invisible graphics item still claims its share of a `QGraphicsGridLayout`, and without the invalidate some rows keep ~20 px. The three plots stay in one `GraphicsLayoutWidget`/scene, so the linked X axis, C0–C4 cursor clones, scale-nudge proxies (parented to each plot's axes, so they hide with it) and fit-Y are untouched. The `frame` x-axis is shown only on the bottom-most visible plot (`hideAxis("bottom")` on the others). `setLabel` on the X-linked upper plots makes pyqtgraph paint those axes over the traces.
 
 ---
 
