@@ -162,6 +162,8 @@ FILTER_LABELS = {
 # Analysis cursor colors (dotted)
 C_COLORS = ["#ff8c00", "#da70d6", "#7fffd4", "#ffa07a"]
 C0_COLOR = "#ffff66"  # solid movie cursor
+UNITS_FRAMES = "frames"
+UNITS_SECONDS = "seconds"
 
 _NUDGE_FRAC = 0.05  # fraction of visible span per axis-arrow click
 
@@ -212,6 +214,22 @@ class _NudgePair(QWidget):
         return btn
 
 
+def image_view_box(image_view: pg.ImageView) -> Any:
+    """ViewBox used for scene → image mapping.
+
+    Raster Tools / FOV pass no ``view=`` so ``getView()`` is already a ViewBox.
+    Annotation Tools and Edit HeatMaps pass a PlotItem; only then unwrap with
+    PlotItem.getViewBox(). Never call getViewBox() on a ViewBox — this
+    pyqtgraph walks to GraphicsView, which cannot map clicks.
+    """
+    view = image_view.getView()
+    if isinstance(view, pg.ViewBox):
+        return view
+    if isinstance(view, pg.PlotItem):
+        return view.getViewBox()
+    return view
+
+
 class ClickableImageView(pg.ImageView):
     """ImageView: left-click select and/or freehand lasso drawing."""
 
@@ -231,17 +249,8 @@ class ClickableImageView(pg.ImageView):
         )
         self.getView().addItem(self._lasso_curve)
 
-    def _view_box(self) -> Any:
-        view = self.getView()
-        getter = getattr(view, "getViewBox", None)
-        if callable(getter):
-            box = getter()
-            if box is not None:
-                return box
-        return view
-
     def _map_scene_to_view(self, scene_pos: Any) -> Any | None:
-        box = self._view_box()
+        box = image_view_box(self)
         if not box.sceneBoundingRect().contains(scene_pos):
             return None
         return box.mapSceneToView(scene_pos)
@@ -352,11 +361,7 @@ class PaintImageView(pg.ImageView):
     def _emit_paint(self, viewport_pos) -> None:
         assert self._on_paint is not None
         scene_pos = self.ui.graphicsView.mapToScene(viewport_pos)
-        view = self.getView()
-        getter = getattr(view, "getViewBox", None)
-        box = getter() if callable(getter) else view
-        if box is None:
-            box = view
+        box = image_view_box(self)
         if not box.sceneBoundingRect().contains(scene_pos):
             return
         mouse = box.mapSceneToView(scene_pos)
@@ -682,15 +687,27 @@ class MainWindow(QMainWindow):
         raster_layout.setContentsMargins(0, 0, 0, 0)
         raster_layout.setSpacing(6)
 
-        self.raster_view = ClickableImageView(on_click=self._on_raster_click)
+        self.raster_plot = pg.PlotItem()
+        self.raster_view = ClickableImageView(
+            view=self.raster_plot, on_click=self._on_raster_click
+        )
         self.raster_view.ui.histogram.hide()
         self.raster_view.setMinimumHeight(180)
+        self.raster_plot.setAspectLocked(False)
+        self.raster_plot.showAxis("bottom", True)
+        self.raster_plot.showAxis("left", True)
+        self.raster_plot.setLabel("left", "row")
+        self.raster_plot.setLabel("bottom", "frame")
+        self.raster_plot.showGrid(x=True, y=False, alpha=0.25)
+        self.raster_plot.getAxis("bottom").enableAutoSIPrefix(False)
         raster_layout.addWidget(self.raster_view, stretch=3)
 
         self.plot_raster_trace = pg.PlotWidget(title="tc_norm")
         self.plot_raster_trace.setMinimumHeight(100)
         self.plot_raster_trace.showGrid(x=True, y=False, alpha=0.2)
         self.plot_raster_trace.setLabel("bottom", "frame")
+        self.plot_raster_trace.getAxis("bottom").enableAutoSIPrefix(False)
+        self.plot_raster_trace.setXLink(self.raster_plot)
         self.curve_raster_trace = self.plot_raster_trace.plot(
             pen=pg.mkPen("#2ca02c", width=1.5)
         )
@@ -888,6 +905,19 @@ class MainWindow(QMainWindow):
         raster_mode_row.addWidget(QLabel("Batch"))
         raster_mode_row.addStretch(1)
 
+        self.cmb_raster_units = QComboBox()
+        self.cmb_raster_units.addItems([UNITS_FRAMES, UNITS_SECONDS])
+        self.cmb_raster_units.setEnabled(False)
+        self.cmb_raster_units.setToolTip(
+            "Tick labels on the raster and the trace below it. Seconds needs "
+            "the frame rate (meta 'fs' from ops.npy); data stay in frames."
+        )
+        idx_units = self.cmb_raster_units.findText(
+            str(load_settings().get("heatmap_x_units") or UNITS_FRAMES)
+        )
+        if idx_units >= 0:
+            self.cmb_raster_units.setCurrentIndex(idx_units)
+
         self.btn_rebuild_tc_norm = QPushButton("Rebuild tc_norm")
         self.btn_rebuild_tc_norm.setEnabled(False)
         self.btn_rebuild_tc_norm.setToolTip(
@@ -915,6 +945,7 @@ class MainWindow(QMainWindow):
         raster_form.addRow("LUT", self.cmb_raster_lut)
         raster_form.addRow(self.chk_raster_revert)
         raster_form.addRow("Mode", raster_mode_row)
+        raster_form.addRow("X units", self.cmb_raster_units)
         raster_form.addRow(self.btn_rebuild_tc_norm)
         raster_form.addRow(self.btn_analysis_tools)
         raster_form.addRow(self.btn_edit_heatmaps)
@@ -943,6 +974,7 @@ class MainWindow(QMainWindow):
         self.slider_raster_batch.valueChanged.connect(self._on_raster_batch_slider)
         self.cmb_raster_sort.currentIndexChanged.connect(self._on_raster_sort_changed)
         self.cmb_raster_trace.currentIndexChanged.connect(self._on_raster_trace_changed)
+        self.cmb_raster_units.currentIndexChanged.connect(self._on_raster_units_changed)
         self.btn_rebuild_tc_norm.clicked.connect(self._rebuild_tc_norm)
         return panel
 
@@ -1220,8 +1252,13 @@ class MainWindow(QMainWindow):
                 idx = self.cmb_w3_lut.findText(str(lut))
                 if idx >= 0:
                     self.cmb_w3_lut.setCurrentIndex(idx)
+            units = str(s.get("heatmap_x_units") or UNITS_FRAMES)
+            idx_u = self.cmb_raster_units.findText(units)
+            if idx_u >= 0:
+                self.cmb_raster_units.setCurrentIndex(idx_u)
         finally:
             self._updating = False
+        self._apply_raster_x_units()
 
     def _persist_ui_settings(self, *, suite2p_dir: Path | None = None) -> None:
         updates: dict[str, Any] = {
@@ -1323,6 +1360,7 @@ class MainWindow(QMainWindow):
         self._fill_raster_trace_combo()
         self._update_rebuild_button()
         self._set_raster_controls_enabled(True)
+        self._sync_raster_units_combo()
         if self._analysis_window is not None:
             self._analysis_window.refresh_from_doc()
         if self._trace_proc_window is not None:
@@ -2046,6 +2084,7 @@ class MainWindow(QMainWindow):
         self.slider_raster_batch.setEnabled(enabled)
         self.cmb_raster_sort.setEnabled(enabled)
         self.cmb_raster_trace.setEnabled(enabled)
+        self.cmb_raster_units.setEnabled(enabled)
         self.btn_analysis_tools.setEnabled(enabled)
         self.btn_edit_heatmaps.setEnabled(enabled)
         self._update_rebuild_button()
@@ -2054,6 +2093,55 @@ class MainWindow(QMainWindow):
         self.btn_rebuild_tc_norm.setEnabled(
             self.doc is not None and self._tc_norm_stale
         )
+
+    def _fs(self) -> float | None:
+        if self.doc is None:
+            return None
+        try:
+            fs = float((self.doc.get("meta") or {}).get("fs"))
+        except (TypeError, ValueError):
+            return None
+        return fs if np.isfinite(fs) and fs > 0 else None
+
+    def _raster_seconds_mode(self) -> bool:
+        return (
+            self.cmb_raster_units.currentText() == UNITS_SECONDS
+            and self._fs() is not None
+        )
+
+    def _apply_raster_x_units(self) -> None:
+        """Rescale raster/trace tick labels only; data stay in frames."""
+        fs = self._fs()
+        seconds = self._raster_seconds_mode()
+        scale = 1.0 / fs if (seconds and fs) else 1.0
+        label = "time (s)" if seconds else "frame"
+        for plot in (self.plot_raster_trace, self.raster_plot):
+            plot.getAxis("bottom").setScale(scale)
+            plot.setLabel("bottom", label)
+
+    def _sync_raster_units_combo(self) -> None:
+        if self.cmb_raster_units.currentText() == UNITS_SECONDS and self._fs() is None:
+            idx = self.cmb_raster_units.findText(UNITS_FRAMES)
+            self._updating = True
+            if idx >= 0:
+                self.cmb_raster_units.setCurrentIndex(idx)
+            self._updating = False
+        self._apply_raster_x_units()
+
+    def _on_raster_units_changed(self) -> None:
+        if self._updating:
+            return
+        if self.cmb_raster_units.currentText() == UNITS_SECONDS and self._fs() is None:
+            QMessageBox.information(
+                self,
+                "Seconds unavailable",
+                "This pickle has no frame rate (meta 'fs' from ops.npy), so the "
+                "x-axes stay in frames.",
+            )
+            self._sync_raster_units_combo()
+            return
+        save_settings({"heatmap_x_units": self.cmb_raster_units.currentText()})
+        self._apply_raster_x_units()
 
     def _refresh_analysis_stale_ui(self) -> None:
         if self.doc is None:
@@ -2486,6 +2574,7 @@ class MainWindow(QMainWindow):
         self.raster_trace_c0.setValue(self.cursor_c0.value())
         self._updating = False
         self._refresh_raster_trace(rows, matrix, reset_view=do_range)
+        self._apply_raster_x_units()
 
     def _refresh_raster_trace(
         self,
@@ -2528,7 +2617,6 @@ class MainWindow(QMainWindow):
         if reset_view:
             self._updating = True
             self.plot_raster_trace.enableAutoRange(axis="y")
-            self.plot_raster_trace.setXRange(0, max(nframes - 1, 1), padding=0.02)
             self._updating = False
 
     def _on_raster_click(self, y: int, x: int) -> None:
