@@ -500,7 +500,7 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 
 **Input:** `tc_norm` of current `iscell=True`; pairwise metric ignores NaN frames (LED+Shutter), not `nan_to_num(0)` (zeros look like silence for Ružička).
 
-**Output:** dendrogram leaf order → `order`. Optional later: cut → `labels`. Matrices recomputed in the window (similarity image + dendrogram).
+**Output:** dendrogram leaf order → `order`. Optional later: cut → `labels`. Matrices are not stored; picking a saved HAC run (or Run) recomputes the similarity image + dendrogram in the window.
 
 **Distance (stored in `params["metric"]`):**
 
@@ -552,7 +552,14 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 - **Trace processing + heatmaps (schema 4, 2026-08-25):** SG → `tc_norm_sm`; bleach → `tc_norm_sm_bc`; HAC trace-field choice; named heatmaps in Image dropdowns
 - **HeatMap ranges (2026-08-26):** Edit HeatMaps mirrors the raster and takes frame ranges off the trace; metric is `auc_ratio` (inside / outside)
 - **Inspect panel space (2026-08-27):** draggable W1–W3 / lower-panel divider; click a plot title (or a zoom) to expand one of the four items
+- **Annotation Tools window (2026-08-28):** heatmap-style ranges; C0 copy buttons removed from the right panel
 - Run: `python -m s2p_trace_curation`
+
+---
+
+## Session 2026-08-28 — Annotation Tools window
+
+The right-panel Start/End + `Start ← C0` / `End ← C0` flow is gone. **Annotation Tools** opens a non-modal window like Edit HeatMaps: mirrored raster + trace, draggable draft ranges (Add / Remove / type Start–End), then **Save**. Each draft range becomes its own pickle annotation (`property`, inclusive `start_frame`/`end_frame`) so LED+Shutter / PMT-noise selection still NaNs one span at a time. **Kind** is one editable dropdown: presets `LED+Shutter`, `AirPuff`, `PMT-noise`, or a custom name you type (stored as `property`). Click a saved list row to load it for editing; extra ranges on Save are appended. C0 remains the movie cursor only. A **Trace** dropdown (`tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc`) chooses which stored field fills the raster and the selected-ROI plot used to place ranges; it is local to this window and does not rewrite Raster Tools. **X units** (frames / seconds) matches Edit HeatMaps: tick labels only, ranges stay in frames, persisted as `heatmap_x_units`. Click a raster row to switch ROI.
 
 ---
 

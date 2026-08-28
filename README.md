@@ -45,3 +45,6 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
 - Analysis Tools HAC can use `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc`
 - Draggable divider above the trace panel; click a plot title (or a C1–C4 zoom)
   to expand it to full height, click again to show all four
+- Annotation Tools: kind is a preset (LED+Shutter, AirPuff, PMT-noise) or a
+  name you type; pick a trace type; frames or seconds; click a saved row to
+  edit; draw ranges, then Save

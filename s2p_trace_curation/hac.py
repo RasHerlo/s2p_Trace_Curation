@@ -108,19 +108,29 @@ def ruzicka_condensed(X: np.ndarray) -> np.ndarray:
     return out
 
 
-def run_hac(doc: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Cluster selected (iscell=True) tc_norm traces. Does not write the pickle.
+def run_hac(
+    doc: dict[str, Any],
+    params: dict[str, Any] | None = None,
+    *,
+    roi_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Cluster selected traces. Does not write the pickle.
 
-    Returns roi_ids (pickle order), leaf ``order``, linkage Z, and a leaf-sorted
-    square matrix for display (similarity for Ružička, distance for Euclidean).
+    ``roi_ids`` defaults to current ``iscell=True``. Pass a saved membership
+    list to redraw that run. Returns leaf ``order``, linkage Z, and a
+    leaf-sorted square matrix (similarity for Ružička, distance for Euclidean).
     """
     from s2p_trace_curation.analyses import current_iscell_ids
 
     params = normalize_hac_params(params)
-    roi_ids = current_iscell_ids(doc)
-    if len(roi_ids) < 2:
+    have = {int(r["roi_id"]) for r in doc["rois"]}
+    if roi_ids is None:
+        ids = current_iscell_ids(doc)
+    else:
+        ids = [int(i) for i in roi_ids if int(i) in have]
+    if len(ids) < 2:
         raise ValueError("HAC needs at least two selected (iscell=True) ROIs")
-    X = drop_nan_frames(trace_stack_for_ids(doc, roi_ids, params["trace_field"]))
+    X = drop_nan_frames(trace_stack_for_ids(doc, ids, params["trace_field"]))
     if not np.isfinite(X).all():
         raise ValueError("Some selected traces still contain NaNs after dropping LED frames")
 
@@ -131,7 +141,7 @@ def run_hac(doc: dict[str, Any], params: dict[str, Any] | None = None) -> dict[s
 
     Z = linkage(condensed, method=params["linkage"])
     leaves = [int(i) for i in leaves_list(Z)]
-    order = [int(roi_ids[i]) for i in leaves]
+    order = [int(ids[i]) for i in leaves]
     square = squareform(condensed)
     sorted_sq = square[np.ix_(leaves, leaves)]
     if params["metric"] == METRIC_RUZICKA:
@@ -143,7 +153,7 @@ def run_hac(doc: dict[str, Any], params: dict[str, Any] | None = None) -> dict[s
     return {
         "kind": "hac",
         "params": params,
-        "roi_ids": [int(i) for i in roi_ids],
+        "roi_ids": [int(i) for i in ids],
         "order": order,
         "Z": Z,
         "leaves": leaves,

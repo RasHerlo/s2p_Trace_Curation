@@ -2,27 +2,63 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 
-AnnotationProperty = Literal["LED+Shutter", "AirPuff"]
+PROPERTY_LED_SHUTTER = "LED+Shutter"
+PROPERTY_AIRPUFF = "AirPuff"
+PROPERTY_PMT_NOISE = "PMT-noise"
 
-ANNOTATION_PROPERTIES: tuple[AnnotationProperty, ...] = ("LED+Shutter", "AirPuff")
+ANNOTATION_PROPERTIES: tuple[str, ...] = (
+    PROPERTY_LED_SHUTTER,
+    PROPERTY_AIRPUFF,
+    PROPERTY_PMT_NOISE,
+)
 
 # Display / export behavior keyed by property name.
 PROPERTY_SPEC: dict[str, dict[str, Any]] = {
-    "LED+Shutter": {
+    PROPERTY_LED_SHUTTER: {
         "color": "#c0392b",
         "nan_display": True,  # when selected in GUI, NaN that range for display/Y-scale
         "description": "Shutter/LED artifact; NaN for display when selected",
     },
-    "AirPuff": {
+    PROPERTY_AIRPUFF: {
         "color": "#2980b9",
         "nan_display": False,
         "description": "Air-puff epoch marker for later quantification",
     },
+    PROPERTY_PMT_NOISE: {
+        "color": "#d35400",
+        "nan_display": True,
+        "description": "PMT noise epoch; NaN for display when selected",
+    },
 }
+
+DEFAULT_PROPERTY_SPEC: dict[str, Any] = {
+    "color": "#8e44ad",
+    "nan_display": False,
+    "description": "Custom marker",
+}
+
+
+def property_spec(name: str) -> dict[str, Any]:
+    return PROPERTY_SPEC.get(str(name), DEFAULT_PROPERTY_SPEC)
+
+
+def normalize_property_name(name: str) -> str:
+    text = str(name).strip()
+    if not text:
+        raise ValueError("Annotation kind cannot be empty")
+    lowered = text.lower()
+    for known in ANNOTATION_PROPERTIES:
+        if lowered == known.lower():
+            return known
+    return text
+
+
+def is_led_shutter(name: str) -> bool:
+    return str(name) == PROPERTY_LED_SHUTTER
 
 
 def ensure_annotations(doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -31,7 +67,18 @@ def ensure_annotations(doc: dict[str, Any]) -> list[dict[str, Any]]:
     if anns is None:
         anns = []
         doc["annotations"] = anns
+    for ann in anns:
+        if "label" not in ann or ann["label"] is None:
+            ann["label"] = ""
     return anns
+
+
+def annotation_kind(ann: dict[str, Any]) -> str:
+    return str(ann.get("property") or "").strip() or "Untitled"
+
+
+def annotation_list_text(ann: dict[str, Any]) -> str:
+    return f"{annotation_kind(ann)}  [{ann['start_frame']}–{ann['end_frame']}]"
 
 
 def next_ann_id(doc: dict[str, Any]) -> int:
@@ -39,6 +86,14 @@ def next_ann_id(doc: dict[str, Any]) -> int:
     if not anns:
         return 0
     return max(int(a["ann_id"]) for a in anns) + 1
+
+
+def get_annotation(doc: dict[str, Any], ann_id: int) -> dict[str, Any] | None:
+    want = int(ann_id)
+    for ann in ensure_annotations(doc):
+        if int(ann["ann_id"]) == want:
+            return ann
+    return None
 
 
 def make_annotation(
@@ -49,15 +104,14 @@ def make_annotation(
     *,
     label: str = "",
 ) -> dict[str, Any]:
-    if property_name not in PROPERTY_SPEC:
-        raise ValueError(f"Unknown annotation property: {property_name}")
+    kind = normalize_property_name(property_name)
     s = int(start_frame)
     e = int(end_frame)
     if e < s:
         s, e = e, s
     return {
         "ann_id": int(ann_id),
-        "property": str(property_name),
+        "property": kind,
         "start_frame": s,
         "end_frame": e,  # inclusive
         "label": str(label),
@@ -89,7 +143,7 @@ def nan_mask_from_annotations(
     for ann in annotations:
         if int(ann["ann_id"]) not in active:
             continue
-        spec = PROPERTY_SPEC.get(str(ann["property"]), {})
+        spec = property_spec(str(ann["property"]))
         if not spec.get("nan_display", False):
             continue
         s = int(ann["start_frame"])

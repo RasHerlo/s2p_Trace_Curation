@@ -9,7 +9,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from s2p_trace_curation.analyses import active_sort_run, apply_raster_sort
-from s2p_trace_curation.annotations import PROPERTY_SPEC, ensure_annotations
+from s2p_trace_curation.annotations import ensure_annotations, property_spec
 from s2p_trace_curation.gui.colormaps import (
     LUT_NAMES,
     colorize_raster,
@@ -689,7 +689,7 @@ class HeatmapEditorWindow(QDialog):
             return
         for ann in ensure_annotations(doc):
             prop = str(ann["property"])
-            color = PROPERTY_SPEC.get(prop, {}).get("color", "#888888")
+            color = property_spec(prop).get("color", "#888888")
             c = QtGui.QColor(color)
             c.setAlpha(50)
             region = pg.LinearRegionItem(

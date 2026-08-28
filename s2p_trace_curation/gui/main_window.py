@@ -56,14 +56,10 @@ from s2p_trace_curation.analyses import (
     set_raster_sort,
 )
 from s2p_trace_curation.annotations import (
-    ANNOTATION_PROPERTIES,
-    PROPERTY_SPEC,
     apply_nan_mask,
     ensure_annotations,
-    make_annotation,
     nan_mask_from_annotations,
-    next_ann_id,
-    validate_annotation_frames,
+    property_spec,
 )
 from s2p_trace_curation.batch_select import mean_traces_for_rois, rois_in_lasso
 from s2p_trace_curation.curation import (
@@ -78,6 +74,7 @@ from s2p_trace_curation.curation import (
     set_compensation_x,
 )
 from s2p_trace_curation.gui.analysis_dialog import AnalysisToolsWindow
+from s2p_trace_curation.gui.annotation_dialog import AnnotationEditorWindow
 from s2p_trace_curation.gui.heatmap_dialog import HeatmapEditorWindow
 from s2p_trace_curation.gui.trace_processing_dialog import TraceProcessingWindow
 from s2p_trace_curation.gui.colormaps import (
@@ -234,6 +231,21 @@ class ClickableImageView(pg.ImageView):
         )
         self.getView().addItem(self._lasso_curve)
 
+    def _view_box(self) -> Any:
+        view = self.getView()
+        getter = getattr(view, "getViewBox", None)
+        if callable(getter):
+            box = getter()
+            if box is not None:
+                return box
+        return view
+
+    def _map_scene_to_view(self, scene_pos: Any) -> Any | None:
+        box = self._view_box()
+        if not box.sceneBoundingRect().contains(scene_pos):
+            return None
+        return box.mapSceneToView(scene_pos)
+
     def clear_lasso_drawing(self) -> None:
         self._lasso_points = []
         self._lasso_curve.setData([], [])
@@ -269,10 +281,9 @@ class ClickableImageView(pg.ImageView):
 
     def _append_lasso_pos(self, viewport_pos) -> None:
         scene_pos = self.ui.graphicsView.mapToScene(viewport_pos)
-        view = self.getView()
-        if not view.sceneBoundingRect().contains(scene_pos):
+        mouse = self._map_scene_to_view(scene_pos)
+        if mouse is None:
             return
-        mouse = view.mapSceneToView(scene_pos)
         # Image coords: y=row, x=col
         pt = (float(mouse.y()), float(mouse.x()))
         if self._lasso_points:
@@ -290,10 +301,9 @@ class ClickableImageView(pg.ImageView):
         if self._on_click is None or event.button() != Qt.MouseButton.LeftButton:
             return
         pos = event.scenePos()
-        view = self.getView()
-        if not view.sceneBoundingRect().contains(pos):
+        mouse = self._map_scene_to_view(pos)
+        if mouse is None:
             return
-        mouse = view.mapSceneToView(pos)
         self._on_click(int(mouse.y()), int(mouse.x()))
 
 
@@ -343,9 +353,13 @@ class PaintImageView(pg.ImageView):
         assert self._on_paint is not None
         scene_pos = self.ui.graphicsView.mapToScene(viewport_pos)
         view = self.getView()
-        if not view.sceneBoundingRect().contains(scene_pos):
+        getter = getattr(view, "getViewBox", None)
+        box = getter() if callable(getter) else view
+        if box is None:
+            box = view
+        if not box.sceneBoundingRect().contains(scene_pos):
             return
-        mouse = view.mapSceneToView(scene_pos)
+        mouse = box.mapSceneToView(scene_pos)
         self._on_paint(int(round(mouse.y())), int(round(mouse.x())))
 
 
@@ -374,6 +388,7 @@ class MainWindow(QMainWindow):
         self._analysis_window: AnalysisToolsWindow | None = None
         self._trace_proc_window: TraceProcessingWindow | None = None
         self._heatmap_window: HeatmapEditorWindow | None = None
+        self._annotation_window: AnnotationEditorWindow | None = None
 
         self._mask_edit_active = False
         self._mask_edit_kind: str | None = None  # "modify" | "add"
@@ -391,7 +406,7 @@ class MainWindow(QMainWindow):
         self._w3_x0 = 0
         self._w3_side = 1
 
-        self._ann_panel_open = False
+        self._ann_selected_ids: set[int] = set()
         self._scale_panel_open = False
         self._ann_span_items: list[pg.LinearRegionItem] = []
         self._trace_x_user_zoomed = False
@@ -1052,57 +1067,11 @@ class MainWindow(QMainWindow):
         ann_outer = QVBoxLayout(ann)
         self.btn_ann_tools = QPushButton("Annotation Tools")
         self.btn_ann_tools.setEnabled(False)
-        self.btn_ann_tools.setToolTip("Add global time-range annotations on traces")
-        self.btn_ann_tools.clicked.connect(self._toggle_ann_panel)
-        ann_outer.addWidget(self.btn_ann_tools)
-
-        self.ann_panel = QWidget()
-        ann_layout = QVBoxLayout(self.ann_panel)
-        ann_layout.setContentsMargins(0, 0, 0, 0)
-
-        ann_form = QFormLayout()
-        self.cmb_ann_prop = QComboBox()
-        for name in ANNOTATION_PROPERTIES:
-            self.cmb_ann_prop.addItem(name)
-        self.spin_ann_start = QSpinBox()
-        self.spin_ann_end = QSpinBox()
-        for s in (self.spin_ann_start, self.spin_ann_end):
-            s.setRange(0, 0)
-        ann_form.addRow("Property", self.cmb_ann_prop)
-        ann_form.addRow("Start frame", self.spin_ann_start)
-        ann_form.addRow("End frame", self.spin_ann_end)
-        ann_layout.addLayout(ann_form)
-
-        c0_row = QHBoxLayout()
-        self.btn_ann_start_c0 = QPushButton("Start ← C0")
-        self.btn_ann_end_c0 = QPushButton("End ← C0")
-        self.btn_ann_start_c0.clicked.connect(self._ann_start_from_c0)
-        self.btn_ann_end_c0.clicked.connect(self._ann_end_from_c0)
-        c0_row.addWidget(self.btn_ann_start_c0)
-        c0_row.addWidget(self.btn_ann_end_c0)
-        ann_layout.addLayout(c0_row)
-
-        self.btn_ann_add = QPushButton("Add annotation")
-        self.btn_ann_add.clicked.connect(self._add_annotation)
-        ann_layout.addWidget(self.btn_ann_add)
-
-        self.list_ann = QListWidget()
-        self.list_ann.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list_ann.itemSelectionChanged.connect(self._on_ann_selection_changed)
-        ann_layout.addWidget(self.list_ann)
-
-        self.lbl_ann_hint = QLabel(
-            "Select LED+Shutter to NaN that range for display/Y-scale."
+        self.btn_ann_tools.setToolTip(
+            "Set annotation ranges on a raster/trace, same as HeatMaps"
         )
-        self.lbl_ann_hint.setWordWrap(True)
-        ann_layout.addWidget(self.lbl_ann_hint)
-
-        self.btn_ann_delete = QPushButton("Delete selected")
-        self.btn_ann_delete.clicked.connect(self._delete_selected_annotations)
-        ann_layout.addWidget(self.btn_ann_delete)
-
-        self.ann_panel.setVisible(False)
-        ann_outer.addWidget(self.ann_panel)
+        self.btn_ann_tools.clicked.connect(self._open_annotation_editor)
+        ann_outer.addWidget(self.btn_ann_tools)
         layout.addWidget(ann)
 
         # Scaling tools (fold-out, same pattern as Annotation tools)
@@ -1333,12 +1302,8 @@ class MainWindow(QMainWindow):
         self.btn_scale_tools.setEnabled(True)
         self.btn_trace_proc.setEnabled(True)
         self.btn_save.setEnabled(True)
-        nframes = int(doc["meta"]["nframes"])
-        self.spin_ann_start.setRange(0, max(0, nframes - 1))
-        self.spin_ann_end.setRange(0, max(0, nframes - 1))
-        self.spin_ann_end.setValue(max(0, nframes - 1))
         ensure_annotations(doc)
-        self._rebuild_ann_list()
+        self._ann_selected_ids = set()
         self._batch_mode = False
         self._batch_roi_ids = []
         self._updating = True
@@ -1364,6 +1329,8 @@ class MainWindow(QMainWindow):
             self._trace_proc_window.refresh_from_doc()
         if self._heatmap_window is not None:
             self._heatmap_window.refresh_from_doc()
+        if self._annotation_window is not None:
+            self._annotation_window.refresh_from_doc()
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -1928,6 +1895,8 @@ class MainWindow(QMainWindow):
             self._trace_proc_window._refresh_preview()
         if self._heatmap_window is not None:
             self._heatmap_window.on_active_roi_changed()
+        if self._annotation_window is not None:
+            self._annotation_window.on_active_roi_changed()
 
     def _on_fov_click(self, y: int, x: int) -> None:
         if self.doc is None or self._batch_mode:
@@ -2194,6 +2163,21 @@ class MainWindow(QMainWindow):
         self._heatmap_window.raise_()
         self._heatmap_window.activateWindow()
 
+    def _open_annotation_editor(self) -> None:
+        if self.doc is None:
+            return
+        if self._annotation_window is None:
+            self._annotation_window = AnnotationEditorWindow(self)
+
+            def _clear(_obj: object = None) -> None:
+                self._annotation_window = None
+
+            self._annotation_window.destroyed.connect(_clear)
+        self._annotation_window.refresh_from_doc()
+        self._annotation_window.show()
+        self._annotation_window.raise_()
+        self._annotation_window.activateWindow()
+
     def _heatmaps_changed(self) -> None:
         if self.doc is None:
             return
@@ -2205,6 +2189,8 @@ class MainWindow(QMainWindow):
         """Keep the HeatMap editor's mirrored raster in sync with Raster Tools."""
         if self._heatmap_window is not None:
             self._heatmap_window.refresh_raster()
+        if self._annotation_window is not None:
+            self._annotation_window.refresh_raster()
 
     def _fill_image_source_combos(self) -> None:
         if self.doc is None:
@@ -3205,25 +3191,20 @@ class MainWindow(QMainWindow):
         return apply_nan_mask(trace, mask)
 
     def _selected_ann_ids(self) -> set[int]:
-        ids: set[int] = set()
-        for item in self.list_ann.selectedItems():
-            ann_id = item.data(Qt.ItemDataRole.UserRole)
-            if ann_id is not None:
-                ids.add(int(ann_id))
-        return ids
+        return set(self._ann_selected_ids)
 
-    def _toggle_ann_panel(self) -> None:
-        self._ann_panel_open = not self._ann_panel_open
-        self.ann_panel.setVisible(self._ann_panel_open)
-        if self._ann_panel_open:
-            self._rebuild_ann_list()
-            self._refresh_ann_spans()
+    def _set_ann_selection(self, ids: set[int]) -> None:
+        self._ann_selected_ids = {int(i) for i in ids}
+        self._refresh_traces(autoscale=False)
 
-    def _ann_start_from_c0(self) -> None:
-        self.spin_ann_start.setValue(int(round(self.cursor_c0.value())))
-
-    def _ann_end_from_c0(self) -> None:
-        self.spin_ann_end.setValue(int(round(self.cursor_c0.value())))
+    def _annotations_changed(self, *, led_changed: bool = False) -> None:
+        self.dirty = True
+        self._refresh_ann_spans()
+        self._refresh_traces(autoscale=False)
+        if led_changed:
+            self._mark_tc_norm_stale()
+        if self._heatmap_window is not None:
+            self._heatmap_window.refresh_raster()
 
     def _on_trace_x_range_changed(self, *_args: object) -> None:
         if self._updating or self.doc is None:
@@ -3249,74 +3230,6 @@ class MainWindow(QMainWindow):
             self._fit_trace_y(key)
         self.statusBar().showMessage("Trace scales reset to autoscale")
 
-    def _rebuild_ann_list(self) -> None:
-        self.list_ann.blockSignals(True)
-        self.list_ann.clear()
-        if self.doc is None:
-            self.list_ann.blockSignals(False)
-            return
-        for ann in ensure_annotations(self.doc):
-            prop = str(ann["property"])
-            text = (
-                f"#{ann['ann_id']}  {prop}  "
-                f"[{ann['start_frame']}–{ann['end_frame']}]"
-            )
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, int(ann["ann_id"]))
-            color = PROPERTY_SPEC.get(prop, {}).get("color", "#888888")
-            item.setForeground(QtGui.QColor(color))
-            self.list_ann.addItem(item)
-        self.list_ann.blockSignals(False)
-
-    def _add_annotation(self) -> None:
-        if self.doc is None:
-            return
-        nframes = int(self.doc["meta"]["nframes"])
-        try:
-            s, e = validate_annotation_frames(
-                self.spin_ann_start.value(), self.spin_ann_end.value(), nframes
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Invalid frames", str(exc))
-            return
-        prop = self.cmb_ann_prop.currentText()
-        ann = make_annotation(next_ann_id(self.doc), prop, s, e)
-        ensure_annotations(self.doc).append(ann)
-        self.dirty = True
-        self._rebuild_ann_list()
-        # Select the new item
-        for i in range(self.list_ann.count()):
-            item = self.list_ann.item(i)
-            if item is not None and int(item.data(Qt.ItemDataRole.UserRole)) == ann["ann_id"]:
-                self.list_ann.setCurrentItem(item)
-                break
-        self._refresh_traces(autoscale=False)
-        if prop == "LED+Shutter":
-            self._mark_tc_norm_stale()
-        self.statusBar().showMessage(
-            f"Added {prop} annotation [{s}–{e}] (inclusive)"
-        )
-
-    def _delete_selected_annotations(self) -> None:
-        if self.doc is None:
-            return
-        ids = self._selected_ann_ids()
-        if not ids:
-            return
-        anns = ensure_annotations(self.doc)
-        dropped = [a for a in anns if int(a["ann_id"]) in ids]
-        self.doc["annotations"] = [a for a in anns if int(a["ann_id"]) not in ids]
-        self.dirty = True
-        self._rebuild_ann_list()
-        self._refresh_traces(autoscale=False)
-        if any(str(a["property"]) == "LED+Shutter" for a in dropped):
-            self._mark_tc_norm_stale()
-        self.statusBar().showMessage(f"Deleted {len(ids)} annotation(s)")
-
-    def _on_ann_selection_changed(self) -> None:
-        # Selecting LED+Shutter applies display NaNs; rescale Y accordingly.
-        self._refresh_traces(autoscale=False)
-
     def _clear_ann_spans(self) -> None:
         for item in self._ann_span_items:
             try:
@@ -3336,7 +3249,7 @@ class MainWindow(QMainWindow):
         selected = self._selected_ann_ids()
         for ann in ensure_annotations(self.doc):
             prop = str(ann["property"])
-            color = PROPERTY_SPEC.get(prop, {}).get("color", "#888888")
+            color = property_spec(prop).get("color", "#888888")
             s = float(ann["start_frame"])
             e = float(ann["end_frame"]) + 1.0  # through inclusive end
             alpha = 90 if int(ann["ann_id"]) in selected else 45

@@ -32,6 +32,7 @@ from s2p_trace_curation.trace_processing import (
     TRACE_FIELD_NORM,
     TRACE_FIELD_SM_BC,
     TRACE_FIELDS,
+    field_has_any,
 )
 from s2p_trace_curation.hac import (
     DEFAULT_HAC_PARAMS,
@@ -311,6 +312,8 @@ class AnalysisToolsWindow(QDialog):
             return
         self._editing_id = aid
         self._preview = None
+        was = self._loading
+        self._loading = True
         self.edit_label.setText(str(run.get("label") or ""))
         kind = str(run.get("kind") or KIND_PLACEHOLDER)
         idx = self.cmb_kind.findData(kind)
@@ -324,16 +327,53 @@ class AnalysisToolsWindow(QDialog):
         if fi >= 0:
             self.cmb_trace_field.setCurrentIndex(fi)
         self._sync_kind_page()
-        self._clear_hac_plots()
+        self._loading = was
         n = len(run.get("roi_ids") or [])
         stale = "stale" if run.get("stale") else "valid"
         self.lbl_status.setText(
             f"{run['id']} — {stale} — {n} selected ROI(s) at last run"
         )
-        self.lbl_preview.setText(
-            f"Saved order: {len(run.get('order') or [])} ROI(s). Run to preview changes."
-        )
+        self._show_run_visuals(run)
         self._update_buttons()
+
+    def _show_run_visuals(self, run: dict[str, Any]) -> None:
+        """Redraw dendrogram / pairwise matrix for a saved run (not stored in the pickle)."""
+        kind = str(run.get("kind") or KIND_PLACEHOLDER)
+        if kind != KIND_HAC:
+            self._clear_hac_plots()
+            self.lbl_preview.setText(
+                f"Saved order: {len(run.get('order') or [])} ROI(s)."
+            )
+            return
+        doc = self._doc()
+        if doc is None:
+            self._clear_hac_plots()
+            return
+        params = deepcopy(run.get("params") or {})
+        field = str(params.get("trace_field") or TRACE_FIELD_NORM)
+        if field not in TRACE_FIELDS:
+            field = TRACE_FIELD_NORM
+        if not field_has_any(doc, field):
+            self._clear_hac_plots()
+            self.lbl_preview.setText(
+                f"{field} is missing. Run or Rebuild to compute it, then the "
+                "dendrogram and matrix will show here."
+            )
+            return
+        try:
+            saved_ids = [int(i) for i in (run.get("roi_ids") or [])]
+            result = self._execute(
+                kind, params, roi_ids=saved_ids or None
+            )
+        except ValueError as exc:
+            self._clear_hac_plots()
+            self.lbl_preview.setText(f"Could not draw this run: {exc}")
+            return
+        self._preview = result
+        stale = " (stale — Rebuild to update the saved order)" if run.get("stale") else ""
+        self.lbl_preview.setText(
+            f"Showing {kind_label(kind)} for {len(result['order'])} ROI(s){stale}."
+        )
 
     def _form_kind(self) -> str:
         kind = self.cmb_kind.currentData()
@@ -426,7 +466,11 @@ class AnalysisToolsWindow(QDialog):
 
     def _clear_hac_plots(self) -> None:
         self.plot_hac_tree.clear()
-        self.hac_img.setImage(np.zeros((1, 1), dtype=np.float64), autoLevels=False)
+        self.hac_img.setImage(
+            np.zeros((1, 1), dtype=np.float64),
+            autoLevels=False,
+            levels=(0.0, 1.0),
+        )
         self.plot_hac_mat.setTitle("Pairwise (leaf order)")
         self.plot_hac_tree.setTitle("Dendrogram")
 
@@ -452,16 +496,16 @@ class AnalysisToolsWindow(QDialog):
         )
 
         lut = make_lut("magma")
-        self.hac_img.setLookupTable(lut)
-        self.hac_img.setImage(matrix, autoLevels=False)
         if kind == "similarity":
-            self.hac_img.setLevels((0.0, 1.0))
+            levels = (0.0, 1.0)
         else:
             lo = float(np.nanmin(matrix)) if matrix.size else 0.0
             hi = float(np.nanmax(matrix)) if matrix.size else 1.0
             if hi <= lo:
                 hi = lo + 1.0
-            self.hac_img.setLevels((lo, hi))
+            levels = (lo, hi)
+        self.hac_img.setLookupTable(lut)
+        self.hac_img.setImage(matrix, autoLevels=False, levels=levels)
         self.hac_img.setRect(QtCore.QRectF(-0.5, -0.5, float(n), float(n)))
         self.plot_hac_mat.setXRange(-0.5, n - 0.5, padding=0)
         self.plot_hac_mat.setYRange(-0.5, n - 0.5, padding=0)
@@ -529,20 +573,26 @@ class AnalysisToolsWindow(QDialog):
         self._preview = result
         return self._preview
 
-    def _execute(self, kind: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _execute(
+        self,
+        kind: str,
+        params: dict[str, Any],
+        *,
+        roi_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
         doc = self._doc()
         if doc is None:
             raise ValueError("No session loaded")
         if kind == KIND_HAC:
-            result = run_hac(doc, params)
+            result = run_hac(doc, params, roi_ids=roi_ids)
             self._render_hac(result)
             return result
-        roi_ids, order = compute_run(doc, kind, params)
+        roi_ids_out, order = compute_run(doc, kind, params)
         self._clear_hac_plots()
         return {
             "kind": kind,
             "params": deepcopy(params),
-            "roi_ids": roi_ids,
+            "roi_ids": roi_ids_out,
             "order": order,
         }
 
