@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from s2p_trace_curation.annotations import ensure_annotations
+from s2p_trace_curation.annotations import annotation_ranges, ensure_annotations
 from s2p_trace_curation.trace_processing import (
     TRACE_FIELD_NORM,
     TRACE_FIELDS,
@@ -92,9 +92,10 @@ def set_raster_sort(doc: dict[str, Any], sort_id: str) -> None:
 
 def _led_spans(doc: dict[str, Any]) -> list[list[int]]:
     return sorted(
-        [int(a["start_frame"]), int(a["end_frame"])]
+        r
         for a in ensure_annotations(doc)
         if str(a["property"]) == "LED+Shutter"
+        for r in annotation_ranges(a)
     )
 
 

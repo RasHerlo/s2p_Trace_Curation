@@ -41,6 +41,10 @@ DEFAULT_PROPERTY_SPEC: dict[str, Any] = {
     "description": "Custom marker",
 }
 
+# Overlay boxes on traces: ~80% transparent so the curve stays readable.
+SPAN_FILL_ALPHA = 51  # 20% opaque
+SPAN_PEN_ALPHA = 64
+
 
 def property_spec(name: str) -> dict[str, Any]:
     return PROPERTY_SPEC.get(str(name), DEFAULT_PROPERTY_SPEC)
@@ -61,6 +65,82 @@ def is_led_shutter(name: str) -> bool:
     return str(name) == PROPERTY_LED_SHUTTER
 
 
+def is_pmt_noise(name: str) -> bool:
+    return str(name).strip().lower() == PROPERTY_PMT_NOISE.lower()
+
+
+def merge_ranges(
+    ranges: Any, nframes: int | None = None
+) -> list[list[int]]:
+    """Sorted, clipped, inclusive [start, end] pairs; touching runs join."""
+    out: list[list[int]] = []
+    for item in ranges or []:
+        try:
+            a, b = int(item[0]), int(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if b < a:
+            a, b = b, a
+        if nframes is not None:
+            last = max(int(nframes) - 1, 0)
+            a = max(0, min(a, last))
+            b = max(0, min(b, last))
+        out.append([a, b])
+    out.sort()
+    merged: list[list[int]] = []
+    for a, b in out:
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
+
+
+def annotation_ranges(ann: dict[str, Any]) -> list[list[int]]:
+    """Every interval in an annotation.
+
+    One annotation can cover several disjoint intervals (a PMT-noise import
+    is one feature made of many bursts). Annotations written before 'ranges'
+    existed fall back to their single start/end span.
+    """
+    merged = merge_ranges(ann.get("ranges"))
+    if merged:
+        return merged
+    try:
+        s = int(ann["start_frame"])
+        e = int(ann["end_frame"])
+    except (KeyError, TypeError, ValueError):
+        return []
+    if e < s:
+        s, e = e, s
+    return [[s, e]]
+
+
+def annotation_span(ann: dict[str, Any]) -> tuple[int, int]:
+    """Outer [first start, last end] across every interval."""
+    rs = annotation_ranges(ann)
+    if not rs:
+        return (0, 0)
+    return (rs[0][0], max(b for _, b in rs))
+
+
+def annotation_frame_count(ann: dict[str, Any]) -> int:
+    return sum(b - a + 1 for a, b in annotation_ranges(ann))
+
+
+def set_annotation_ranges(
+    ann: dict[str, Any], ranges: Any, nframes: int | None = None
+) -> list[list[int]]:
+    """Replace an annotation's intervals, keeping start/end as the outer span."""
+    merged = merge_ranges(ranges, nframes)
+    if not merged:
+        raise ValueError("An annotation needs at least one frame range")
+    ann["ranges"] = merged
+    ann["start_frame"] = merged[0][0]
+    ann["end_frame"] = max(b for _, b in merged)
+    return merged
+
+
 def ensure_annotations(doc: dict[str, Any]) -> list[dict[str, Any]]:
     """Guarantee doc['annotations'] exists and return it."""
     anns = doc.get("annotations")
@@ -70,6 +150,8 @@ def ensure_annotations(doc: dict[str, Any]) -> list[dict[str, Any]]:
     for ann in anns:
         if "label" not in ann or ann["label"] is None:
             ann["label"] = ""
+        if not ann.get("ranges"):
+            ann["ranges"] = annotation_ranges(ann)
     return anns
 
 
@@ -78,7 +160,14 @@ def annotation_kind(ann: dict[str, Any]) -> str:
 
 
 def annotation_list_text(ann: dict[str, Any]) -> str:
-    return f"{annotation_kind(ann)}  [{ann['start_frame']}–{ann['end_frame']}]"
+    rs = annotation_ranges(ann)
+    kind = annotation_kind(ann)
+    if len(rs) <= 1:
+        s, e = rs[0] if rs else (0, 0)
+        return f"{kind}  [{s}–{e}]"
+    start, end = annotation_span(ann)
+    frames = sum(b - a + 1 for a, b in rs)
+    return f"{kind}  [{start}–{end}] {len(rs)} intervals, {frames} frames"
 
 
 def next_ann_id(doc: dict[str, Any]) -> int:
@@ -103,19 +192,16 @@ def make_annotation(
     end_frame: int,
     *,
     label: str = "",
+    ranges: Any = None,
 ) -> dict[str, Any]:
-    kind = normalize_property_name(property_name)
-    s = int(start_frame)
-    e = int(end_frame)
-    if e < s:
-        s, e = e, s
-    return {
+    """One annotation; pass ranges to cover several disjoint intervals."""
+    ann: dict[str, Any] = {
         "ann_id": int(ann_id),
-        "property": kind,
-        "start_frame": s,
-        "end_frame": e,  # inclusive
+        "property": normalize_property_name(property_name),
         "label": str(label),
     }
+    set_annotation_ranges(ann, ranges if ranges else [[start_frame, end_frame]])
+    return ann
 
 
 def validate_annotation_frames(start: int, end: int, nframes: int) -> tuple[int, int]:
@@ -146,12 +232,13 @@ def nan_mask_from_annotations(
         spec = property_spec(str(ann["property"]))
         if not spec.get("nan_display", False):
             continue
-        s = int(ann["start_frame"])
-        e = int(ann["end_frame"])
-        s = max(0, min(s, nframes - 1))
-        e = max(0, min(e, nframes - 1))
-        if e >= s:
-            mask[s : e + 1] = True
+        # Per interval, not the outer span: the quiet frames between two
+        # noise bursts of one annotation must stay visible.
+        for a, b in annotation_ranges(ann):
+            s = max(0, min(int(a), nframes - 1))
+            e = max(0, min(int(b), nframes - 1))
+            if e >= s:
+                mask[s : e + 1] = True
     return mask
 
 

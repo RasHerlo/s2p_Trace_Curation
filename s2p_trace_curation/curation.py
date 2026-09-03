@@ -24,6 +24,7 @@ from s2p_trace_curation.suite2p_io import (
     resolve_suite2p_dir,
 )
 from s2p_trace_curation.analyses import PICKLE_SORT_ID, ensure_analyses, get_analysis, refresh_stale_flags
+from s2p_trace_curation.annotations import ensure_annotations
 from s2p_trace_curation.heatmaps import ensure_heatmaps
 from s2p_trace_curation.trace_processing import ensure_trace_processing
 
@@ -216,6 +217,7 @@ def load_curation(path: Path) -> dict[str, Any]:
     # Migrations
     if "annotations" not in doc or doc["annotations"] is None:
         doc["annotations"] = []
+    ensure_annotations(doc)  # backfills 'label' and per-interval 'ranges'
     ensure_analyses(doc)
     ensure_heatmaps(doc)
     ensure_trace_processing(doc)

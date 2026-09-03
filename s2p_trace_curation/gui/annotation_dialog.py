@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -11,17 +12,23 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from s2p_trace_curation.analyses import active_sort_run, apply_raster_sort
 from s2p_trace_curation.annotations import (
     ANNOTATION_PROPERTIES,
+    SPAN_FILL_ALPHA,
+    SPAN_PEN_ALPHA,
     annotation_kind,
     annotation_list_text,
+    annotation_ranges,
     ensure_annotations,
     get_annotation,
     is_led_shutter,
+    is_pmt_noise,
     make_annotation,
     next_ann_id,
     normalize_property_name,
     property_spec,
+    set_annotation_ranges,
     validate_annotation_frames,
 )
+from s2p_trace_curation.pmt_noise import RMS_COLUMN, read_per_frame_rms
 from s2p_trace_curation.gui.colormaps import (
     colorize_raster,
     lut_with_revert,
@@ -47,6 +54,7 @@ from s2p_trace_curation.user_settings import load_settings, save_settings
 Qt = QtCore.Qt
 QComboBox = QtWidgets.QComboBox
 QDialog = QtWidgets.QDialog
+QFileDialog = QtWidgets.QFileDialog
 QFormLayout = QtWidgets.QFormLayout
 QGroupBox = QtWidgets.QGroupBox
 QHBoxLayout = QtWidgets.QHBoxLayout
@@ -64,6 +72,11 @@ RANGE_BRUSH = (241, 196, 15, 60)
 RANGE_RASTER_BRUSH = (241, 196, 15, 45)
 RANGE_PEN = "#f1c40f"
 
+# Longest preset is "LED+Shutter"; keep the combo wide enough for the text
+# plus the drop-down arrow (File lives on the right action row).
+_KIND_COMBO_MIN_WIDTH = 220
+_LEFT_PANEL_MIN_WIDTH = 280
+
 
 class AnnotationEditorWindow(QDialog):
     def __init__(self, main: Any) -> None:
@@ -79,6 +92,7 @@ class AnnotationEditorWindow(QDialog):
         self._updating = False
         self._trace_field = TRACE_FIELD_NORM
         self._ranges: list[list[int]] = []
+        self._draft_label = ""
         self._range_items: list[pg.LinearRegionItem] = []
         self._raster_range_items: list[pg.LinearRegionItem] = []
         self._guide_spans: list[pg.LinearRegionItem] = []
@@ -89,6 +103,7 @@ class AnnotationEditorWindow(QDialog):
         outer = QSplitter(Qt.Orientation.Horizontal)
 
         left = QWidget()
+        left.setMinimumWidth(_LEFT_PANEL_MIN_WIDTH)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(QLabel("Saved annotations"))
@@ -117,6 +132,12 @@ class AnnotationEditorWindow(QDialog):
             "Pick LED+Shutter, AirPuff, or PMT-noise, or type a custom name. "
             "Selecting LED+Shutter or PMT-noise rows NaNs that span on the traces."
         )
+        self.cmb_prop.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.cmb_prop.setMinimumContentsLength(12)
+        self.cmb_prop.setMinimumWidth(_KIND_COMBO_MIN_WIDTH)
+        self.cmb_prop.currentTextChanged.connect(self._on_kind_text_changed)
         form.addRow("Kind", self.cmb_prop)
         left_layout.addLayout(form)
         self.lbl_status = QLabel("New draft — add ranges, then Save")
@@ -202,6 +223,14 @@ class AnnotationEditorWindow(QDialog):
         right_layout.addWidget(ranges_box)
 
         action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        self.btn_pmt_file = QPushButton("File\u2026")
+        self.btn_pmt_file.setEnabled(False)
+        self.btn_pmt_file.setToolTip(
+            f"PMT-noise only: load a per_frame.csv and threshold its "
+            f"'{RMS_COLUMN}' column into ranges."
+        )
+        self.btn_pmt_file.clicked.connect(self._on_pmt_file)
         self.btn_save = QPushButton("Save")
         self.btn_save.setToolTip(
             "Write every draft range as an annotation of the selected kind. "
@@ -210,8 +239,8 @@ class AnnotationEditorWindow(QDialog):
         self.btn_save.clicked.connect(self._on_save)
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.close)
+        action_row.addWidget(self.btn_pmt_file)
         action_row.addWidget(self.btn_save)
-        action_row.addStretch(1)
         action_row.addWidget(btn_close)
         right_layout.addLayout(action_row)
 
@@ -219,7 +248,8 @@ class AnnotationEditorWindow(QDialog):
             "Kind is a preset (LED+Shutter, AirPuff, PMT-noise) or a name you type. "
             "Click a saved row to load it, or New for a draft. "
             "Drag a range edge on the trace, or type Start/End and Add. "
-            "Save writes each draft range as its own annotation. "
+            "Save writes each draft range as its own annotation, except PMT-noise, "
+            "which becomes one annotation holding every interval. "
             "Select LED+Shutter or PMT-noise rows to NaN those spans on the main traces."
         )
         hint.setWordWrap(True)
@@ -371,6 +401,7 @@ class AnnotationEditorWindow(QDialog):
         elif self.cmb_prop.count():
             self.cmb_prop.setCurrentIndex(0)
         self.cmb_prop.blockSignals(False)
+        self._update_pmt_button()
 
     def _form_kind(self) -> str:
         return normalize_property_name(self.cmb_prop.currentText())
@@ -384,11 +415,112 @@ class AnnotationEditorWindow(QDialog):
             self.cmb_prop.setEditText(text)
         elif self.cmb_prop.count():
             self.cmb_prop.setCurrentIndex(0)
+        # currentTextChanged stays silent when the text is already correct.
+        self._update_pmt_button()
+
+    # ----------------------------------------------------------- PMT-noise csv
+    def _on_kind_text_changed(self, _text: str = "") -> None:
+        self._update_pmt_button()
+
+    def _update_pmt_button(self) -> None:
+        """The csv importer only makes sense for the PMT-noise kind."""
+        if not hasattr(self, "btn_pmt_file"):
+            return
+        self.btn_pmt_file.setEnabled(
+            self._doc() is not None and is_pmt_noise(self.cmb_prop.currentText())
+        )
+
+    def _pmt_start_dir(self) -> str:
+        raw = load_settings().get("last_pmt_csv_dir")
+        if raw and Path(raw).is_dir():
+            return str(raw)
+        suite2p_dir = getattr(self.main, "suite2p_dir", None)
+        if suite2p_dir is not None and Path(suite2p_dir).is_dir():
+            return str(suite2p_dir)
+        return ""
+
+    def _on_pmt_file(self) -> None:
+        doc = self._doc()
+        if doc is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select per_frame.csv",
+            self._pmt_start_dir(),
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        nframes = self._nframes()
+        try:
+            rms = read_per_frame_rms(path, nframes=nframes)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Could not read per_frame.csv", str(exc))
+            return
+        if rms.n_mapped == 0:
+            QMessageBox.warning(
+                self,
+                "No usable values",
+                f"{rms.path.name} has a '{RMS_COLUMN}' column, but none of its "
+                "rows produced a numeric value for a frame in this movie.",
+            )
+            return
+        save_settings({"last_pmt_csv_dir": str(rms.path.parent)})
+        if rms.n_rows != nframes:
+            QMessageBox.information(
+                self,
+                "Frame count differs",
+                f"{rms.path.name} has {rms.n_rows} row(s) but this movie has "
+                f"{nframes} frame(s). Values are mapped by "
+                + (
+                    f"the '{rms.frame_column}' column"
+                    if rms.frame_column
+                    else "row order"
+                )
+                + "; frames without a value are ignored.",
+            )
+
+        from s2p_trace_curation.gui.pmt_noise_dialog import PmtNoiseThresholdDialog
+
+        dlg = PmtNoiseThresholdDialog(
+            rms,
+            parent=self,
+            fs=self._fs(),
+            seconds=self._seconds_mode(),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        ranges = dlg.ranges()
+        if not ranges:
+            return
+        self._editing_id = None
+        self._loading = True
+        self.list_ann.clearSelection()
+        self._loading = False
+        self.main._set_ann_selection(set())
+        self._set_kind(PROPERTY_PMT_NOISE)
+        self._ranges = ranges
+        self._draft_label = (
+            f"{rms.path.name} {RMS_COLUMN}>{dlg.threshold():g}"
+        )
+        self._rebuild_ranges_ui()
+        self._refresh_guide_spans()
+        n_frames = sum(b - a + 1 for a, b in self._ranges)
+        self.lbl_status.setText(
+            f"{len(self._ranges)} interval(s) from {rms.path.name} "
+            f"({n_frames} frame(s), {RMS_COLUMN} > {dlg.threshold():g}) — "
+            "Save writes them as one PMT-noise annotation"
+        )
+        self.main.statusBar().showMessage(
+            f"PMT-noise: {len(self._ranges)} interval(s) above "
+            f"{RMS_COLUMN} {dlg.threshold():g}"
+        )
 
     def _set_draft_form(self) -> None:
         self._editing_id = None
         self._set_kind(ANNOTATION_PROPERTIES[0])
         self._ranges = []
+        self._draft_label = ""
         self._rebuild_ranges_ui()
         self.lbl_status.setText("New draft — pick or type a kind, add ranges, then Save")
         self._update_buttons()
@@ -428,13 +560,18 @@ class AnnotationEditorWindow(QDialog):
             return
         self._editing_id = int(ann["ann_id"])
         self._set_kind(annotation_kind(ann))
-        self._ranges = [[int(ann["start_frame"]), int(ann["end_frame"])]]
+        self._draft_label = str(ann.get("label") or "")
+        self._ranges = annotation_ranges(ann)
         self._rebuild_ranges_ui()
         self._refresh_guide_spans()
         name = annotation_kind(ann)
-        self.lbl_status.setText(
-            f"Editing {name} — drag the range to adjust, or Add more before Save"
+        n = len(self._ranges)
+        detail = (
+            "drag the range to adjust, or Add more before Save"
+            if n <= 1
+            else f"{n} intervals loaded — adjust or Add more before Save"
         )
+        self.lbl_status.setText(f"Editing {name} — {detail}")
         self._update_buttons()
 
     def _selected_saved_ids(self) -> set[int]:
@@ -455,6 +592,7 @@ class AnnotationEditorWindow(QDialog):
         self.btn_save.setEnabled(has and bool(self._ranges))
         self.btn_add_range.setEnabled(has)
         self.btn_remove_range.setEnabled(has and bool(self._ranges))
+        self._update_pmt_button()
 
     def _clear_range_items(self) -> None:
         for item in self._range_items:
@@ -646,18 +784,25 @@ class AnnotationEditorWindow(QDialog):
             if int(ann["ann_id"]) in skip:
                 continue
             prop = str(ann["property"])
+            if not self.main._ann_kind_visible(prop):
+                continue
             color = property_spec(prop).get("color", "#888888")
-            c = QtGui.QColor(color)
-            c.setAlpha(50)
-            region = pg.LinearRegionItem(
-                values=(float(ann["start_frame"]), float(ann["end_frame"]) + 1.0),
-                movable=False,
-                brush=c,
-                pen=pg.mkPen(color, width=1),
-            )
-            region.setZValue(-10)
-            self.plot_trace.addItem(region)
-            self._guide_spans.append(region)
+            fill = QtGui.QColor(color)
+            fill.setAlpha(SPAN_FILL_ALPHA)
+            edge = QtGui.QColor(color)
+            edge.setAlpha(SPAN_PEN_ALPHA)
+            for a, b in annotation_ranges(ann):
+                region = pg.LinearRegionItem(
+                    values=(float(a), float(b) + 1.0),
+                    movable=False,
+                    brush=fill,
+                    pen=pg.mkPen(edge, width=1),
+                )
+                region.setHoverBrush(fill)
+                region.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                region.setZValue(-10)
+                self.plot_trace.addItem(region)
+                self._guide_spans.append(region)
 
     def _sync_trace_combo(self) -> None:
         idx = self.cmb_trace.findData(self._trace_field)
@@ -707,8 +852,25 @@ class AnnotationEditorWindow(QDialog):
             QMessageBox.warning(self, "Kind required", str(exc))
             return
         anns = ensure_annotations(doc)
-        created: list[int] = []
         led = is_led_shutter(prop)
+        label = self._draft_label
+        # PMT noise is one feature made of many bursts, so it stays a single
+        # annotation holding every interval. Other kinds mark separate events.
+        if is_pmt_noise(prop):
+            self._save_as_one(doc, anns, prop, ranges, label, led)
+            return
+        if len(ranges) > 50:
+            reply = QMessageBox.question(
+                self,
+                "Save many annotations",
+                f"This writes {len(ranges)} separate {prop} annotations to the "
+                "pickle. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        created: list[int] = []
         first = ranges[0]
         rest = ranges[1:]
         try:
@@ -726,11 +888,11 @@ class AnnotationEditorWindow(QDialog):
             if is_led_shutter(str(ann.get("property"))):
                 led = True
             ann["property"] = prop
-            ann["start_frame"] = s
-            ann["end_frame"] = e
+            ann["label"] = label
+            set_annotation_ranges(ann, [[s, e]], nframes)
             created.append(int(ann["ann_id"]))
         else:
-            ann = make_annotation(next_ann_id(doc), prop, s, e)
+            ann = make_annotation(next_ann_id(doc), prop, s, e, label=label)
             anns.append(ann)
             created.append(int(ann["ann_id"]))
         for a, b in rest:
@@ -739,15 +901,61 @@ class AnnotationEditorWindow(QDialog):
             except ValueError as exc:
                 QMessageBox.warning(self, "Invalid frames", str(exc))
                 break
-            extra = make_annotation(next_ann_id(doc), prop, s2, e2)
+            extra = make_annotation(next_ann_id(doc), prop, s2, e2, label=label)
             anns.append(extra)
             created.append(int(extra["ann_id"]))
         self._editing_id = created[0] if created else None
+        self._after_save(led)
+        self.lbl_status.setText(f"Saved {len(created)} annotation(s) as {prop}")
+        self.main.statusBar().showMessage(f"Saved {len(created)} {prop} annotation(s)")
+
+    def _save_as_one(
+        self,
+        doc: dict[str, Any],
+        anns: list[dict[str, Any]],
+        prop: str,
+        ranges: list[list[int]],
+        label: str,
+        led: bool,
+    ) -> None:
+        """Write every draft interval into a single annotation."""
+        nframes = self._nframes()
+        if self._editing_id is not None:
+            ann = get_annotation(doc, self._editing_id)
+            if ann is None:
+                QMessageBox.warning(
+                    self, "Save", "That annotation is no longer in the pickle."
+                )
+                return
+            if is_led_shutter(str(ann.get("property"))):
+                led = True
+            ann["property"] = prop
+            ann["label"] = label
+        else:
+            ann = make_annotation(
+                next_ann_id(doc), prop, ranges[0][0], ranges[0][1], label=label
+            )
+            anns.append(ann)
+        try:
+            saved = set_annotation_ranges(ann, ranges, nframes)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid frames", str(exc))
+            return
+        self._editing_id = int(ann["ann_id"])
+        self._ranges = [list(r) for r in saved]
+        self._after_save(led)
+        frames = sum(b - a + 1 for a, b in saved)
+        msg = (
+            f"Saved 1 {prop} annotation — {len(saved)} interval(s), "
+            f"{frames} frame(s)"
+        )
+        self.lbl_status.setText(msg)
+        self.main.statusBar().showMessage(msg)
+
+    def _after_save(self, led: bool) -> None:
         self.main._annotations_changed(led_changed=led)
         self.reload_list(load_form=True)
         self._refresh_guide_spans()
-        self.lbl_status.setText(f"Saved {len(created)} annotation(s) as {prop}")
-        self.main.statusBar().showMessage(f"Saved {len(created)} {prop} annotation(s)")
 
     def _on_delete(self) -> None:
         doc = self._doc()

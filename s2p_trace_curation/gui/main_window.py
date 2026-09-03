@@ -56,6 +56,11 @@ from s2p_trace_curation.analyses import (
     set_raster_sort,
 )
 from s2p_trace_curation.annotations import (
+    ANNOTATION_PROPERTIES,
+    SPAN_FILL_ALPHA,
+    SPAN_PEN_ALPHA,
+    annotation_kind,
+    annotation_ranges,
     apply_nan_mask,
     ensure_annotations,
     nan_mask_from_annotations,
@@ -452,6 +457,8 @@ class MainWindow(QMainWindow):
         self._w3_side = 1
 
         self._ann_selected_ids: set[int] = set()
+        self._ann_hidden_kinds: set[str] = set()
+        self._ann_display_checks: dict[str, QCheckBox] = {}
         self._scale_panel_open = False
         self._ann_span_items: list[pg.LinearRegionItem] = []
         self._trace_x_user_zoomed = False
@@ -605,7 +612,6 @@ class MainWindow(QMainWindow):
         inspect_layout.setContentsMargins(0, 0, 0, 0)
         inspect_layout.setSpacing(6)
 
-        # Traces
         self.trace_widget = pg.GraphicsLayoutWidget()
         inspect_layout.addWidget(self.trace_widget, stretch=2)
         self.plot_f = self.trace_widget.addPlot(row=0, col=0, title="F / x·Fneu")
@@ -894,8 +900,17 @@ class MainWindow(QMainWindow):
         roi_form.addRow("ROI #", roi_nav)
         roi_form.addRow("Mode", mode_row)
         roi_form.addRow(self.chk_iscell)
+        self.cmb_trace_units = QComboBox()
+        fill_x_units_combo(self.cmb_trace_units, None)  # fs not known yet
+        self.cmb_trace_units.setToolTip(
+            "X-axis units for the three trace plots. "
+            "Seconds requires a frame rate (fs) from ops.npy; data stay in frames."
+        )
+        self.cmb_trace_units.currentIndexChanged.connect(self._on_trace_units_changed)
+
         roi_form.addRow("x (F−x·Fneu)", self.spin_x)
         roi_form.addRow("Fneu offset", self.spin_fneu_offset)
+        roi_form.addRow("Trace X units", self.cmb_trace_units)
         layout.addWidget(roi)
 
         raster = QGroupBox("Raster Tools")
@@ -1168,6 +1183,24 @@ class MainWindow(QMainWindow):
         )
         self.btn_ann_tools.clicked.connect(self._open_annotation_editor)
         ann_outer.addWidget(self.btn_ann_tools)
+
+        self.ann_display_panel = QWidget()
+        ann_display_layout = QVBoxLayout(self.ann_display_panel)
+        ann_display_layout.setContentsMargins(0, 4, 0, 0)
+        ann_display_layout.setSpacing(2)
+        show_lbl = QLabel("Show on traces")
+        show_lbl.setToolTip(
+            "Which annotation kinds to draw on the inspect traces and the "
+            "raster trace (single and batch). Uncheck to hide that kind."
+        )
+        ann_display_layout.addWidget(show_lbl)
+        self.ann_display_checks_host = QWidget()
+        self.ann_display_checks_layout = QVBoxLayout(self.ann_display_checks_host)
+        self.ann_display_checks_layout.setContentsMargins(0, 0, 0, 0)
+        self.ann_display_checks_layout.setSpacing(1)
+        ann_display_layout.addWidget(self.ann_display_checks_host)
+        self.ann_display_panel.setEnabled(False)
+        ann_outer.addWidget(self.ann_display_panel)
         layout.addWidget(ann)
 
         # Scaling tools (fold-out, same pattern as Annotation tools)
@@ -1322,9 +1355,21 @@ class MainWindow(QMainWindow):
                 self._fs(),
                 s.get("heatmap_x_units") or UNITS_FRAMES,
             )
+            fill_x_units_combo(
+                self.cmb_trace_units,
+                self._fs(),
+                s.get("trace_x_units") or UNITS_FRAMES,
+            )
+            hidden = s.get("ann_hidden_kinds") or []
+            if isinstance(hidden, list):
+                self._ann_hidden_kinds = {str(k) for k in hidden}
+            else:
+                self._ann_hidden_kinds = set()
         finally:
             self._updating = False
+        self._rebuild_ann_display_toggles()
         self._apply_raster_x_units()
+        self._apply_trace_x_units()
 
     def _persist_ui_settings(self, *, suite2p_dir: Path | None = None) -> None:
         updates: dict[str, Any] = {
@@ -1402,6 +1447,7 @@ class MainWindow(QMainWindow):
         self.btn_modify.setEnabled(True)
         self.btn_add_mask.setEnabled(True)
         self.btn_ann_tools.setEnabled(True)
+        self.ann_display_panel.setEnabled(True)
         self.btn_scale_tools.setEnabled(True)
         self.btn_trace_proc.setEnabled(True)
         self.btn_save.setEnabled(True)
@@ -1427,6 +1473,8 @@ class MainWindow(QMainWindow):
         self._update_rebuild_button()
         self._set_raster_controls_enabled(True)
         self._sync_raster_units_combo()
+        self._sync_trace_units_combo()
+        self._rebuild_ann_display_toggles()
         if self._analysis_window is not None:
             self._analysis_window.refresh_from_doc()
         if self._trace_proc_window is not None:
@@ -2255,6 +2303,47 @@ class MainWindow(QMainWindow):
         save_settings({"heatmap_x_units": combo_x_units(self.cmb_raster_units)})
         self._apply_raster_x_units()
 
+    # ------------------------------------------------------ trace X units
+    def _trace_seconds_mode(self) -> bool:
+        if not hasattr(self, "cmb_trace_units"):
+            return False
+        return combo_x_units(self.cmb_trace_units) == UNITS_SECONDS and self._fs() is not None
+
+    def _apply_trace_x_units(self) -> None:
+        """Rescale trace tick labels only; viewRange data stays in frames."""
+        fs = self._fs()
+        seconds = self._trace_seconds_mode()
+        scale = 1.0 / fs if (seconds and fs) else 1.0
+        label = "time (s)" if seconds else "frame"
+        # Apply to every plot that currently shows a bottom axis (only one at a time).
+        for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
+            ax = plot.getAxis("bottom")
+            ax.setScale(scale)
+            if ax.isVisible():
+                plot.setLabel("bottom", label)
+
+    def _sync_trace_units_combo(self) -> None:
+        selected = combo_x_units(self.cmb_trace_units)
+        if selected == UNITS_SECONDS and self._fs() is None:
+            selected = UNITS_FRAMES
+        fill_x_units_combo(self.cmb_trace_units, self._fs(), selected)
+        self._apply_trace_x_units()
+
+    def _on_trace_units_changed(self) -> None:
+        if self._updating:
+            return
+        if combo_x_units(self.cmb_trace_units) == UNITS_SECONDS and self._fs() is None:
+            QMessageBox.information(
+                self,
+                "Seconds unavailable",
+                "This pickle has no frame rate (meta 'fs' from ops.npy), so the "
+                "x-axes stay in frames.",
+            )
+            self._sync_trace_units_combo()
+            return
+        save_settings({"trace_x_units": combo_x_units(self.cmb_trace_units)})
+        self._apply_trace_x_units()
+
     def _refresh_analysis_stale_ui(self) -> None:
         if self.doc is None:
             return
@@ -2377,6 +2466,63 @@ class MainWindow(QMainWindow):
         self._annotation_window.show()
         self._annotation_window.raise_()
         self._annotation_window.activateWindow()
+
+    def _ann_display_kinds(self) -> list[str]:
+        """Preset kinds plus any custom names already in the pickle."""
+        kinds = list(ANNOTATION_PROPERTIES)
+        seen = set(kinds)
+        if self.doc is not None:
+            extras = sorted(
+                {
+                    annotation_kind(ann)
+                    for ann in ensure_annotations(self.doc)
+                    if annotation_kind(ann) not in seen
+                }
+            )
+            kinds.extend(extras)
+        return kinds
+
+    def _ann_kind_visible(self, kind: str) -> bool:
+        return str(kind) not in self._ann_hidden_kinds
+
+    def _rebuild_ann_display_toggles(self) -> None:
+        """Checkboxes for each annotation kind; hidden kinds stay unchecked."""
+        if not hasattr(self, "ann_display_checks_layout"):
+            return
+        layout = self.ann_display_checks_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._ann_display_checks = {}
+        for kind in self._ann_display_kinds():
+            chk = QCheckBox(kind)
+            color = property_spec(kind).get("color", "#888888")
+            chk.setStyleSheet(f"QCheckBox {{ color: {color}; }}")
+            chk.setChecked(self._ann_kind_visible(kind))
+            chk.setToolTip(f"Draw {kind} spans on inspect and raster traces")
+            chk.toggled.connect(lambda on, k=kind: self._on_ann_display_toggled(k, on))
+            layout.addWidget(chk)
+            self._ann_display_checks[kind] = chk
+        has_doc = self.doc is not None
+        self.ann_display_panel.setEnabled(has_doc)
+        for chk in self._ann_display_checks.values():
+            chk.setEnabled(has_doc)
+
+    def _on_ann_display_toggled(self, kind: str, visible: bool) -> None:
+        if self._updating:
+            return
+        if visible:
+            self._ann_hidden_kinds.discard(str(kind))
+        else:
+            self._ann_hidden_kinds.add(str(kind))
+        save_settings({"ann_hidden_kinds": sorted(self._ann_hidden_kinds)})
+        self._refresh_ann_spans()
+        if self._heatmap_window is not None:
+            self._heatmap_window._refresh_ann_spans()
+        if self._annotation_window is not None:
+            self._annotation_window._refresh_guide_spans()
 
     def _heatmaps_changed(self) -> None:
         if self.doc is None:
@@ -2691,6 +2837,7 @@ class MainWindow(QMainWindow):
         self._updating = False
         self._refresh_raster_trace(rows, matrix, reset_view=do_range)
         self._apply_raster_x_units()
+        self._refresh_ann_spans()
 
     def _refresh_raster_trace(
         self,
@@ -3268,13 +3415,15 @@ class MainWindow(QMainWindow):
         setLabel on extra X-linked plots makes pyqtgraph stretch those axes
         over the ViewBox, which paints permanent horizontal lines on the data.
         """
+        label = "time (s)" if self._trace_seconds_mode() else "frame"
         for key in _TRACE_ROWS:
             plot = self._trace_plot(key)
             if key == bottom_key:
                 plot.showAxis("bottom", True)
-                plot.setLabel("bottom", "frame")
+                plot.setLabel("bottom", label)
             else:
                 plot.hideAxis("bottom")
+        self._apply_trace_x_units()
 
     def _install_scale_nudges(self) -> None:
         self._scale_nudges = {}
@@ -3419,6 +3568,7 @@ class MainWindow(QMainWindow):
 
     def _annotations_changed(self, *, led_changed: bool = False) -> None:
         self.dirty = True
+        self._rebuild_ann_display_toggles()
         self._refresh_ann_spans()
         self._refresh_traces(autoscale=False)
         if led_changed:
@@ -3451,11 +3601,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Trace scales reset to autoscale")
 
     def _clear_ann_spans(self) -> None:
+        plots = (
+            self.plot_f,
+            self.plot_comp,
+            self.plot_bleach,
+            self.plot_raster_trace,
+        )
         for item in self._ann_span_items:
             try:
                 item.scene().removeItem(item)  # type: ignore[union-attr]
             except Exception:
-                for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
+                for plot in plots:
                     try:
                         plot.removeItem(item)
                     except Exception:
@@ -3466,25 +3622,36 @@ class MainWindow(QMainWindow):
         self._clear_ann_spans()
         if self.doc is None:
             return
-        selected = self._selected_ann_ids()
+        plots = (
+            self.plot_f,
+            self.plot_comp,
+            self.plot_bleach,
+            self.plot_raster_trace,
+        )
         for ann in ensure_annotations(self.doc):
             prop = str(ann["property"])
+            if not self._ann_kind_visible(prop):
+                continue
             color = property_spec(prop).get("color", "#888888")
-            s = float(ann["start_frame"])
-            e = float(ann["end_frame"]) + 1.0  # through inclusive end
-            alpha = 90 if int(ann["ann_id"]) in selected else 45
-            c = QtGui.QColor(color)
-            c.setAlpha(alpha)
-            for plot in (self.plot_f, self.plot_comp, self.plot_bleach):
-                region = pg.LinearRegionItem(
-                    values=(s, e),
-                    movable=False,
-                    brush=c,
-                    pen=pg.mkPen(color, width=1),
-                )
-                region.setZValue(-10)
-                plot.addItem(region)
-                self._ann_span_items.append(region)
+            fill = QtGui.QColor(color)
+            fill.setAlpha(SPAN_FILL_ALPHA)
+            edge = QtGui.QColor(color)
+            edge.setAlpha(SPAN_PEN_ALPHA)
+            for a, b in annotation_ranges(ann):
+                s = float(a)
+                e = float(b) + 1.0  # through inclusive end
+                for plot in plots:
+                    region = pg.LinearRegionItem(
+                        values=(s, e),
+                        movable=False,
+                        brush=fill,
+                        pen=pg.mkPen(edge, width=1),
+                    )
+                    region.setHoverBrush(fill)
+                    region.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    region.setZValue(-10)
+                    plot.addItem(region)
+                    self._ann_span_items.append(region)
 
     # -------------------------------------------------------------- cursors
     def _sync_cursor_clones(self) -> None:

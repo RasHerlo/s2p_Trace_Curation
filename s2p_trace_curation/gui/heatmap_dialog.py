@@ -9,7 +9,13 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from s2p_trace_curation.analyses import active_sort_run, apply_raster_sort
-from s2p_trace_curation.annotations import ensure_annotations, property_spec
+from s2p_trace_curation.annotations import (
+    SPAN_FILL_ALPHA,
+    SPAN_PEN_ALPHA,
+    annotation_ranges,
+    ensure_annotations,
+    property_spec,
+)
 from s2p_trace_curation.gui.colormaps import (
     LUT_NAMES,
     colorize_raster,
@@ -689,18 +695,25 @@ class HeatmapEditorWindow(QDialog):
             return
         for ann in ensure_annotations(doc):
             prop = str(ann["property"])
+            if not self.main._ann_kind_visible(prop):
+                continue
             color = property_spec(prop).get("color", "#888888")
-            c = QtGui.QColor(color)
-            c.setAlpha(50)
-            region = pg.LinearRegionItem(
-                values=(float(ann["start_frame"]), float(ann["end_frame"]) + 1.0),
-                movable=False,
-                brush=c,
-                pen=pg.mkPen(color, width=1),
-            )
-            region.setZValue(-10)
-            self.plot_trace.addItem(region)
-            self._ann_spans.append(region)
+            fill = QtGui.QColor(color)
+            fill.setAlpha(SPAN_FILL_ALPHA)
+            edge = QtGui.QColor(color)
+            edge.setAlpha(SPAN_PEN_ALPHA)
+            for a, b in annotation_ranges(ann):
+                region = pg.LinearRegionItem(
+                    values=(float(a), float(b) + 1.0),
+                    movable=False,
+                    brush=fill,
+                    pen=pg.mkPen(edge, width=1),
+                )
+                region.setHoverBrush(fill)
+                region.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                region.setZValue(-10)
+                self.plot_trace.addItem(region)
+                self._ann_spans.append(region)
 
     def _on_batch_slider(self, value: int) -> None:
         self._batch = int(value) == 1

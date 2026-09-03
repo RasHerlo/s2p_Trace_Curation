@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from s2p_trace_curation.annotations import (
+    annotation_ranges,
     ensure_annotations,
     nan_mask_from_annotations,
 )
@@ -50,9 +51,10 @@ def compute_tc_norm(trace_comp: np.ndarray, nan_mask: np.ndarray) -> np.ndarray:
 def tc_norm_sig(doc: dict[str, Any]) -> dict[str, Any]:
     """Fingerprint of inputs used to build tc_norm (LED spans + trace_comp sums)."""
     led = sorted(
-        [int(a["start_frame"]), int(a["end_frame"])]
+        r
         for a in ensure_annotations(doc)
         if str(a["property"]) == "LED+Shutter"
+        for r in annotation_ranges(a)
     )
     ids: list[int] = []
     sums: list[float] = []
