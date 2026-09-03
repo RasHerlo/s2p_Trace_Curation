@@ -42,6 +42,11 @@ from s2p_trace_curation.hac import (
     LINKAGE_WARD,
     METRIC_EUCLIDEAN,
     METRIC_RUZICKA,
+    HAC_CLUSTER_COLORS,
+    apply_distance_cut,
+    cluster_leaf_spans,
+    default_cut_threshold,
+    max_linkage_distance,
     normalize_hac_params,
     run_hac,
 )
@@ -49,6 +54,7 @@ from s2p_trace_curation.hac import (
 Qt = QtCore.Qt
 QComboBox = QtWidgets.QComboBox
 QDialog = QtWidgets.QDialog
+QDoubleSpinBox = QtWidgets.QDoubleSpinBox
 QFormLayout = QtWidgets.QFormLayout
 QGroupBox = QtWidgets.QGroupBox
 QHBoxLayout = QtWidgets.QHBoxLayout
@@ -64,6 +70,8 @@ QVBoxLayout = QtWidgets.QVBoxLayout
 QStackedWidget = QtWidgets.QStackedWidget
 QWidget = QtWidgets.QWidget
 
+HAC_CUT_PEN = "#f0e68c"
+
 
 class AnalysisToolsWindow(QDialog):
     def __init__(self, main: Any) -> None:
@@ -75,6 +83,11 @@ class AnalysisToolsWindow(QDialog):
         self._editing_id: str | None = None
         self._preview: dict[str, Any] | None = None
         self._loading = False
+        self._hac_cut_initialized = False
+        self._hac_cut_updating = False
+        self._hac_pending_cut: float | None = None
+        self._hac_tree_items: list[Any] = []
+        self._hac_cluster_items: list[Any] = []
 
         layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -163,6 +176,19 @@ class AnalysisToolsWindow(QDialog):
         )
         hac_form.addRow("Metric", self.cmb_hac_metric)
         hac_form.addRow("Linkage", self.cmb_hac_linkage)
+        self.spin_hac_cut = QDoubleSpinBox()
+        self.spin_hac_cut.setDecimals(4)
+        self.spin_hac_cut.setRange(0.0, 1.0)
+        self.spin_hac_cut.setSingleStep(0.01)
+        self.spin_hac_cut.setKeyboardTracking(False)
+        self.spin_hac_cut.setEnabled(False)
+        self.spin_hac_cut.setToolTip(
+            "Distance cut on the dendrogram (dotted vertical line). "
+            "Drag the line or type a value; clusters update immediately."
+        )
+        self.lbl_hac_clusters = QLabel("—")
+        hac_form.addRow("Cut distance", self.spin_hac_cut)
+        hac_form.addRow("Clusters", self.lbl_hac_clusters)
         hac_layout.addLayout(hac_form)
 
         viz_split = QSplitter(Qt.Orientation.Horizontal)
@@ -172,6 +198,16 @@ class AnalysisToolsWindow(QDialog):
         self.plot_hac_tree.setLabel("bottom", "distance")
         self.plot_hac_tree.setLabel("left", "leaf")
         self.plot_hac_tree.showGrid(x=True, y=False, alpha=0.2)
+        self.hac_cut_line = pg.InfiniteLine(
+            pos=0.0,
+            angle=90,
+            movable=True,
+            pen=pg.mkPen(HAC_CUT_PEN, width=2, style=Qt.PenStyle.DotLine),
+            hoverPen=pg.mkPen("#fff8b0", width=2.5, style=Qt.PenStyle.DotLine),
+        )
+        self.hac_cut_line.setZValue(20)
+        self.hac_cut_line.setVisible(False)
+        self.plot_hac_tree.addItem(self.hac_cut_line)
         viz_split.addWidget(self.plot_hac_tree)
 
         self.plot_hac_mat = pg.PlotWidget(title="Pairwise (leaf order)")
@@ -192,6 +228,8 @@ class AnalysisToolsWindow(QDialog):
         self.cmb_hac_linkage.currentIndexChanged.connect(self._on_hac_linkage_changed)
         self.cmb_kind.currentIndexChanged.connect(self._on_kind_changed)
         self.cmb_trace_field.currentIndexChanged.connect(self._on_trace_field_changed)
+        self.spin_hac_cut.valueChanged.connect(self._on_hac_cut_spin)
+        self.hac_cut_line.sigPositionChanged.connect(self._on_hac_cut_line)
 
         self.lbl_preview = QLabel("No preview yet.")
         self.lbl_preview.setWordWrap(True)
@@ -282,6 +320,8 @@ class AnalysisToolsWindow(QDialog):
         if idx >= 0:
             self.cmb_kind.setCurrentIndex(idx)
         self._apply_hac_params(DEFAULT_HAC_PARAMS)
+        self._hac_cut_initialized = False
+        self._hac_pending_cut = None
         idx_f = self.cmb_trace_field.findData(TRACE_FIELD_SM_BC)
         if idx_f >= 0:
             self.cmb_trace_field.setCurrentIndex(idx_f)
@@ -371,8 +411,10 @@ class AnalysisToolsWindow(QDialog):
             return
         self._preview = result
         stale = " (stale — Rebuild to update the saved order)" if run.get("stale") else ""
+        n_cl = len(result.get("clusters") or [])
+        extra = f" — {n_cl} cluster(s)" if kind == KIND_HAC else ""
         self.lbl_preview.setText(
-            f"Showing {kind_label(kind)} for {len(result['order'])} ROI(s){stale}."
+            f"Showing {kind_label(kind)} for {len(result['order'])} ROI(s){extra}{stale}."
         )
 
     def _form_kind(self) -> str:
@@ -383,21 +425,26 @@ class AnalysisToolsWindow(QDialog):
         field = str(self.cmb_trace_field.currentData() or TRACE_FIELD_SM_BC)
         if self._form_kind() != KIND_HAC:
             return {"trace_field": field}
-        return {
+        params: dict[str, Any] = {
             "metric": str(self.cmb_hac_metric.currentData() or METRIC_RUZICKA),
             "linkage": str(self.cmb_hac_linkage.currentData() or LINKAGE_AVERAGE),
             "trace_field": field,
         }
+        if self._hac_cut_initialized:
+            params["cut_threshold"] = float(self.spin_hac_cut.value())
+        return params
 
     def _on_trace_field_changed(self) -> None:
         if self._loading:
             return
         self._preview = None
+        self._hac_cut_initialized = False
 
     def _on_kind_changed(self) -> None:
         if self._loading:
             return
         self._preview = None
+        self._hac_cut_initialized = False
         self._sync_kind_page()
         if self._form_kind() == KIND_HAC:
             self._apply_hac_linkage_constraint()
@@ -423,6 +470,12 @@ class AnalysisToolsWindow(QDialog):
         fi = self.cmb_trace_field.findData(field)
         if fi >= 0:
             self.cmb_trace_field.setCurrentIndex(fi)
+        if "cut_threshold" in norm:
+            self._hac_cut_initialized = True
+            self._hac_pending_cut = float(norm["cut_threshold"])
+        else:
+            self._hac_cut_initialized = False
+            self._hac_pending_cut = None
         self._loading = was
         self._apply_hac_linkage_constraint()
 
@@ -450,12 +503,14 @@ class AnalysisToolsWindow(QDialog):
         if self._loading:
             return
         self._preview = None
+        self._hac_cut_initialized = False
         self._apply_hac_linkage_constraint()
 
     def _on_hac_linkage_changed(self) -> None:
         if self._loading:
             return
         self._preview = None
+        self._hac_cut_initialized = False
         if str(self.cmb_hac_linkage.currentData()) == LINKAGE_WARD:
             eu_idx = self.cmb_hac_metric.findData(METRIC_EUCLIDEAN)
             if eu_idx >= 0 and str(self.cmb_hac_metric.currentData()) != METRIC_EUCLIDEAN:
@@ -465,7 +520,11 @@ class AnalysisToolsWindow(QDialog):
                 self._apply_hac_linkage_constraint()
 
     def _clear_hac_plots(self) -> None:
-        self.plot_hac_tree.clear()
+        self._clear_hac_tree_branches()
+        self._clear_hac_cluster_outlines()
+        self.hac_cut_line.setVisible(False)
+        self.spin_hac_cut.setEnabled(False)
+        self.lbl_hac_clusters.setText("—")
         self.hac_img.setImage(
             np.zeros((1, 1), dtype=np.float64),
             autoLevels=False,
@@ -474,7 +533,88 @@ class AnalysisToolsWindow(QDialog):
         self.plot_hac_mat.setTitle("Pairwise (leaf order)")
         self.plot_hac_tree.setTitle("Dendrogram")
 
+    def _clear_hac_tree_branches(self) -> None:
+        for item in self._hac_tree_items:
+            self.plot_hac_tree.removeItem(item)
+        self._hac_tree_items.clear()
+
+    def _clear_hac_cluster_outlines(self) -> None:
+        for item in self._hac_cluster_items:
+            self.plot_hac_mat.removeItem(item)
+        self._hac_cluster_items.clear()
+
+    @staticmethod
+    def _hac_cut_decimals(span: float) -> int:
+        if span <= 0 or not np.isfinite(span):
+            return 4
+        return int(min(max(4, 3 - int(np.floor(np.log10(span)))), 9))
+
+    def _set_hac_cut_value(self, value: float) -> None:
+        self._hac_cut_updating = True
+        try:
+            self.spin_hac_cut.setValue(float(value))
+            self.hac_cut_line.setPos(float(value))
+        finally:
+            self._hac_cut_updating = False
+
+    def _on_hac_cut_spin(self, value: float) -> None:
+        if self._loading or self._hac_cut_updating:
+            return
+        self._hac_cut_updating = True
+        try:
+            self.hac_cut_line.setPos(float(value))
+        finally:
+            self._hac_cut_updating = False
+        self._hac_cut_initialized = True
+        self._apply_hac_cut(float(value), mark_unsaved=True)
+
+    def _on_hac_cut_line(self) -> None:
+        if self._loading or self._hac_cut_updating:
+            return
+        value = float(self.hac_cut_line.value())
+        self._hac_cut_updating = True
+        try:
+            self.spin_hac_cut.setValue(value)
+        finally:
+            self._hac_cut_updating = False
+        self._hac_cut_initialized = True
+        self._apply_hac_cut(value, mark_unsaved=True)
+
+    def _apply_hac_cut(self, threshold: float, *, mark_unsaved: bool = False) -> None:
+        result = self._preview
+        if result is None or result.get("Z") is None:
+            return
+        clusters = apply_distance_cut(result, float(threshold))
+        self._draw_hac_cluster_outlines(clusters)
+        self.lbl_hac_clusters.setText(str(len(clusters)))
+        if mark_unsaved:
+            n = len(result.get("order") or [])
+            n_cl = len(clusters)
+            self.lbl_preview.setText(
+                f"Preview: {n} selected ROI(s) — {kind_label(KIND_HAC)} — "
+                f"{n_cl} cluster(s). Save to keep."
+            )
+            self.lbl_status.setText("Preview ready (unsaved)")
+
+    def _draw_hac_cluster_outlines(self, clusters: list[list[int]]) -> None:
+        self._clear_hac_cluster_outlines()
+        for i, (start, end) in enumerate(cluster_leaf_spans(clusters)):
+            color = HAC_CLUSTER_COLORS[i % len(HAC_CLUSTER_COLORS)]
+            x0 = float(start) - 0.5
+            x1 = float(end) + 0.5
+            pen = pg.mkPen(color, width=2)
+            pen.setCosmetic(True)
+            item = pg.PlotCurveItem(
+                x=[x0, x1, x1, x0, x0],
+                y=[x0, x0, x1, x1, x0],
+                pen=pen,
+            )
+            item.setZValue(10)
+            self.plot_hac_mat.addItem(item)
+            self._hac_cluster_items.append(item)
+
     def _render_hac(self, result: dict[str, Any]) -> None:
+        self._preview = result
         Z = result.get("Z")
         matrix = result.get("matrix")
         if Z is None or matrix is None:
@@ -510,7 +650,7 @@ class AnalysisToolsWindow(QDialog):
         self.plot_hac_mat.setXRange(-0.5, n - 0.5, padding=0)
         self.plot_hac_mat.setYRange(-0.5, n - 0.5, padding=0)
 
-        self.plot_hac_tree.clear()
+        self._clear_hac_tree_branches()
         tree = dendrogram(Z, no_plot=True)
         pen = pg.mkPen("#dddddd", width=1)
         ymax = 0.0
@@ -518,10 +658,39 @@ class AnalysisToolsWindow(QDialog):
             y = (np.asarray(ys, dtype=np.float64) - 5.0) / 10.0
             x = np.asarray(xs, dtype=np.float64)
             ymax = max(ymax, float(np.max(x)))
-            self.plot_hac_tree.plot(x, y, pen=pen, connect="all")
+            curve = self.plot_hac_tree.plot(x, y, pen=pen, connect="all")
+            self._hac_tree_items.append(curve)
+        ymax = max(ymax, max_linkage_distance(Z), 1e-6)
         self.plot_hac_tree.setYRange(-0.5, n - 0.5, padding=0)
-        self.plot_hac_tree.setXRange(0.0, max(ymax * 1.05, 1e-6), padding=0.02)
+        self.plot_hac_tree.setXRange(0.0, ymax * 1.05, padding=0.02)
 
+        span = ymax
+        decimals = self._hac_cut_decimals(span)
+        self._hac_cut_updating = True
+        try:
+            self.spin_hac_cut.setDecimals(decimals)
+            self.spin_hac_cut.setRange(0.0, ymax)
+            step = span / 200.0 if span else 0.01
+            self.spin_hac_cut.setSingleStep(max(step, 10.0 ** (-decimals)))
+            self.hac_cut_line.setBounds((0.0, ymax))
+        finally:
+            self._hac_cut_updating = False
+
+        if self._hac_pending_cut is not None:
+            threshold = float(self._hac_pending_cut)
+            self._hac_pending_cut = None
+        elif self._hac_cut_initialized:
+            threshold = float(self.spin_hac_cut.value())
+        elif params.get("cut_threshold") is not None:
+            threshold = float(params["cut_threshold"])
+        else:
+            threshold = default_cut_threshold(Z)
+        threshold = float(np.clip(threshold, 0.0, ymax))
+        self._hac_cut_initialized = True
+        self.spin_hac_cut.setEnabled(True)
+        self.hac_cut_line.setVisible(True)
+        self._set_hac_cut_value(threshold)
+        self._apply_hac_cut(threshold, mark_unsaved=False)
 
     def _form_label(self) -> str:
         return self.edit_label.text().strip() or "Untitled"
@@ -552,8 +721,11 @@ class AnalysisToolsWindow(QDialog):
             QMessageBox.warning(self, "Run failed", str(exc))
             return
         self._preview = result
+        n_cl = len(result.get("clusters") or [])
+        extra = f" — {n_cl} cluster(s)" if kind == KIND_HAC else ""
         self.lbl_preview.setText(
-            f"Preview: {len(result['order'])} selected ROI(s) — {kind_label(kind)}. Save to keep."
+            f"Preview: {len(result['order'])} selected ROI(s) — {kind_label(kind)}"
+            f"{extra}. Save to keep."
         )
         self.lbl_status.setText("Preview ready (unsaved)")
 
@@ -612,6 +784,7 @@ class AnalysisToolsWindow(QDialog):
                 params=result["params"],
                 roi_ids=result["roi_ids"],
                 order=result["order"],
+                clusters=result.get("clusters") or [],
             )
             ensure_analyses(doc).append(run)
             self._editing_id = str(run["id"])
@@ -628,6 +801,7 @@ class AnalysisToolsWindow(QDialog):
                 params=result["params"],
                 roi_ids=result["roi_ids"],
                 order=result["order"],
+                clusters=result.get("clusters") or [],
             )
         self.main._analysis_runs_changed()
         self.refresh_from_doc()
@@ -656,6 +830,7 @@ class AnalysisToolsWindow(QDialog):
             params=result["params"],
             roi_ids=result["roi_ids"],
             order=result["order"],
+            clusters=result.get("clusters") or [],
             analysis_id=next_analysis_id(doc),
         )
         ensure_analyses(doc).append(run)
@@ -685,6 +860,8 @@ class AnalysisToolsWindow(QDialog):
             doc,
             roi_ids=result["roi_ids"],
             order=result["order"],
+            params=result.get("params"),
+            clusters=result.get("clusters") or [],
         )
         self._preview = result
         idx = self.cmb_kind.findData(kind)

@@ -47,14 +47,18 @@ from copy import deepcopy
 
 from s2p_trace_curation.analyses import (
     PICKLE_SORT_ID,
+    active_hac_clusters,
     active_sort_run,
     apply_raster_sort,
+    cluster_row_spans,
     dropdown_label,
     ensure_analyses,
     raster_sort_id,
     refresh_stale_flags,
+    roi_cluster_index,
     set_raster_sort,
 )
+from s2p_trace_curation.hac import hac_cluster_hex, hac_cluster_rgb
 from s2p_trace_curation.annotations import (
     ANNOTATION_PROPERTIES,
     SPAN_FILL_ALPHA,
@@ -67,6 +71,19 @@ from s2p_trace_curation.annotations import (
     property_spec,
 )
 from s2p_trace_curation.batch_select import mean_traces_for_rois, rois_in_lasso
+from s2p_trace_curation.bg_rois import (
+    BG_FIELD_SM,
+    BG_FIELD_SM_BC,
+    BG_ROI_RGB,
+    append_bg_roi,
+    apply_processed_to_bg,
+    bg_roi_from_draft,
+    build_bg_overlay,
+    empty_bg_paint_draft,
+    ensure_bg_rois,
+    next_bg_id,
+    reextract_bg_draft,
+)
 from s2p_trace_curation.curation import (
     append_roi,
     compensation_fneu_offset,
@@ -441,7 +458,7 @@ class MainWindow(QMainWindow):
         self._annotation_window: AnnotationEditorWindow | None = None
 
         self._mask_edit_active = False
-        self._mask_edit_kind: str | None = None  # "modify" | "add"
+        self._mask_edit_kind: str | None = None  # "modify" | "add" | "add_bg"
         self._add_mask_draft: dict[str, Any] | None = None
         self._add_mask_center: tuple[float, float] | None = None
         self._add_mask_side = 64
@@ -839,6 +856,24 @@ class MainWindow(QMainWindow):
         fov_form.addRow("Lower", self.spin_fov_lo)
         fov_form.addRow("Upper", self.spin_fov_hi)
         fov_form.addRow("Show ROIs", self.cmb_overlay)
+        self.chk_show_bg_rois = QCheckBox("Show BG-ROIs")
+        self.chk_show_bg_rois.setChecked(False)
+        self.chk_show_bg_rois.setEnabled(False)
+        self.chk_show_bg_rois.setToolTip(
+            "Overlay background measurement ROIs on W1. Off by default."
+        )
+        self.chk_show_clusters = QCheckBox("Show Clusters")
+        self.chk_show_clusters.setChecked(False)
+        self.chk_show_clusters.setEnabled(False)
+        self.chk_show_clusters.setToolTip(
+            "Color W1 ROI fills by the HAC cluster of the current Raster Sort run. "
+            "Transparency matches the usual masks. Needs an HAC sort with a distance cut."
+        )
+        fov_show_row = QHBoxLayout()
+        fov_show_row.addWidget(self.chk_show_bg_rois)
+        fov_show_row.addWidget(self.chk_show_clusters)
+        fov_show_row.addStretch(1)
+        fov_form.addRow(fov_show_row)
         layout.addWidget(fov)
 
         mov = QGroupBox("Movie (W2)")
@@ -962,6 +997,12 @@ class MainWindow(QMainWindow):
         self.chk_raster_revert = QCheckBox("Revert LUT")
         self.chk_raster_revert.setEnabled(False)
         self.chk_raster_revert.setToolTip("Flip the 0↔1 mapping of the current LUT")
+        self.chk_raster_clusters = QCheckBox("Add clusters")
+        self.chk_raster_clusters.setEnabled(False)
+        self.chk_raster_clusters.setToolTip(
+            "Outline raster rows that share an HAC cluster in the current Sort run "
+            "(same colours as the Analysis Tools similarity matrix)."
+        )
 
         raster_mode_row = QHBoxLayout()
         raster_mode_row.addWidget(QLabel("Single"))
@@ -1018,7 +1059,11 @@ class MainWindow(QMainWindow):
         raster_form.addRow("Sort", self.cmb_raster_sort)
         raster_form.addRow("Trace", self.cmb_raster_trace)
         raster_form.addRow("LUT", self.cmb_raster_lut)
-        raster_form.addRow(self.chk_raster_revert)
+        raster_lut_row = QHBoxLayout()
+        raster_lut_row.addWidget(self.chk_raster_revert)
+        raster_lut_row.addWidget(self.chk_raster_clusters)
+        raster_lut_row.addStretch(1)
+        raster_form.addRow(raster_lut_row)
         raster_form.addRow("Mode", raster_mode_row)
         raster_form.addRow("X units", self.cmb_raster_units)
         raster_form.addRow(self.btn_rebuild_tc_norm)
@@ -1047,6 +1092,7 @@ class MainWindow(QMainWindow):
         self.cmb_raster_show.currentIndexChanged.connect(self._on_overlay_combo)
         self.cmb_raster_lut.currentIndexChanged.connect(self._on_raster_display_changed)
         self.chk_raster_revert.toggled.connect(self._on_raster_display_changed)
+        self.chk_raster_clusters.toggled.connect(self._on_raster_clusters_toggled)
         self.slider_raster_batch.valueChanged.connect(self._on_raster_batch_slider)
         self.cmb_raster_sort.currentIndexChanged.connect(self._on_raster_sort_changed)
         self.cmb_raster_trace.currentIndexChanged.connect(self._on_raster_trace_changed)
@@ -1094,6 +1140,15 @@ class MainWindow(QMainWindow):
         self.btn_add_mask.setToolTip("Create a new ROI: pick center on W1, paint in W3")
         self.btn_add_mask.clicked.connect(self._start_add_mask)
         actions_layout.addWidget(self.btn_add_mask)
+
+        self.btn_add_bg = QPushButton("Add BG ROI")
+        self.btn_add_bg.setEnabled(False)
+        self.btn_add_bg.setToolTip(
+            "Create a background-measurement ROI (no Fneu). "
+            "Traces stay out of the raster and later analysis."
+        )
+        self.btn_add_bg.clicked.connect(self._start_add_bg)
+        actions_layout.addWidget(self.btn_add_bg)
 
         self.mask_edit_panel = QWidget()
         edit_layout = QVBoxLayout(self.mask_edit_panel)
@@ -1313,6 +1368,8 @@ class MainWindow(QMainWindow):
         self.spin_w3_lo.valueChanged.connect(self._refresh_w3_and_thumbs)
         self.spin_w3_hi.valueChanged.connect(self._refresh_w3_and_thumbs)
         self.chk_w3_show_roi.toggled.connect(self._refresh_w3_and_thumbs)
+        self.chk_show_bg_rois.toggled.connect(self._on_show_bg_rois_toggled)
+        self.chk_show_clusters.toggled.connect(self._on_show_clusters_toggled)
         return panel
 
     def _apply_saved_settings(self) -> None:
@@ -1365,6 +1422,9 @@ class MainWindow(QMainWindow):
                 self._ann_hidden_kinds = {str(k) for k in hidden}
             else:
                 self._ann_hidden_kinds = set()
+            self.chk_show_bg_rois.setChecked(bool(s.get("show_bg_rois", False)))
+            self.chk_show_clusters.setChecked(bool(s.get("show_clusters", False)))
+            self.chk_raster_clusters.setChecked(bool(s.get("raster_add_clusters", False)))
         finally:
             self._updating = False
         self._rebuild_ann_display_toggles()
@@ -1379,6 +1439,9 @@ class MainWindow(QMainWindow):
             "mov_lut": self.cmb_mov_lut.currentText(),
             "w3_src": self.cmb_w3_src.currentData() or self.cmb_w3_src.currentText(),
             "w3_lut": self.cmb_w3_lut.currentText(),
+            "show_bg_rois": bool(self.chk_show_bg_rois.isChecked()),
+            "show_clusters": bool(self.chk_show_clusters.isChecked()),
+            "raster_add_clusters": bool(self.chk_raster_clusters.isChecked()),
         }
         if suite2p_dir is not None:
             updates["last_suite2p_dir"] = str(suite2p_dir)
@@ -1446,6 +1509,9 @@ class MainWindow(QMainWindow):
         self._persist_ui_settings(suite2p_dir=suite2p_dir)
         self.btn_modify.setEnabled(True)
         self.btn_add_mask.setEnabled(True)
+        self.btn_add_bg.setEnabled(True)
+        self.chk_show_bg_rois.setEnabled(True)
+        self.chk_show_clusters.setEnabled(True)
         self.btn_ann_tools.setEnabled(True)
         self.ann_display_panel.setEnabled(True)
         self.btn_scale_tools.setEnabled(True)
@@ -1561,7 +1627,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Mask edit active",
-                "Finish with Apply/Save Mask or Cancel before saving.",
+                "Finish with Apply/Save Mask/Save BG ROI or Cancel before saving.",
             )
             return False
         path = save_curation(self.doc, self.suite2p_dir)
@@ -1576,7 +1642,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Mask edit active",
-                "Finish with Apply/Save Mask or Cancel before resetting the ROI.",
+                "Finish with Apply/Save Mask/Save BG ROI or Cancel before resetting the ROI.",
             )
             return
         reset_roi_from_suite2p(self.doc, self.suite2p_dir, self.active_roi_id)
@@ -1625,16 +1691,68 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # ----------------------------------------------------------- mask edit
+    def _is_new_mask(self) -> bool:
+        return self._mask_edit_kind in ("add", "add_bg")
+
+    def _is_add_bg(self) -> bool:
+        return self._mask_edit_kind == "add_bg"
+
+    def _sync_mask_mode_labels(self) -> None:
+        """Fneu tools stay hidden while painting a BG ROI."""
+        bg = self._is_add_bg()
+        for mode, rb in self.mask_mode_buttons.items():
+            if mode in ("add_fneu", "remove_fneu"):
+                rb.setVisible(not bg)
+            elif mode == "add_f":
+                rb.setText("Add BG-ROI pixels" if bg else MODE_LABELS["add_f"])
+            elif mode == "remove_f":
+                rb.setText("Remove BG-ROI pixels" if bg else MODE_LABELS["remove_f"])
+        if bg and self._mask_edit_mode in ("add_fneu", "remove_fneu"):
+            self.mask_mode_buttons["add_f"].setChecked(True)
+            self._mask_edit_mode = "add_f"
+
+    def _on_show_bg_rois_toggled(self) -> None:
+        if self._updating:
+            return
+        save_settings({"show_bg_rois": bool(self.chk_show_bg_rois.isChecked())})
+        if self.doc is not None:
+            self._refresh_fov()
+
+    def _on_show_clusters_toggled(self) -> None:
+        if self._updating:
+            return
+        save_settings({"show_clusters": bool(self.chk_show_clusters.isChecked())})
+        if self.doc is not None:
+            self._refresh_fov()
+
+    def _on_raster_clusters_toggled(self) -> None:
+        if self._updating:
+            return
+        save_settings({"raster_add_clusters": bool(self.chk_raster_clusters.isChecked())})
+        self._on_raster_display_changed()
+
+    def _fov_cluster_rgb(self) -> dict[int, tuple[int, int, int]] | None:
+        if self.doc is None or not self.chk_show_clusters.isChecked():
+            return None
+        clusters = active_hac_clusters(self.doc)
+        if not clusters:
+            return None
+        return {
+            rid: hac_cluster_rgb(idx)
+            for rid, idx in roi_cluster_index(clusters).items()
+        }
+
     def _set_mask_edit_ui(self, active: bool) -> None:
         self._mask_edit_active = active
         self.mask_edit_panel.setVisible(active)
         can_start = not active and self.doc is not None and not self._batch_mode
         self.btn_modify.setEnabled(can_start)
         self.btn_add_mask.setEnabled(can_start)
+        self.btn_add_bg.setEnabled(can_start)
         view: PaintImageView = self.w3.image_view  # type: ignore[attr-defined]
         paint_ok = active and (
             self._mask_edit_kind == "modify"
-            or (self._mask_edit_kind == "add" and self._add_mask_center is not None)
+            or (self._is_new_mask() and self._add_mask_center is not None)
         )
         view.paint_enabled = paint_ok
         single_ok = not active and not self._batch_mode
@@ -1648,7 +1766,7 @@ class MainWindow(QMainWindow):
             not active and self.doc is not None and not self._raster_mode
         )
         self.slider_raster_on.setEnabled(not active and self.doc is not None)
-        is_add = self._mask_edit_kind == "add"
+        is_add = self._is_new_mask()
         for w in (
             self.lbl_zoom_side,
             self.spin_add_side,
@@ -1656,8 +1774,11 @@ class MainWindow(QMainWindow):
             self.btn_zoom_out,
         ):
             w.setVisible(bool(active and is_add))
-        if active and is_add:
+        self._sync_mask_mode_labels()
+        if active and self._mask_edit_kind == "add":
             self.btn_apply_mask.setText("Save Mask")
+        elif active and self._is_add_bg():
+            self.btn_apply_mask.setText("Save BG ROI")
         else:
             self.btn_apply_mask.setText("Apply Mask")
 
@@ -1685,17 +1806,25 @@ class MainWindow(QMainWindow):
         )
 
     def _start_add_mask(self) -> None:
+        self._begin_new_mask("add")
+
+    def _start_add_bg(self) -> None:
+        self._begin_new_mask("add_bg")
+
+    def _begin_new_mask(self, kind: str) -> None:
         if self.doc is None or self._mask_edit_active or self._batch_mode:
             return
         Ly = int(self.doc["meta"]["Ly"])
         Lx = int(self.doc["meta"]["Lx"])
         side = median_zoom_side(self.doc["rois"], Ly, Lx)
-        self._mask_edit_kind = "add"
+        nframes = int(self.doc["meta"]["nframes"])
+        self._mask_edit_kind = kind
         self._add_mask_center = None
         self._add_mask_side = side
-        self._add_mask_draft = empty_roi_draft(
-            next_roi_id(self.doc), int(self.doc["meta"]["nframes"])
-        )
+        if kind == "add_bg":
+            self._add_mask_draft = empty_bg_paint_draft(nframes)
+        else:
+            self._add_mask_draft = empty_roi_draft(next_roi_id(self.doc), nframes)
         self._mask_edit_snapshot = None
         self._mask_traces_stale = False
         self._mask_roi_changed = False
@@ -1707,14 +1836,21 @@ class MainWindow(QMainWindow):
         self._set_mask_edit_ui(True)
         view: PaintImageView = self.w3.image_view  # type: ignore[attr-defined]
         view.paint_enabled = False
-        self.statusBar().showMessage(
-            "Add Mask: click W1 to place the red cross (click again to move before painting)"
-        )
+        if kind == "add_bg":
+            self.statusBar().showMessage(
+                "Add BG ROI: click W1 to place the red cross "
+                "(click again to move before painting)"
+            )
+        else:
+            self.statusBar().showMessage(
+                "Add Mask: click W1 to place the red cross "
+                "(click again to move before painting)"
+            )
         self._refresh_fov()
         self._refresh_w3()
 
     def _nudge_add_zoom(self, delta: int) -> None:
-        if self._mask_edit_kind != "add" or self.doc is None:
+        if not self._is_new_mask() or self.doc is None:
             return
         Ly = int(self.doc["meta"]["Ly"])
         Lx = int(self.doc["meta"]["Lx"])
@@ -1722,7 +1858,7 @@ class MainWindow(QMainWindow):
         self.spin_add_side.setValue(new_side)
 
     def _on_add_side_changed(self, value: int) -> None:
-        if self._updating or self._mask_edit_kind != "add":
+        if self._updating or not self._is_new_mask():
             return
         self._add_mask_side = int(value)
         if self._add_mask_center is not None:
@@ -1730,7 +1866,7 @@ class MainWindow(QMainWindow):
             self._refresh_fov()
 
     def _on_w3_wheel(self, direction: int) -> None:
-        if self._mask_edit_kind != "add" or not self._mask_edit_active:
+        if not self._is_new_mask() or not self._mask_edit_active:
             return
         self._nudge_add_zoom(-8 if direction > 0 else 8)
 
@@ -1761,6 +1897,8 @@ class MainWindow(QMainWindow):
     def _finish_mask_edit(self) -> None:
         if self._mask_edit_kind == "add":
             self._save_new_mask()
+        elif self._is_add_bg():
+            self._save_new_bg_roi()
         else:
             self._apply_mask_edit()
 
@@ -1838,6 +1976,55 @@ class MainWindow(QMainWindow):
         self._refresh_analysis_stale_ui()
         self.statusBar().showMessage(f"Saved new ROI {new_id} to {path}")
 
+    def _save_new_bg_roi(self) -> None:
+        if (
+            not self._mask_edit_active
+            or not self._is_add_bg()
+            or self.doc is None
+            or self.suite2p_dir is None
+            or self._add_mask_draft is None
+        ):
+            return
+        if self._extracting:
+            return
+        if self._add_mask_center is None:
+            QMessageBox.warning(
+                self, "Save BG ROI", "Click W1 to place the ROI center first."
+            )
+            return
+        draft = self._add_mask_draft
+        if len(draft["roi"]["ypix"]) == 0:
+            QMessageBox.warning(
+                self, "Save BG ROI", "The BG-ROI must be non-empty before saving."
+            )
+            return
+        self._mask_roi_changed = True
+        self._mask_neu_changed = False
+        self._mask_traces_stale = True
+        ok = self._recalculate_traces()
+        if not ok:
+            return
+        row = bg_roi_from_draft(draft, next_bg_id(self.doc))
+        apply_processed_to_bg(self.doc, row)
+        append_bg_roi(self.doc, row)
+        self._add_mask_draft = None
+        self._add_mask_center = None
+        self._mask_edit_kind = None
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        path = save_curation(self.doc, self.suite2p_dir)
+        self.dirty = False
+        self._set_mask_edit_ui(False)
+        self._refresh_all()
+        if self._annotation_window is not None:
+            self._annotation_window._update_kind_buttons()
+        bid = int(row["bg_id"])
+        hint = ""
+        if not self.chk_show_bg_rois.isChecked():
+            hint = " — turn on Show BG-ROIs in W1 to see it"
+        self.statusBar().showMessage(f"Saved BG ROI {bid} to {path}{hint}")
+
     def _cancel_extract_job(self) -> None:
         if self._extracting:
             self._extract_cancel = True
@@ -1854,7 +2041,7 @@ class MainWindow(QMainWindow):
         neu_changed = bool(self._mask_neu_changed)
         if self._mask_traces_stale and not roi_changed and not neu_changed:
             roi_changed = True
-            neu_changed = True
+            neu_changed = not self._is_add_bg()
 
         self._extracting = True
         self._extract_cancel = False
@@ -1872,19 +2059,28 @@ class MainWindow(QMainWindow):
                 if step == 1 or step == total or step % 25 == 0:
                     QApplication.processEvents()
 
-            reextract_after_mask_edit(
-                self._row(),
-                self.suite2p_dir,
-                roi_changed=roi_changed,
-                neuropil_changed=neu_changed,
-                progress=_progress,
-                should_cancel=lambda: self._extract_cancel,
-            )
+            if self._is_add_bg():
+                reextract_bg_draft(
+                    self._row(),
+                    self.suite2p_dir,
+                    progress=_progress,
+                    should_cancel=lambda: self._extract_cancel,
+                )
+                apply_processed_to_bg(self.doc, self._row())
+            else:
+                reextract_after_mask_edit(
+                    self._row(),
+                    self.suite2p_dir,
+                    roi_changed=roi_changed,
+                    neuropil_changed=neu_changed,
+                    progress=_progress,
+                    should_cancel=lambda: self._extract_cancel,
+                )
             self._mask_traces_stale = False
             self._mask_roi_changed = False
             self._mask_neu_changed = False
             self.dirty = True
-            if self._mask_edit_kind != "add":
+            if self._mask_edit_kind not in ("add", "add_bg"):
                 self._mark_tc_norm_stale()
             self._refresh_traces(autoscale=True)
             self.extract_progress.setValue(100)
@@ -1909,7 +2105,7 @@ class MainWindow(QMainWindow):
     def _on_w3_paint(self, y_img: int, x_img: int) -> None:
         if not self._mask_edit_active or self._extracting or self.doc is None:
             return
-        if self._mask_edit_kind == "add" and self._add_mask_center is None:
+        if self._is_new_mask() and self._add_mask_center is None:
             return
         Ly = int(self.doc["meta"]["Ly"])
         Lx = int(self.doc["meta"]["Lx"])
@@ -1939,6 +2135,8 @@ class MainWindow(QMainWindow):
         if self._mask_edit_mode in ("add_f", "add_fneu"):
             self._mask_roi_changed = True
             self._mask_neu_changed = True
+        if self._is_add_bg():
+            self._mask_neu_changed = False
         self._mask_traces_stale = True
         self.dirty = True
         self._refresh_fov()
@@ -1951,7 +2149,7 @@ class MainWindow(QMainWindow):
         assert self.doc is not None
         if (
             roi_id is None
-            and self._mask_edit_kind == "add"
+            and self._is_new_mask()
             and self._add_mask_draft is not None
         ):
             return self._add_mask_draft
@@ -2088,8 +2286,8 @@ class MainWindow(QMainWindow):
         if y < 0 or x < 0 or y >= Ly or x >= Lx:
             return
 
-        # Add Mask: place / move center (only before painting starts)
-        if self._mask_edit_active and self._mask_edit_kind == "add":
+        # Add Mask / Add BG ROI: place / move center (only before painting starts)
+        if self._mask_edit_active and self._is_new_mask():
             painted = self._mask_roi_changed or self._mask_neu_changed
             if painted:
                 self.statusBar().showMessage(
@@ -2101,9 +2299,14 @@ class MainWindow(QMainWindow):
             view.paint_enabled = True
             self._refresh_fov()
             self._refresh_w3()
-            self.statusBar().showMessage(
-                f"Add Mask center at (y={y}, x={x}) — paint in W3, then Save Mask"
-            )
+            if self._is_add_bg():
+                self.statusBar().showMessage(
+                    f"Add BG ROI center at (y={y}, x={x}) — paint in W3, then Save BG ROI"
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"Add Mask center at (y={y}, x={x}) — paint in W3, then Save Mask"
+                )
             return
 
         if self._mask_edit_active:
@@ -2160,6 +2363,7 @@ class MainWindow(QMainWindow):
         self.spin_fneu_offset.setEnabled(single)
         self.btn_modify.setEnabled(single and self.doc is not None)
         self.btn_add_mask.setEnabled(single and self.doc is not None)
+        self.btn_add_bg.setEnabled(single and self.doc is not None)
         self.chk_iscell.setEnabled(not self._mask_edit_active and self.doc is not None)
         self.slider_mode.setEnabled(
             not self._mask_edit_active and self.doc is not None and not self._raster_mode
@@ -2246,6 +2450,7 @@ class MainWindow(QMainWindow):
         self.cmb_raster_show.setEnabled(enabled)
         self.cmb_raster_lut.setEnabled(enabled)
         self.chk_raster_revert.setEnabled(enabled)
+        self.chk_raster_clusters.setEnabled(enabled)
         self.slider_raster_batch.setEnabled(enabled)
         self.cmb_raster_sort.setEnabled(enabled)
         self.cmb_raster_trace.setEnabled(enabled)
@@ -2379,6 +2584,8 @@ class MainWindow(QMainWindow):
         self.dirty = True
         if self._raster_mode:
             self._refresh_raster()
+        if self.chk_show_clusters.isChecked():
+            self._refresh_fov()
         self._notify_heatmap_raster()
 
     def _fill_raster_trace_combo(self) -> None:
@@ -2572,6 +2779,8 @@ class MainWindow(QMainWindow):
         self._fill_raster_sort_combo()
         if self._raster_mode:
             self._refresh_raster()
+        if self.chk_show_clusters.isChecked():
+            self._refresh_fov()
 
     def _ensure_analysis_inputs(self, field: str | None = None) -> bool:
         if self.doc is None:
@@ -2750,15 +2959,23 @@ class MainWindow(QMainWindow):
         self._raster_box_items.clear()
 
     def _add_raster_group_box(
-        self, x: float, y: float, w: float, h: float, color: str
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        color: str,
+        *,
+        width: int = 1,
+        z: float = 10,
     ) -> None:
         if w <= 0 or h <= 0:
             return
         rect = QtWidgets.QGraphicsRectItem(x, y, w, h)
-        rect.setPen(pg.mkPen(color, width=1))
+        rect.setPen(pg.mkPen(color, width=width))
         rect.setBrush(QtGui.QBrush(Qt.BrushStyle.NoBrush))
         rect.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        rect.setZValue(10)
+        rect.setZValue(z)
         self.raster_view.getView().addItem(rect)
         self._raster_box_items.append(rect)
 
@@ -2829,6 +3046,18 @@ class MainWindow(QMainWindow):
             elif filt == "noncell":
                 self._add_raster_group_box(
                     -0.5, -0.5, float(nframes), float(len(rows)), "#3498db"
+                )
+        if rows and self.chk_raster_clusters.isChecked():
+            cluster_of = roi_cluster_index(active_hac_clusters(self.doc))
+            for start, end, cid in cluster_row_spans(self._raster_row_ids, cluster_of):
+                self._add_raster_group_box(
+                    -0.5,
+                    float(start) - 0.5,
+                    float(nframes),
+                    float(end - start + 1),
+                    hac_cluster_hex(cid),
+                    width=2,
+                    z=12,
                 )
         self.raster_c0.setZValue(20)
         self._updating = True
@@ -3027,9 +3256,24 @@ class MainWindow(QMainWindow):
             active_id,
             self._overlay_filter(),
             batch_roi_ids=batch_ids,
+            cluster_rgb=self._fov_cluster_rgb(),
         )
         composed = compose_rgb_with_overlay(rgb, overlay)
-        if self._mask_edit_kind == "add" and self._add_mask_center is not None:
+        show_bg = bool(self.chk_show_bg_rois.isChecked()) or self._is_add_bg()
+        if show_bg:
+            draft = (
+                self._add_mask_draft
+                if self._is_add_bg() and self._add_mask_draft is not None
+                else None
+            )
+            bg_ov = build_bg_overlay(
+                int(self.doc["meta"]["Ly"]),
+                int(self.doc["meta"]["Lx"]),
+                ensure_bg_rois(self.doc),
+                draft=draft,
+            )
+            composed = compose_rgb_with_overlay(composed, bg_ov)
+        if self._is_new_mask() and self._add_mask_center is not None:
             cy, cx = self._add_mask_center
             self._draw_red_cross(composed, int(round(cy)), int(round(cx)))
         self._set_display_rgb(self.w1.image_view, composed)  # type: ignore[attr-defined]
@@ -3060,11 +3304,11 @@ class MainWindow(QMainWindow):
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
         row = self._row()
-        if self._mask_edit_kind == "add" and self._add_mask_center is not None:
+        if self._is_new_mask() and self._add_mask_center is not None:
             cy, cx = self._add_mask_center
             y0, x0, side = zoom_square_at(cy, cx, self._add_mask_side, Ly, Lx)
             return y0, x0, side, row
-        if self._mask_edit_kind == "add":
+        if self._is_new_mask():
             cy, cx = (Ly - 1) / 2.0, (Lx - 1) / 2.0
             y0, x0, side = zoom_square_at(cy, cx, self._add_mask_side, Ly, Lx)
             return y0, x0, side, row
@@ -3099,7 +3343,8 @@ class MainWindow(QMainWindow):
                 Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=2
             )
             if y_out.size:
-                w2[y_out, x_out] = (255, 0, 0)
+                color = BG_ROI_RGB if self._is_add_bg() else (255, 0, 0)
+                w2[y_out, x_out] = color
         self._set_display_rgb(self.w2.image_view, w2)  # type: ignore[attr-defined]
         self.w2.setTitle(f"Movie (W2) — frame {t}")  # type: ignore[attr-defined]
 
@@ -3135,6 +3380,8 @@ class MainWindow(QMainWindow):
             Ly,
             Lx,
             show_roi=self.chk_w3_show_roi.isChecked(),
+            show_neu=not self._is_add_bg(),
+            roi_rgb=BG_ROI_RGB if self._is_add_bg() else (255, 0, 0),
         )
         self._set_display_rgb(self.w3.image_view, zoom)  # type: ignore[attr-defined]
         src = self.cmb_w3_src.currentText()
@@ -3192,33 +3439,50 @@ class MainWindow(QMainWindow):
         else:
             row = self._row()
             F = np.asarray(row["roi"]["F"], dtype=np.float64)
-            comp = np.asarray(row["compensation"]["trace_comp"], dtype=np.float64)
             xs = np.arange(F.shape[0])
-            self.curve_f.setData(xs, self._display_trace(F))
-            self.curve_fneu.setData(xs, self._display_trace(scaled_fneu(row)))
-            self.curve_comp.setData(xs, self._display_trace(comp))
-            self.plot_f.setTitle("F / Fneu")
-            off = compensation_fneu_offset(row)
-            if abs(off) > 1e-12:
-                self.plot_comp.setTitle("trace_comp = F − x·(Fneu + offset)")
-            else:
-                self.plot_comp.setTitle("trace_comp = F − x·Fneu")
-            nframes = int(self.doc["meta"]["nframes"])
-            mask = led_shutter_nan_mask(self.doc, nframes)
-            sm = row.get(TRACE_FIELD_SM)
-            bc = row.get(TRACE_FIELD_SM_BC)
-            fit = bleach_fit_curve(row, mask, nframes)
             nan_y = np.full(xs.shape, np.nan, dtype=np.float64)
-            self.curve_bleach_sm.setData(
-                xs, self._display_trace(sm) if sm is not None else nan_y
-            )
-            self.curve_bleach_fit.setData(xs, fit if fit is not None else nan_y)
-            self.curve_bleach_bc.setData(
-                xs, self._display_trace(bc) if bc is not None else nan_y
-            )
-            cons = bool((row.get("bleach") or {}).get("conservative", False)) if bc is not None else False
-            extra = " (conservative)" if cons else ""
-            self.plot_bleach.setTitle(f"tc_norm_sm / tc_norm_sm_bc{extra}")
+            if self._is_add_bg():
+                self.curve_f.setData(xs, self._display_trace(F))
+                self.curve_fneu.setData(xs, nan_y)
+                self.curve_comp.setData(xs, nan_y)
+                self.plot_f.setTitle("BG-ROI")
+                self.plot_comp.setTitle("BG-ROI (no Fneu / compensation)")
+                sm = row.get(BG_FIELD_SM)
+                bc = row.get(BG_FIELD_SM_BC)
+                self.curve_bleach_sm.setData(
+                    xs, self._display_trace(sm) if sm is not None else nan_y
+                )
+                self.curve_bleach_fit.setData(xs, nan_y)
+                self.curve_bleach_bc.setData(
+                    xs, self._display_trace(bc) if bc is not None else nan_y
+                )
+                self.plot_bleach.setTitle("BG-ROI sm / sm_bc (no min–max)")
+            else:
+                comp = np.asarray(row["compensation"]["trace_comp"], dtype=np.float64)
+                self.curve_f.setData(xs, self._display_trace(F))
+                self.curve_fneu.setData(xs, self._display_trace(scaled_fneu(row)))
+                self.curve_comp.setData(xs, self._display_trace(comp))
+                self.plot_f.setTitle("F / Fneu")
+                off = compensation_fneu_offset(row)
+                if abs(off) > 1e-12:
+                    self.plot_comp.setTitle("trace_comp = F − x·(Fneu + offset)")
+                else:
+                    self.plot_comp.setTitle("trace_comp = F − x·Fneu")
+                nframes = int(self.doc["meta"]["nframes"])
+                mask = led_shutter_nan_mask(self.doc, nframes)
+                sm = row.get(TRACE_FIELD_SM)
+                bc = row.get(TRACE_FIELD_SM_BC)
+                fit = bleach_fit_curve(row, mask, nframes)
+                self.curve_bleach_sm.setData(
+                    xs, self._display_trace(sm) if sm is not None else nan_y
+                )
+                self.curve_bleach_fit.setData(xs, fit if fit is not None else nan_y)
+                self.curve_bleach_bc.setData(
+                    xs, self._display_trace(bc) if bc is not None else nan_y
+                )
+                cons = bool((row.get("bleach") or {}).get("conservative", False)) if bc is not None else False
+                extra = " (conservative)" if cons else ""
+                self.plot_bleach.setTitle(f"tc_norm_sm / tc_norm_sm_bc{extra}")
         self._refresh_ann_spans()
         if autoscale:
             for k in self._trace_y_locked:
@@ -3740,6 +4004,8 @@ class MainWindow(QMainWindow):
                 Ly,
                 Lx,
                 show_roi=self.chk_w3_show_roi.isChecked(),
+                show_neu=not self._is_add_bg(),
+                roi_rgb=BG_ROI_RGB if self._is_add_bg() else (255, 0, 0),
             )
             self._set_display_rgb(view, zoom)
             if movie:

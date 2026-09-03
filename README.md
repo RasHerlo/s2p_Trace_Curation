@@ -42,9 +42,15 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
 - Trace Processing: Savitzky–Golay (`tc_norm_sm`) and bleach (`tc_norm_sm_bc`)
 - Named heatmaps from `data.bin`: set frame ranges on the raster trace, map is
   AUC inside / AUC outside (Edit HeatMaps → Image dropdowns)
-- Analysis Tools HAC can use `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc`
+- Analysis Tools HAC: drag a dotted distance cut on the dendrogram to
+  outline clusters on the similarity matrix; the cut and membership are
+  saved with the run and can be edited later
+- Raster **Add clusters** outlines same-cluster rows; FOV **Show Clusters**
+  paints those ROIs in the same colours (uses the current Raster Sort run)
 - Draggable divider above the trace panel; click a plot title (or a C1–C4 zoom)
   to expand it to full height, click again to show all four
-- Annotation Tools: kind is a preset (LED+Shutter, AirPuff, PMT-noise) or a
-  name you type; pick a trace type; frames or seconds; click a saved row to
-  edit; draw ranges, then Save
+- Annotation Tools: kind is a preset (LED+Shutter, AirPuff, PMT-noise,
+  BG-motion) or a name you type; pick a trace type; frames or seconds; click
+  a saved row to edit; draw ranges, then Save
+- Mask Tools: Add BG ROI (unweighted background traces, stored apart from
+  cells); Annotation Tools can threshold their sum as BG-motion

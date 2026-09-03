@@ -52,11 +52,17 @@ def build_fov_overlay(
     overlay_filter: OverlayFilter,
     alpha: float = 0.35,
     batch_roi_ids: set[int] | None = None,
+    cluster_rgb: dict[int, tuple[int, int, int]] | None = None,
 ) -> np.ndarray:
-    """RGBA uint8 overlay; non-active red, active/batch cyan."""
+    """RGBA uint8 overlay; non-active red, active/batch cyan.
+
+    ``cluster_rgb`` (roi_id → RGB) overrides those fills for clustered ROIs
+    while keeping the same alpha.
+    """
     overlay = np.zeros((Ly, Lx, 4), dtype=np.uint8)
     a = int(round(alpha * 255))
     batch = batch_roi_ids or set()
+    clustered = cluster_rgb or {}
     for row in iter_visible_rois(rois, overlay_filter, active_roi_id):
         y = np.asarray(row["roi"]["ypix"], dtype=np.int64)
         x = np.asarray(row["roi"]["xpix"], dtype=np.int64)
@@ -64,16 +70,16 @@ def build_fov_overlay(
             continue
         rid = int(row["roi_id"])
         highlight = rid in batch or (not batch and rid == int(active_roi_id))
-        if highlight:
-            overlay[y, x, 0] = 0
-            overlay[y, x, 1] = 255
-            overlay[y, x, 2] = 255
-            overlay[y, x, 3] = a
+        if rid in clustered:
+            r, g, b = clustered[rid]
+        elif highlight:
+            r, g, b = 0, 255, 255
         else:
-            overlay[y, x, 0] = 255
-            overlay[y, x, 1] = 0
-            overlay[y, x, 2] = 0
-            overlay[y, x, 3] = a
+            r, g, b = 255, 0, 0
+        overlay[y, x, 0] = r
+        overlay[y, x, 1] = g
+        overlay[y, x, 2] = b
+        overlay[y, x, 3] = a
     return overlay
 
 
@@ -154,30 +160,33 @@ def zoom_masks_rgba(
     roi_alpha: float = 0.35,
     neu_alpha: float = 0.35,
     show_roi: bool = True,
+    show_neu: bool = True,
+    roi_rgb: tuple[int, int, int] = (255, 0, 0),
 ) -> np.ndarray:
-    """Crop RGB frame and blend neuropil (yellow-orange) + optional ROI (red)."""
+    """Crop RGB frame and blend neuropil (yellow-orange) + optional ROI fill."""
     crop = frame_rgb[y0 : y0 + side, x0 : x0 + side].copy()
     overlay = np.zeros((side, side, 4), dtype=np.uint8)
 
     # neuropil first (under)
-    ipix = np.asarray(row["neuropil"]["ipix"], dtype=np.int64)
-    if ipix.size:
-        ny, nx = np.unravel_index(ipix, (Ly, Lx))
-        cy = ny - y0
-        cx = nx - x0
-        m = (cy >= 0) & (cy < side) & (cx >= 0) & (cx < side)
-        overlay[cy[m], cx[m], 0] = 255
-        overlay[cy[m], cx[m], 1] = 180
-        overlay[cy[m], cx[m], 2] = 0
-        overlay[cy[m], cx[m], 3] = int(round(neu_alpha * 255))
+    if show_neu:
+        ipix = np.asarray(row["neuropil"]["ipix"], dtype=np.int64)
+        if ipix.size:
+            ny, nx = np.unravel_index(ipix, (Ly, Lx))
+            cy = ny - y0
+            cx = nx - x0
+            m = (cy >= 0) & (cy < side) & (cx >= 0) & (cx < side)
+            overlay[cy[m], cx[m], 0] = 255
+            overlay[cy[m], cx[m], 1] = 180
+            overlay[cy[m], cx[m], 2] = 0
+            overlay[cy[m], cx[m], 3] = int(round(neu_alpha * 255))
 
     if show_roi:
         ypix = np.asarray(row["roi"]["ypix"], dtype=np.int64) - y0
         xpix = np.asarray(row["roi"]["xpix"], dtype=np.int64) - x0
         m = (ypix >= 0) & (ypix < side) & (xpix >= 0) & (xpix < side)
-        overlay[ypix[m], xpix[m], 0] = 255
-        overlay[ypix[m], xpix[m], 1] = 0
-        overlay[ypix[m], xpix[m], 2] = 0
+        overlay[ypix[m], xpix[m], 0] = roi_rgb[0]
+        overlay[ypix[m], xpix[m], 1] = roi_rgb[1]
+        overlay[ypix[m], xpix[m], 2] = roi_rgb[2]
         overlay[ypix[m], xpix[m], 3] = int(round(roi_alpha * 255))
 
     return compose_rgb_with_overlay(crop, overlay)

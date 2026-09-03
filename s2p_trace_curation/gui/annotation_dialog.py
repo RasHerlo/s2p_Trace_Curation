@@ -12,6 +12,8 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from s2p_trace_curation.analyses import active_sort_run, apply_raster_sort
 from s2p_trace_curation.annotations import (
     ANNOTATION_PROPERTIES,
+    PROPERTY_BG_MOTION,
+    PROPERTY_PMT_NOISE,
     SPAN_FILL_ALPHA,
     SPAN_PEN_ALPHA,
     annotation_kind,
@@ -19,6 +21,8 @@ from s2p_trace_curation.annotations import (
     annotation_ranges,
     ensure_annotations,
     get_annotation,
+    is_bg_motion,
+    is_bundle_kind,
     is_led_shutter,
     is_pmt_noise,
     make_annotation,
@@ -28,6 +32,7 @@ from s2p_trace_curation.annotations import (
     set_annotation_ranges,
     validate_annotation_frames,
 )
+from s2p_trace_curation.bg_rois import ensure_bg_rois
 from s2p_trace_curation.pmt_noise import RMS_COLUMN, read_per_frame_rms
 from s2p_trace_curation.gui.colormaps import (
     colorize_raster,
@@ -129,8 +134,9 @@ class AnnotationEditorWindow(QDialog):
         self.cmb_prop.setEditable(True)
         self.cmb_prop.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.cmb_prop.setToolTip(
-            "Pick LED+Shutter, AirPuff, or PMT-noise, or type a custom name. "
-            "Selecting LED+Shutter or PMT-noise rows NaNs that span on the traces."
+            "Pick LED+Shutter, AirPuff, PMT-noise, or BG-motion, or type a "
+            "custom name. Selecting LED+Shutter, PMT-noise, or BG-motion rows "
+            "NaNs that span on the traces."
         )
         self.cmb_prop.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
@@ -231,6 +237,12 @@ class AnnotationEditorWindow(QDialog):
             f"'{RMS_COLUMN}' column into ranges."
         )
         self.btn_pmt_file.clicked.connect(self._on_pmt_file)
+        self.btn_bg_rois = QPushButton("BG ROIs")
+        self.btn_bg_rois.setEnabled(False)
+        self.btn_bg_rois.setToolTip(
+            "BG-motion only: plot saved BG-ROI traces and threshold their raw sum."
+        )
+        self.btn_bg_rois.clicked.connect(self._on_bg_rois)
         self.btn_save = QPushButton("Save")
         self.btn_save.setToolTip(
             "Write every draft range as an annotation of the selected kind. "
@@ -240,17 +252,19 @@ class AnnotationEditorWindow(QDialog):
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.close)
         action_row.addWidget(self.btn_pmt_file)
+        action_row.addWidget(self.btn_bg_rois)
         action_row.addWidget(self.btn_save)
         action_row.addWidget(btn_close)
         right_layout.addLayout(action_row)
 
         hint = QLabel(
-            "Kind is a preset (LED+Shutter, AirPuff, PMT-noise) or a name you type. "
-            "Click a saved row to load it, or New for a draft. "
+            "Kind is a preset (LED+Shutter, AirPuff, PMT-noise, BG-motion) or a "
+            "name you type. Click a saved row to load it, or New for a draft. "
             "Drag a range edge on the trace, or type Start/End and Add. "
-            "Save writes each draft range as its own annotation, except PMT-noise, "
-            "which becomes one annotation holding every interval. "
-            "Select LED+Shutter or PMT-noise rows to NaN those spans on the main traces."
+            "Save writes each draft range as its own annotation, except PMT-noise "
+            "and BG-motion, which become one annotation holding every interval. "
+            "Select LED+Shutter, PMT-noise, or BG-motion rows to NaN those spans "
+            "on the main traces."
         )
         hint.setWordWrap(True)
         right_layout.addWidget(hint)
@@ -401,7 +415,7 @@ class AnnotationEditorWindow(QDialog):
         elif self.cmb_prop.count():
             self.cmb_prop.setCurrentIndex(0)
         self.cmb_prop.blockSignals(False)
-        self._update_pmt_button()
+        self._update_kind_buttons()
 
     def _form_kind(self) -> str:
         return normalize_property_name(self.cmb_prop.currentText())
@@ -416,19 +430,30 @@ class AnnotationEditorWindow(QDialog):
         elif self.cmb_prop.count():
             self.cmb_prop.setCurrentIndex(0)
         # currentTextChanged stays silent when the text is already correct.
-        self._update_pmt_button()
+        self._update_kind_buttons()
 
     # ----------------------------------------------------------- PMT-noise csv
     def _on_kind_text_changed(self, _text: str = "") -> None:
-        self._update_pmt_button()
+        self._update_kind_buttons()
 
-    def _update_pmt_button(self) -> None:
-        """The csv importer only makes sense for the PMT-noise kind."""
-        if not hasattr(self, "btn_pmt_file"):
+    def _update_kind_buttons(self) -> None:
+        """File… is PMT-noise; BG ROIs is BG-motion (and needs saved BG ROIs)."""
+        if not hasattr(self, "btn_pmt_file") or not hasattr(self, "btn_bg_rois"):
             return
-        self.btn_pmt_file.setEnabled(
-            self._doc() is not None and is_pmt_noise(self.cmb_prop.currentText())
-        )
+        doc = self._doc()
+        has = doc is not None
+        kind = self.cmb_prop.currentText()
+        self.btn_pmt_file.setEnabled(has and is_pmt_noise(kind))
+        n_bg = len(ensure_bg_rois(doc)) if has else 0
+        self.btn_bg_rois.setEnabled(has and is_bg_motion(kind) and n_bg > 0)
+        if has and is_bg_motion(kind) and n_bg == 0:
+            self.btn_bg_rois.setToolTip(
+                "Draw at least one BG ROI in Mask Tools first."
+            )
+        else:
+            self.btn_bg_rois.setToolTip(
+                "BG-motion only: plot saved BG-ROI traces and threshold their raw sum."
+            )
 
     def _pmt_start_dir(self) -> str:
         raw = load_settings().get("last_pmt_csv_dir")
@@ -516,6 +541,54 @@ class AnnotationEditorWindow(QDialog):
             f"{RMS_COLUMN} {dlg.threshold():g}"
         )
 
+    def _on_bg_rois(self) -> None:
+        doc = self._doc()
+        if doc is None:
+            return
+        rows = ensure_bg_rois(doc)
+        if not rows:
+            QMessageBox.information(
+                self,
+                "No BG ROIs",
+                "Draw at least one BG ROI with Mask Tools → Add BG ROI first.",
+            )
+            return
+        from s2p_trace_curation.gui.bg_roi_dialog import BgRoiThresholdDialog
+
+        dlg = BgRoiThresholdDialog(
+            doc,
+            parent=self,
+            fs=self._fs(),
+            seconds=self._seconds_mode(),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        ranges = dlg.ranges()
+        if not ranges:
+            return
+        self._editing_id = None
+        self._loading = True
+        self.list_ann.clearSelection()
+        self._loading = False
+        self.main._set_ann_selection(set())
+        self._set_kind(PROPERTY_BG_MOTION)
+        self._ranges = ranges
+        ids = dlg.selected_ids()
+        id_txt = ",".join(str(i) for i in ids)
+        self._draft_label = f"BG {id_txt} sumF>{dlg.threshold():g}"
+        self._rebuild_ranges_ui()
+        self._refresh_guide_spans()
+        n_frames = sum(b - a + 1 for a, b in self._ranges)
+        self.lbl_status.setText(
+            f"{len(self._ranges)} interval(s) from {len(ids)} BG ROI(s) "
+            f"({n_frames} frame(s), sum F > {dlg.threshold():g}) — "
+            "Save writes them as one BG-motion annotation"
+        )
+        self.main.statusBar().showMessage(
+            f"BG-motion: {len(self._ranges)} interval(s) above "
+            f"sum F {dlg.threshold():g}"
+        )
+
     def _set_draft_form(self) -> None:
         self._editing_id = None
         self._set_kind(ANNOTATION_PROPERTIES[0])
@@ -592,7 +665,7 @@ class AnnotationEditorWindow(QDialog):
         self.btn_save.setEnabled(has and bool(self._ranges))
         self.btn_add_range.setEnabled(has)
         self.btn_remove_range.setEnabled(has and bool(self._ranges))
-        self._update_pmt_button()
+        self._update_kind_buttons()
 
     def _clear_range_items(self) -> None:
         for item in self._range_items:
@@ -854,9 +927,8 @@ class AnnotationEditorWindow(QDialog):
         anns = ensure_annotations(doc)
         led = is_led_shutter(prop)
         label = self._draft_label
-        # PMT noise is one feature made of many bursts, so it stays a single
-        # annotation holding every interval. Other kinds mark separate events.
-        if is_pmt_noise(prop):
+        # PMT-noise and BG-motion are one feature made of many intervals.
+        if is_bundle_kind(prop):
             self._save_as_one(doc, anns, prop, ranges, label, led)
             return
         if len(ranges) > 50:

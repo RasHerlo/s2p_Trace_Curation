@@ -136,6 +136,34 @@ class BinaryStack:
                 progress(t + 1, self.nframes)
         return out
 
+    def extract_unweighted_trace(
+        self,
+        ypix: np.ndarray,
+        xpix: np.ndarray,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress_offset: int = 0,
+        progress_total: int | None = None,
+    ) -> np.ndarray:
+        """Unweighted mean over ``(ypix, xpix)`` — used for BG ROIs."""
+        ypix = np.asarray(ypix, dtype=np.int64)
+        xpix = np.asarray(xpix, dtype=np.int64)
+        if ypix.size == 0:
+            return np.zeros(self.nframes, dtype=np.float64)
+        out = np.empty(self.nframes, dtype=np.float64)
+        total = self.nframes if progress_total is None else int(progress_total)
+        for t in range(self.nframes):
+            if should_cancel is not None and should_cancel():
+                from s2p_trace_curation.mask_edit import ExtractCancelled
+
+                raise ExtractCancelled()
+            frame = self.read_frame(t)
+            out[t] = float(frame[ypix, xpix].mean())
+            if progress is not None:
+                progress(progress_offset + t + 1, total)
+        return out
+
     def extract_neuropil_trace(
         self,
         ipix: np.ndarray,

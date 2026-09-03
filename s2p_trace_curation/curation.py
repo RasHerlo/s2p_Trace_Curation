@@ -26,6 +26,7 @@ from s2p_trace_curation.suite2p_io import (
 from s2p_trace_curation.analyses import PICKLE_SORT_ID, ensure_analyses, get_analysis, refresh_stale_flags
 from s2p_trace_curation.annotations import ensure_annotations
 from s2p_trace_curation.heatmaps import ensure_heatmaps
+from s2p_trace_curation.bg_rois import ensure_bg_rois
 from s2p_trace_curation.trace_processing import ensure_trace_processing
 
 
@@ -155,6 +156,7 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
         "annotations": [],
         "analyses": [],
         "heatmaps": [],
+        "bg_rois": [],
     }
     ensure_trace_processing(doc)
     return doc
@@ -221,6 +223,7 @@ def load_curation(path: Path) -> dict[str, Any]:
     ensure_analyses(doc)
     ensure_heatmaps(doc)
     ensure_trace_processing(doc)
+    ensure_bg_rois(doc)
     for row in doc["rois"]:
         ensure_compensation(row)
     refresh_stale_flags(doc)

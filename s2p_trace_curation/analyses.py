@@ -48,6 +48,9 @@ def ensure_analyses(doc: dict[str, Any]) -> list[dict[str, Any]]:
     meta = doc.setdefault("meta", {})
     if not meta.get("raster_sort"):
         meta["raster_sort"] = PICKLE_SORT_ID
+    for run in runs:
+        if "clusters" not in run:
+            run["clusters"] = []
     return runs
 
 
@@ -209,6 +212,57 @@ def compute_run(
     raise ValueError(f"Unknown analysis kind: {kind}")
 
 
+def normalize_clusters(raw: Any) -> list[list[int]]:
+    """Coerce a run's ``clusters`` field to lists of roi_ids."""
+    out: list[list[int]] = []
+    if not raw:
+        return out
+    for group in raw:
+        ids = [int(i) for i in (group or [])]
+        if ids:
+            out.append(ids)
+    return out
+
+
+def active_hac_clusters(doc: dict[str, Any]) -> list[list[int]]:
+    """Clusters from the raster Sort run, if it is a saved HAC cut."""
+    run = active_sort_run(doc)
+    if run is None or str(run.get("kind")) != KIND_HAC:
+        return []
+    return normalize_clusters(run.get("clusters"))
+
+
+def roi_cluster_index(clusters: list[list[int]]) -> dict[int, int]:
+    """Map roi_id → 0-based cluster index (first membership wins)."""
+    out: dict[int, int] = {}
+    for i, group in enumerate(clusters):
+        for rid in group:
+            rid_i = int(rid)
+            if rid_i not in out:
+                out[rid_i] = i
+    return out
+
+
+def cluster_row_spans(
+    row_ids: list[int], cluster_of: dict[int, int]
+) -> list[tuple[int, int, int]]:
+    """Contiguous (start, end, cluster_index) spans along a raster row order."""
+    spans: list[tuple[int, int, int]] = []
+    i = 0
+    n = len(row_ids)
+    while i < n:
+        cid = cluster_of.get(int(row_ids[i]))
+        if cid is None:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and cluster_of.get(int(row_ids[j])) == cid:
+            j += 1
+        spans.append((i, j - 1, int(cid)))
+        i = j
+    return spans
+
+
 def make_analysis_run(
     doc: dict[str, Any],
     *,
@@ -217,19 +271,22 @@ def make_analysis_run(
     params: dict[str, Any],
     roi_ids: list[int],
     order: list[int],
+    clusters: list[list[int]] | None = None,
     analysis_id: str | None = None,
 ) -> dict[str, Any]:
     now = _utc_now()
     params = deepcopy(params)
     roi_ids = [int(i) for i in roi_ids]
     order = [int(i) for i in order]
+    kind = str(kind)
     return {
         "id": analysis_id or next_analysis_id(doc),
         "label": str(label).strip() or "Untitled",
-        "kind": str(kind),
+        "kind": kind,
         "params": params,
         "roi_ids": roi_ids,
         "order": order,
+        "clusters": normalize_clusters(clusters) if kind == KIND_HAC else [],
         "input_sig": analysis_input_sig(doc, roi_ids, kind, params),
         "stale": False,
         "created_utc": now,
@@ -246,6 +303,7 @@ def apply_run_result(
     params: dict[str, Any] | None = None,
     roi_ids: list[int],
     order: list[int],
+    clusters: list[list[int]] | None = None,
 ) -> None:
     if label is not None:
         run["label"] = str(label).strip() or "Untitled"
@@ -255,6 +313,10 @@ def apply_run_result(
         run["params"] = deepcopy(params)
     run["roi_ids"] = [int(i) for i in roi_ids]
     run["order"] = [int(i) for i in order]
+    if clusters is not None:
+        run["clusters"] = normalize_clusters(clusters)
+    elif str(run.get("kind") or "") != KIND_HAC:
+        run["clusters"] = []
     run["input_sig"] = analysis_input_sig(
         doc, run["roi_ids"], str(run["kind"]), run.get("params") or {}
     )

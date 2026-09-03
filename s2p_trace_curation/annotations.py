@@ -9,11 +9,13 @@ import numpy as np
 PROPERTY_LED_SHUTTER = "LED+Shutter"
 PROPERTY_AIRPUFF = "AirPuff"
 PROPERTY_PMT_NOISE = "PMT-noise"
+PROPERTY_BG_MOTION = "BG-motion"
 
 ANNOTATION_PROPERTIES: tuple[str, ...] = (
     PROPERTY_LED_SHUTTER,
     PROPERTY_AIRPUFF,
     PROPERTY_PMT_NOISE,
+    PROPERTY_BG_MOTION,
 )
 
 # Display / export behavior keyed by property name.
@@ -32,6 +34,11 @@ PROPERTY_SPEC: dict[str, dict[str, Any]] = {
         "color": "#d35400",
         "nan_display": True,
         "description": "PMT noise epoch; NaN for display when selected",
+    },
+    PROPERTY_BG_MOTION: {
+        "color": "#16a085",
+        "nan_display": True,
+        "description": "Background-evaluated motion; NaN for display when selected",
     },
 }
 
@@ -67,6 +74,15 @@ def is_led_shutter(name: str) -> bool:
 
 def is_pmt_noise(name: str) -> bool:
     return str(name).strip().lower() == PROPERTY_PMT_NOISE.lower()
+
+
+def is_bg_motion(name: str) -> bool:
+    return str(name).strip().lower() == PROPERTY_BG_MOTION.lower()
+
+
+def is_bundle_kind(name: str) -> bool:
+    """Kinds that store every interval in one annotation (PMT-noise, BG-motion)."""
+    return is_pmt_noise(name) or is_bg_motion(name)
 
 
 def merge_ranges(

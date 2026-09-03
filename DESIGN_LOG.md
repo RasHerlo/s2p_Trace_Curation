@@ -442,6 +442,7 @@ First slice: pickle `analyses` + migration, sort dropdown, analysis window (list
   "params": {},
   "roi_ids": [...],   # iscell=True at last run, pickle order
   "order": [...],     # permutation of roi_ids
+  "clusters": [...],  # HAC: lists of roi_ids in leaf order (empty otherwise)
   "input_sig": {...}, # kind, params, ids, tc_norm sums, LED spans
   "stale": False,
   "created_utc": "...",
@@ -454,7 +455,7 @@ First slice: pickle `analyses` + migration, sort dropdown, analysis window (list
 | ID | Agreement |
 |----|-----------|
 | AN-A1 | Analyses in `trc_curation.pkl`; schema 3; `analyses: []` + `meta.raster_sort` |
-| AN-A2 | Store params, `roi_ids`, `order`, fingerprint; do not store matrices |
+| AN-A2 | Store params, `roi_ids`, `order`, fingerprint, and HAC `clusters`; do not store matrices |
 | AN-A3 | Members = `iscell=True`; v1 input = full-movie `tc_norm` |
 | AN-A4 | Raster dropdown: Pickle (default) + saved runs; persist `meta.raster_sort` |
 | AN-A5 | Pickle order = doc/`roi_id` order, filtered by Show (not iscell-block grouping) |
@@ -500,7 +501,7 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 
 **Input:** `tc_norm` of current `iscell=True`; pairwise metric ignores NaN frames (LED+Shutter), not `nan_to_num(0)` (zeros look like silence for Ružička).
 
-**Output:** dendrogram leaf order → `order`. Optional later: cut → `labels`. Matrices are not stored; picking a saved HAC run (or Run) recomputes the similarity image + dendrogram in the window.
+**Output:** dendrogram leaf order → `order`; distance cut → `clusters` (roi_id lists in leaf order). Matrices are not stored; picking a saved HAC run (or Run) recomputes the similarity image + dendrogram in the window, then reapplies the saved `cut_threshold`.
 
 **Distance (stored in `params["metric"]`):**
 
@@ -522,7 +523,21 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 
 **Proposed v1 defaults:** `metric=ruzicka`, `linkage=average`. Expose metric + linkage in the Method pane (disable Ward unless Euclidean). Cosine without centering is the closest “angle” cousin to Ružička; Pearson is the comparison for shape.
 
-**Params to persist:** `{metric, linkage}` (and later `cut_threshold` / `n_clusters` if we cut the tree).
+**Params to persist:** `{metric, linkage, trace_field, cut_threshold}`.
+
+**Tree cut (2026-09-03):** a dotted vertical InfiniteLine on the dendrogram (distance on x) sets `params["cut_threshold"]`. `scipy.cluster.hierarchy.fcluster(..., criterion="distance")` yields contiguous blocks in leaf order, drawn as coloured squares on the pairwise matrix. Default cut when none is saved: 0.7 × max merge height (scipy's dendrogram rule). Lower → more / smaller clusters; at 0 every leaf is a singleton; at max height there is one cluster.
+
+Saved on each HAC run (sibling of `order`, not a matrix):
+
+```python
+"clusters": [[roi_id, ...], ...],  # leaf order, one inner list per cluster
+```
+
+Selecting a saved run restores the line at `cut_threshold`; dragging it or typing the Cut distance spinbox edits the clusters immediately. Save / Save as / Rebuild write the new cut and membership. Tweaks stay preview-only until Save (same contract as other analysis params). Changing metric / linkage / trace field discards the previous cut and re-defaults after the next Run (distances are not comparable).
+
+---
+
+## Inspiration / references
 
 ### Open questions (HAC)
 
@@ -530,7 +545,7 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 |---|--------|--------|
 | H1 | Default metric **Ružička**, linkage **average**; also **Euclidean + Ward** | **Agreed** |
 | H2 | Pearson distance = `(1-r)/2` (signed; anti-corr far) vs `1-\|r\|` | Open (not in v1) |
-| H3 | Tree cut / labels in v1 or leaf-order only first | **Order only** |
+| H3 | Tree cut / labels in v1 or leaf-order only first | **Distance cut** (2026-09-03): dotted vertical line on the dendrogram; cluster outlines on the matrix; `params.cut_threshold` + `clusters` stored on the run |
 | H4 | scipy dependency for `pdist` / `linkage` / dendrogram | **Yes** |
 
 ---
@@ -548,11 +563,12 @@ Keep it as a **coarse first pass** when *N* is still large, then switch to HAC f
 - **v1 shell in place** (2026-08-09 + later remote updates):
   - curation I/O, suite2p_io, main GUI, mask edit, user settings
 - **Merge s2p folders / batch iscell / Add Mask:** implemented (2026-08-23+)
-- **Analysis Tools:** schema + window shell; **HAC** (Ružička/average default, Euclidean/Ward) implemented 2026-08-24; PCA / k-means / rastermap parked
+- **Analysis Tools:** schema + window shell; **HAC** (Ružička/average default, Euclidean/Ward) implemented 2026-08-24; distance-threshold cut + matrix cluster outlines 2026-09-03; PCA / k-means / rastermap parked
 - **Trace processing + heatmaps (schema 4, 2026-08-25):** SG → `tc_norm_sm`; bleach → `tc_norm_sm_bc`; HAC trace-field choice; named heatmaps in Image dropdowns
 - **HeatMap ranges (2026-08-26):** Edit HeatMaps mirrors the raster and takes frame ranges off the trace; metric is `auc_ratio` (inside / outside)
 - **Inspect panel space (2026-08-27):** draggable W1–W3 / lower-panel divider; click a plot title (or a zoom) to expand one of the four items
 - **Annotation Tools window (2026-08-28):** heatmap-style ranges; C0 copy buttons removed from the right panel
+- **BG ROIs + BG-motion (schema 7, 2026-09-03):** Add BG ROI; Show BG-ROIs on W1; threshold summed raw BG traces as BG-motion
 - Run: `python -m s2p_trace_curation`
 
 ---
@@ -630,4 +646,62 @@ Superseded 2026-08-26: the earlier starts / extension / Area L–R segment-align
 
 ### Schema 4
 `meta.trace_processing`, `meta.raster_trace_field`, per-ROI `tc_norm_sm` / `tc_norm_sm_bc` / `bleach`, top-level `heatmaps: []`.
+
+---
+
+## Session 2026-09-03 — BG ROIs + BG-motion
+
+Background-measurement ROIs live in `doc["bg_rois"]` (schema **7**). They are not cells: no Fneu, no raster / HAC / heatmap membership, no iscell.
+
+### Mask Tools
+**Add BG ROI** under Add Mask. Same W1-cross + W3 paint flow, Fneu radios hidden, F modes labelled BG-ROI. Extraction is an unweighted mean. **Save BG ROI** appends after optional Re-calculate. W1 **Show BG-ROIs** (under Show ROIs, default off) overlays them in green.
+
+### Traces
+Raw `F` plus `F_sm` / `F_sm_bc` from the same session SG / bleach params (LED+Shutter excised). **No min–max** — amplitude stays usable for motion thresholding. Rebuild of cell `tc_norm_sm` / `tc_norm_sm_bc` also refreshes the BG copies.
+
+### Annotation Tools
+Kind **BG-motion** (`nan_display=True`, same as PMT-noise / LED+Shutter). **BG ROIs** next to File… opens a picker: overlay selected traces (F / sm / sm_bc) and threshold the **sum of raw F**. Save writes one annotation holding every interval. The usual kind checkbox shows the spans on traces.
+
+### Record (illustrative)
+
+```python
+{
+  "bg_id": 0,
+  "ypix": ..., "xpix": ...,
+  "F": ...,          # unweighted mean
+  "F_sm": ...,       # SG, no min-max
+  "F_sm_bc": ...,    # bleach subtracted, no min-max
+  "bleach": {"fit_params": [...], "conservative": False},
+  "modified": True,
+}
+```
+
+---
+
+## Session 2026-09-03 — HAC distance cut
+
+The Analysis Tools dendrogram is already a horizontal tree (distance on x, leaves on y). A **dotted vertical InfiniteLine** slides along that x-axis; the Cut distance spinbox is the same value.
+
+`fcluster(Z, t, criterion="distance")` assigns labels; in leaf order those labels are contiguous blocks. Each block is a coloured square on the pairwise matrix (same leaf coordinates as the tree).
+
+Persistence (no schema bump; optional keys on existing analysis runs):
+
+| Field | Where | Role |
+|-------|--------|------|
+| `cut_threshold` | `params` | Distance used for the cut |
+| `clusters` | run record | `list[list[int]]` of `roi_ids` in leaf order |
+
+Matrices stay unstored. Opening a saved HAC run recomputes Z / the image, then puts the line back at the saved cut so the clusters can be edited and Saved again. Rebuild reapplies the saved cut to the current members. Changing metric / linkage / trace field resets the cut (distances are not comparable) on the next Run.
+
+Default when a run has no saved cut: 0.7 × max merge height.
+
+### Cluster display (same session)
+
+Palette `HAC_CLUSTER_COLORS` is shared by the similarity-matrix squares, raster outlines, and FOV fills.
+
+- Raster Tools, next to Revert LUT: **Add clusters**. When on, contiguous raster rows that share a cluster in the current **Sort** HAC run are boxed in that cluster's colour.
+- FOV, next to Show BG-ROIs: **Show Clusters**. When on, W1 ROI fills use the same colours at the usual mask alpha. Unclustered ROIs stay red / cyan. Needs an HAC sort with a saved cut; Pickle sort shows nothing extra.
+
+Both default off and persist in user settings (`raster_add_clusters`, `show_clusters`).
+
 

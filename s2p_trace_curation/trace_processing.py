@@ -407,6 +407,9 @@ def rebuild_all_tc_norm_sm(doc: dict[str, Any]) -> None:
             row["compensation"]["trace_comp"], mask, window, poly
         )
     doc.setdefault("meta", {})["tc_norm_sm_sig"] = tc_norm_sm_sig(doc)
+    from s2p_trace_curation.bg_rois import rebuild_all_bg_processed
+
+    rebuild_all_bg_processed(doc)
 
 
 def mean_illumination_trace(
@@ -540,6 +543,9 @@ def rebuild_all_tc_norm_sm_bc(doc: dict[str, Any]) -> None:
         row["bleach"] = {"fit_params": list(params), "conservative": bool(cons)}
         row[TRACE_FIELD_SM_BC] = apply_bleach_to_sm(sm_arr, mask, params)
     doc.setdefault("meta", {})["tc_norm_sm_bc_sig"] = tc_norm_sm_bc_sig(doc)
+    from s2p_trace_curation.bg_rois import rebuild_all_bg_processed
+
+    rebuild_all_bg_processed(doc)
 
 
 def row_trace_field(row: dict[str, Any], field: str, nframes: int) -> np.ndarray:
