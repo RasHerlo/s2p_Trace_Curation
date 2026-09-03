@@ -37,6 +37,12 @@ from s2p_trace_curation.heatmaps import (
 from s2p_trace_curation.gui.overlays import iter_visible_rois, thick_outline_mask
 from s2p_trace_curation.raster import led_shutter_nan_mask, rois_for_raster
 from s2p_trace_curation.trace_processing import raster_trace_field, stack_trace_field
+from s2p_trace_curation.gui.x_units import (
+    UNITS_FRAMES,
+    UNITS_SECONDS,
+    combo_x_units,
+    fill_x_units_combo,
+)
 from s2p_trace_curation.user_settings import load_settings, save_settings
 
 Qt = QtCore.Qt
@@ -65,8 +71,6 @@ RANGE_RASTER_BRUSH = (241, 196, 15, 45)
 RANGE_PEN = "#f1c40f"
 OUTLINE_RGB = (255, 0, 0)
 OUTLINE_ACTIVE_RGB = (0, 255, 255)
-UNITS_FRAMES = "frames"
-UNITS_SECONDS = "seconds"
 
 
 class HeatmapEditorWindow(QDialog):
@@ -154,7 +158,7 @@ class HeatmapEditorWindow(QDialog):
         self.chk_outlines = QCheckBox("ROI outlines")
         self.chk_outlines.setToolTip(
             "Draw outlines of the ROIs passing Show ROIs on top of the map "
-            "(active ROI in cyan)"
+            "(None / Current / iscell filters; active ROI in cyan)"
         )
         self.chk_outlines.toggled.connect(self._refresh_map_overlay)
         map_ctl.addWidget(self.chk_outlines)
@@ -191,16 +195,15 @@ class HeatmapEditorWindow(QDialog):
         mode_row.addSpacing(14)
         mode_row.addWidget(QLabel("X units"))
         self.cmb_units = QComboBox()
-        self.cmb_units.addItems([UNITS_FRAMES, UNITS_SECONDS])
+        fill_x_units_combo(
+            self.cmb_units,
+            self._fs(),
+            load_settings().get("heatmap_x_units"),
+        )
         self.cmb_units.setToolTip(
             "Tick labels on the raster and trace x-axes. Seconds needs the "
             "frame rate (meta 'fs' from ops.npy); ranges stay in frames."
         )
-        idx_units = self.cmb_units.findText(
-            str(load_settings().get("heatmap_x_units") or UNITS_FRAMES)
-        )
-        if idx_units >= 0:
-            self.cmb_units.setCurrentIndex(idx_units)
         self.cmb_units.currentIndexChanged.connect(self._on_units_changed)
         mode_row.addWidget(self.cmb_units)
         mode_row.addStretch(1)
@@ -310,10 +313,11 @@ class HeatmapEditorWindow(QDialog):
         if doc is not None and n:
             self.spin_start.setValue(int(0.2 * (n - 1)))
             self.spin_end.setValue(int(0.3 * (n - 1)))
-        if self.cmb_units.currentText() == UNITS_SECONDS and self._fs() is None:
-            self._set_units(UNITS_FRAMES)
-        else:
-            self._apply_x_units()
+        selected = combo_x_units(self.cmb_units)
+        if selected == UNITS_SECONDS and self._fs() is None:
+            selected = UNITS_FRAMES
+        fill_x_units_combo(self.cmb_units, self._fs(), selected)
+        self._apply_x_units()
         self.reload_list(load_form=True)
         self.refresh_raster()
 
@@ -330,7 +334,7 @@ class HeatmapEditorWindow(QDialog):
         return fs if np.isfinite(fs) and fs > 0 else None
 
     def _seconds_mode(self) -> bool:
-        return self.cmb_units.currentText() == UNITS_SECONDS and self._fs() is not None
+        return combo_x_units(self.cmb_units) == UNITS_SECONDS and self._fs() is not None
 
     def _apply_x_units(self) -> None:
         """Rescale only the tick labels; plot data stays in frame coordinates."""
@@ -343,15 +347,11 @@ class HeatmapEditorWindow(QDialog):
             plot.setLabel("bottom", label)
 
     def _set_units(self, units: str) -> None:
-        idx = self.cmb_units.findText(units)
-        if idx >= 0:
-            self.cmb_units.blockSignals(True)
-            self.cmb_units.setCurrentIndex(idx)
-            self.cmb_units.blockSignals(False)
+        fill_x_units_combo(self.cmb_units, self._fs(), units)
         self._apply_x_units()
 
     def _on_units_changed(self) -> None:
-        if self.cmb_units.currentText() == UNITS_SECONDS and self._fs() is None:
+        if combo_x_units(self.cmb_units) == UNITS_SECONDS and self._fs() is None:
             QMessageBox.information(
                 self,
                 "Seconds unavailable",
@@ -360,7 +360,7 @@ class HeatmapEditorWindow(QDialog):
             )
             self._set_units(UNITS_FRAMES)
             return
-        save_settings({"heatmap_x_units": self.cmb_units.currentText()})
+        save_settings({"heatmap_x_units": combo_x_units(self.cmb_units)})
         self._apply_x_units()
         self._rebuild_ranges_ui()
 
@@ -594,7 +594,11 @@ class HeatmapEditorWindow(QDialog):
         doc = self._doc()
         if doc is None:
             return []
-        rows = rois_for_raster(doc["rois"], self.main._overlay_filter())
+        rows = rois_for_raster(
+            doc["rois"],
+            self.main._overlay_filter(),
+            active_roi_id=self.main.active_roi_id,
+        )
         return apply_raster_sort(rows, active_sort_run(doc))
 
     def refresh_raster(self) -> None:
@@ -629,14 +633,10 @@ class HeatmapEditorWindow(QDialog):
         rgb = colorize_raster(
             matrix, lut, highlight_row=highlight_row, highlight_lut=highlight_lut
         )
-        shape = (int(rgb.shape[0]), int(rgb.shape[1]))
-        # Only re-fit the view when the raster geometry changes, so selecting a
-        # row or ROI keeps whatever zoom the user was working at.
-        self.raster_view.setImage(
-            rgb,
-            autoLevels=False,
-            levels=(0, 255),
-            autoRange=shape != self._raster_shape,
+        from s2p_trace_curation.gui.main_window import keep_image_zoom
+
+        shape = keep_image_zoom(
+            self.raster_view, rgb, prev_shape=self._raster_shape
         )
         self._raster_shape = shape
         self.lbl_raster_info.setText(f"{len(rows)} row(s) — {field}")
@@ -735,7 +735,11 @@ class HeatmapEditorWindow(QDialog):
         Lx = int(doc["meta"]["Lx"])
         rgba = np.zeros((Ly, Lx, 4), dtype=np.uint8)
         active = int(self.main.active_roi_id)
-        for row in iter_visible_rois(doc["rois"], self.main._overlay_filter()):
+        for row in iter_visible_rois(
+            doc["rois"],
+            self.main._overlay_filter(),
+            active_roi_id=self.main.active_roi_id,
+        ):
             ys, xs = thick_outline_mask(
                 Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=1
             )

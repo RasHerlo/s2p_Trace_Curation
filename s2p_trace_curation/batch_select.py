@@ -48,6 +48,7 @@ def rois_in_lasso(
     overlay_filter: OverlayFilter,
     *,
     min_fraction: float = 0.5,
+    active_roi_id: int | None = None,
 ) -> list[int]:
     """
     Return roi_ids (visible under filter) with > ``min_fraction`` of pixels inside
@@ -59,7 +60,7 @@ def rois_in_lasso(
     # Use > 0.5 as agreed ("more than 50%")
     thr = float(min_fraction)
     selected: list[int] = []
-    for row in iter_visible_rois(rois, overlay_filter):
+    for row in iter_visible_rois(rois, overlay_filter, active_roi_id):
         frac = roi_fraction_inside(row["roi"]["ypix"], row["roi"]["xpix"], poly)
         if frac > thr:
             selected.append(int(row["roi_id"]))

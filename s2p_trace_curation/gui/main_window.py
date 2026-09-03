@@ -64,6 +64,7 @@ from s2p_trace_curation.annotations import (
 from s2p_trace_curation.batch_select import mean_traces_for_rois, rois_in_lasso
 from s2p_trace_curation.curation import (
     append_roi,
+    compensation_fneu_offset,
     empty_roi_draft,
     ensure_meanimge,
     next_roi_id,
@@ -71,12 +72,20 @@ from s2p_trace_curation.curation import (
     reextract_after_mask_edit,
     reset_roi_from_suite2p,
     save_curation,
+    scaled_fneu,
+    set_compensation_fneu_offset,
     set_compensation_x,
 )
 from s2p_trace_curation.gui.analysis_dialog import AnalysisToolsWindow
 from s2p_trace_curation.gui.annotation_dialog import AnnotationEditorWindow
 from s2p_trace_curation.gui.heatmap_dialog import HeatmapEditorWindow
 from s2p_trace_curation.gui.trace_processing_dialog import TraceProcessingWindow
+from s2p_trace_curation.gui.x_units import (
+    UNITS_FRAMES,
+    UNITS_SECONDS,
+    combo_x_units,
+    fill_x_units_combo,
+)
 from s2p_trace_curation.gui.colormaps import (
     LUT_NAMES,
     apply_lut,
@@ -154,6 +163,8 @@ _MIN_WINDOW_W = 960
 _MIN_WINDOW_H = 700
 
 FILTER_LABELS = {
+    "none": "None",
+    "current": "Current",
     "noncell": "non-selected (iscell=0)",
     "cell": "selected (iscell=1)",
     "both": "both",
@@ -162,10 +173,10 @@ FILTER_LABELS = {
 # Analysis cursor colors (dotted)
 C_COLORS = ["#ff8c00", "#da70d6", "#7fffd4", "#ffa07a"]
 C0_COLOR = "#ffff66"  # solid movie cursor
-UNITS_FRAMES = "frames"
-UNITS_SECONDS = "seconds"
 
 _NUDGE_FRAC = 0.05  # fraction of visible span per axis-arrow click
+# Extra left-axis width so Y nudge buttons sit left of the tick labels.
+_TRACE_LEFT_AXIS_WIDTH = 80
 
 # Rows of trace_widget, and how much height one may claim when expanded alone
 _TRACE_ROWS = {"f": 0, "comp": 1, "bleach": 2}
@@ -228,6 +239,35 @@ def image_view_box(image_view: pg.ImageView) -> Any:
     if isinstance(view, pg.PlotItem):
         return view.getViewBox()
     return view
+
+
+def keep_image_zoom(
+    image_view: pg.ImageView,
+    rgb: np.ndarray,
+    *,
+    prev_shape: tuple[int, int] | None = None,
+    force_range: bool = False,
+) -> tuple[int, int]:
+    """setImage RGB without resetting pan/zoom unless time width is new.
+
+    Row-count changes (Show ROIs) keep the current X range and fit Y to the
+    new height. First paint or an explicit force_range still auto-ranges.
+    """
+    shape = (int(rgb.shape[0]), int(rgb.shape[1]))
+    vb = image_view_box(image_view)
+    prev_range = vb.viewRange() if prev_shape is not None else None
+    time_changed = prev_shape is None or int(prev_shape[1]) != shape[1]
+    do_range = force_range or time_changed
+    image_view.setImage(
+        rgb, autoLevels=False, levels=(0, 255), autoRange=do_range
+    )
+    if prev_range is not None and not do_range:
+        if int(prev_shape[0]) == shape[0]:  # type: ignore[index]
+            y_range = prev_range[1]
+        else:
+            y_range = (-0.5, float(shape[0]) - 0.5)
+        vb.setRange(xRange=prev_range[0], yRange=y_range, padding=0)
+    return shape
 
 
 class ClickableImageView(pg.ImageView):
@@ -495,7 +535,9 @@ class MainWindow(QMainWindow):
             or self._batch_mode
         ):
             return
-        if self._raster_mode and self._raster_row_ids:
+        if self._overlay_is_view_only():
+            ids = self._nav_roi_ids()
+        elif self._raster_mode and self._raster_row_ids:
             ids = self._raster_row_ids
         else:
             ids = self._filtered_roi_ids()
@@ -582,6 +624,7 @@ class MainWindow(QMainWindow):
             plot.setMouseEnabled(x=True, y=True)
             plot.showGrid(x=True, y=False, alpha=0.2)
             plot.hideButtons()
+            plot.getAxis("left").setWidth(_TRACE_LEFT_AXIS_WIDTH)
             vb = plot.getViewBox()
             vb.setMouseMode(pg.ViewBox.PanMode)
             vb.sigResized.connect(self._reposition_scale_nudges)
@@ -778,7 +821,13 @@ class MainWindow(QMainWindow):
         self.cmb_overlay = QComboBox()
         for key, label in FILTER_LABELS.items():
             self.cmb_overlay.addItem(label, key)
-        self.cmb_overlay.setCurrentIndex(2)
+        self.cmb_overlay.setToolTip(
+            "None: no outlines. Current: only the selected ROI. "
+            "Other entries filter by iscell."
+        )
+        idx_both = self.cmb_overlay.findData("both")
+        if idx_both >= 0:
+            self.cmb_overlay.setCurrentIndex(idx_both)
         fov_form.addRow("Image", self.cmb_fov_src)
         fov_form.addRow("LUT", self.cmb_fov_lut)
         fov_form.addRow("Lower", self.spin_fov_lo)
@@ -832,10 +881,21 @@ class MainWindow(QMainWindow):
         self.spin_x.setSingleStep(0.05)
         self.spin_x.setDecimals(3)
         self.spin_x.setValue(1.0)
+        self.spin_x.setToolTip("Neuropil coefficient: trace_comp = F − x·(Fneu + offset)")
+        self.spin_fneu_offset = QDoubleSpinBox()
+        self.spin_fneu_offset.setRange(-1e6, 1e6)
+        self.spin_fneu_offset.setSingleStep(1.0)
+        self.spin_fneu_offset.setDecimals(2)
+        self.spin_fneu_offset.setValue(0.0)
+        self.spin_fneu_offset.setToolTip(
+            "Added to Fneu before scaling. trace_comp = F − x·(Fneu + offset). "
+            "Default 0."
+        )
         roi_form.addRow("ROI #", roi_nav)
         roi_form.addRow("Mode", mode_row)
         roi_form.addRow(self.chk_iscell)
         roi_form.addRow("x (F−x·Fneu)", self.spin_x)
+        roi_form.addRow("Fneu offset", self.spin_fneu_offset)
         layout.addWidget(roi)
 
         raster = QGroupBox("Raster Tools")
@@ -863,6 +923,7 @@ class MainWindow(QMainWindow):
             self.cmb_raster_show.addItem(label, key)
         self.cmb_raster_show.setCurrentIndex(self.cmb_overlay.currentIndex())
         self.cmb_raster_show.setEnabled(False)
+        self.cmb_raster_show.setToolTip(self.cmb_overlay.toolTip())
 
         self.cmb_raster_sort = QComboBox()
         self.cmb_raster_sort.setEnabled(False)
@@ -906,17 +967,16 @@ class MainWindow(QMainWindow):
         raster_mode_row.addStretch(1)
 
         self.cmb_raster_units = QComboBox()
-        self.cmb_raster_units.addItems([UNITS_FRAMES, UNITS_SECONDS])
+        fill_x_units_combo(
+            self.cmb_raster_units,
+            None,
+            load_settings().get("heatmap_x_units"),
+        )
         self.cmb_raster_units.setEnabled(False)
         self.cmb_raster_units.setToolTip(
             "Tick labels on the raster and the trace below it. Seconds needs "
             "the frame rate (meta 'fs' from ops.npy); data stay in frames."
         )
-        idx_units = self.cmb_raster_units.findText(
-            str(load_settings().get("heatmap_x_units") or UNITS_FRAMES)
-        )
-        if idx_units >= 0:
-            self.cmb_raster_units.setCurrentIndex(idx_units)
 
         self.btn_rebuild_tc_norm = QPushButton("Rebuild tc_norm")
         self.btn_rebuild_tc_norm.setEnabled(False)
@@ -966,6 +1026,7 @@ class MainWindow(QMainWindow):
         self.btn_roi_down.clicked.connect(lambda: self._roi_step(-1))
         self.chk_iscell.toggled.connect(self._on_iscell_toggled)
         self.spin_x.valueChanged.connect(self._on_x_changed)
+        self.spin_fneu_offset.valueChanged.connect(self._on_fneu_offset_changed)
         self.slider_mode.valueChanged.connect(self._on_mode_slider)
         self.slider_raster_on.valueChanged.connect(self._on_raster_mode_slider)
         self.cmb_raster_show.currentIndexChanged.connect(self._on_overlay_combo)
@@ -1000,6 +1061,9 @@ class MainWindow(QMainWindow):
         zoom_form.addRow("LUT", self.cmb_w3_lut)
         zoom_form.addRow("Lower", self.spin_w3_lo)
         zoom_form.addRow("Upper", self.spin_w3_hi)
+        self.chk_w3_show_roi = QCheckBox("Show ROI")
+        self.chk_w3_show_roi.setChecked(True)
+        zoom_form.addRow(self.chk_w3_show_roi)
         layout.addWidget(zoom)
 
         actions = QGroupBox("Mask tools")
@@ -1215,6 +1279,7 @@ class MainWindow(QMainWindow):
         self.cmb_w3_lut.currentIndexChanged.connect(self._refresh_w3_and_thumbs)
         self.spin_w3_lo.valueChanged.connect(self._refresh_w3_and_thumbs)
         self.spin_w3_hi.valueChanged.connect(self._refresh_w3_and_thumbs)
+        self.chk_w3_show_roi.toggled.connect(self._refresh_w3_and_thumbs)
         return panel
 
     def _apply_saved_settings(self) -> None:
@@ -1252,10 +1317,11 @@ class MainWindow(QMainWindow):
                 idx = self.cmb_w3_lut.findText(str(lut))
                 if idx >= 0:
                     self.cmb_w3_lut.setCurrentIndex(idx)
-            units = str(s.get("heatmap_x_units") or UNITS_FRAMES)
-            idx_u = self.cmb_raster_units.findText(units)
-            if idx_u >= 0:
-                self.cmb_raster_units.setCurrentIndex(idx_u)
+            fill_x_units_combo(
+                self.cmb_raster_units,
+                self._fs(),
+                s.get("heatmap_x_units") or UNITS_FRAMES,
+            )
         finally:
             self._updating = False
         self._apply_raster_x_units()
@@ -1529,6 +1595,7 @@ class MainWindow(QMainWindow):
         self.btn_roi_down.setEnabled(single_ok)
         self.chk_iscell.setEnabled(not active and not self._batch_mode)
         self.spin_x.setEnabled(single_ok)
+        self.spin_fneu_offset.setEnabled(single_ok)
         self.slider_mode.setEnabled(
             not active and self.doc is not None and not self._raster_mode
         )
@@ -1849,10 +1916,36 @@ class MainWindow(QMainWindow):
     def _overlay_filter(self) -> OverlayFilter:
         return self.cmb_overlay.currentData()  # type: ignore[return-value]
 
+    def _overlay_is_view_only(self) -> bool:
+        return self._overlay_filter() in ("none", "current")
+
+    def _overlay_active_id(self) -> int | None:
+        if (
+            self._mask_edit_kind == "add"
+            and self._add_mask_draft is not None
+        ):
+            return int(self._add_mask_draft["roi_id"])
+        return int(self.active_roi_id) if self.doc is not None else None
+
     def _filtered_roi_ids(self) -> list[int]:
         if self.doc is None:
             return []
-        return [int(r["roi_id"]) for r in rois_for_raster(self.doc["rois"], self._overlay_filter())]
+        return [
+            int(r["roi_id"])
+            for r in rois_for_raster(
+                self.doc["rois"],
+                self._overlay_filter(),
+                active_roi_id=self._overlay_active_id(),
+            )
+        ]
+
+    def _nav_roi_ids(self) -> list[int]:
+        """ROI ids the spinner / arrows can land on."""
+        if self.doc is None:
+            return []
+        if self._overlay_is_view_only():
+            return [int(r["roi_id"]) for r in self.doc["rois"]]
+        return self._filtered_roi_ids()
 
     def _on_overlay_combo(self) -> None:
         if self._updating:
@@ -1880,7 +1973,9 @@ class MainWindow(QMainWindow):
         """If the active ROI is hidden by Show ROIs, jump to the nearest visible one."""
         if self.doc is None or self._mask_edit_active or self._batch_mode:
             return False
-        ids = self._filtered_roi_ids()
+        if self._overlay_is_view_only():
+            return False
+        ids = self._nav_roi_ids()
         if not ids:
             return False
         if self.active_roi_id in ids:
@@ -1893,7 +1988,7 @@ class MainWindow(QMainWindow):
     def _on_roi_spin(self, value: int) -> None:
         if self._updating or self.doc is None or self._mask_edit_active or self._batch_mode:
             return
-        ids = self._filtered_roi_ids()
+        ids = self._nav_roi_ids()
         if value in ids or not ids:
             self._select_roi(value)
             return
@@ -1927,6 +2022,7 @@ class MainWindow(QMainWindow):
         self.spin_roi.setValue(self.active_roi_id)
         self.chk_iscell.setChecked(bool(row["iscell"]))
         self.spin_x.setValue(float(row["compensation"]["x"]))
+        self.spin_fneu_offset.setValue(compensation_fneu_offset(row))
         self._updating = False
         self._refresh_all()
         if self._trace_proc_window is not None:
@@ -1964,7 +2060,13 @@ class MainWindow(QMainWindow):
 
         if self._mask_edit_active:
             return
-        hits = rois_at_pixel(self.doc["rois"], y, x, self._overlay_filter())
+        hits = rois_at_pixel(
+            self.doc["rois"],
+            y,
+            x,
+            self._overlay_filter(),
+            active_roi_id=self._overlay_active_id(),
+        )
         if hits:
             self._select_roi(int(hits[0]["roi_id"]))
 
@@ -1993,6 +2095,7 @@ class MainWindow(QMainWindow):
             )
             self._updating = True
             self.spin_x.setValue(1.0)
+            self.spin_fneu_offset.setValue(0.0)
             self.chk_iscell.setChecked(True)
             self._updating = False
             self._refresh_all()
@@ -2006,6 +2109,7 @@ class MainWindow(QMainWindow):
         self.btn_roi_up.setEnabled(single)
         self.btn_roi_down.setEnabled(single)
         self.spin_x.setEnabled(single)
+        self.spin_fneu_offset.setEnabled(single)
         self.btn_modify.setEnabled(single and self.doc is not None)
         self.btn_add_mask.setEnabled(single and self.doc is not None)
         self.chk_iscell.setEnabled(not self._mask_edit_active and self.doc is not None)
@@ -2026,7 +2130,11 @@ class MainWindow(QMainWindow):
         if not self._batch_mode or self.doc is None:
             return
         ids = rois_in_lasso(
-            self.doc["rois"], points_yx, self._overlay_filter(), min_fraction=0.5
+            self.doc["rois"],
+            points_yx,
+            self._overlay_filter(),
+            min_fraction=0.5,
+            active_roi_id=self._overlay_active_id(),
         )
         self._batch_roi_ids = ids
         # Snap all selected ROIs to iscell=True (default on)
@@ -2037,6 +2145,7 @@ class MainWindow(QMainWindow):
         self._updating = True
         self.chk_iscell.setChecked(True)
         self.spin_x.setValue(1.0)
+        self.spin_fneu_offset.setValue(0.0)
         self._updating = False
         self._refresh_all()
         self._refresh_analysis_stale_ui()
@@ -2076,6 +2185,14 @@ class MainWindow(QMainWindow):
         self._mark_tc_norm_stale()
         self._refresh_traces(autoscale=True)
 
+    def _on_fneu_offset_changed(self, value: float) -> None:
+        if self._updating or self.doc is None or self._batch_mode:
+            return
+        set_compensation_fneu_offset(self._row(), float(value))
+        self.dirty = True
+        self._mark_tc_norm_stale()
+        self._refresh_traces(autoscale=True)
+
     def _set_raster_controls_enabled(self, enabled: bool) -> None:
         self.slider_raster_on.setEnabled(enabled and not self._mask_edit_active)
         self.cmb_raster_show.setEnabled(enabled)
@@ -2104,10 +2221,7 @@ class MainWindow(QMainWindow):
         return fs if np.isfinite(fs) and fs > 0 else None
 
     def _raster_seconds_mode(self) -> bool:
-        return (
-            self.cmb_raster_units.currentText() == UNITS_SECONDS
-            and self._fs() is not None
-        )
+        return combo_x_units(self.cmb_raster_units) == UNITS_SECONDS and self._fs() is not None
 
     def _apply_raster_x_units(self) -> None:
         """Rescale raster/trace tick labels only; data stay in frames."""
@@ -2120,18 +2234,16 @@ class MainWindow(QMainWindow):
             plot.setLabel("bottom", label)
 
     def _sync_raster_units_combo(self) -> None:
-        if self.cmb_raster_units.currentText() == UNITS_SECONDS and self._fs() is None:
-            idx = self.cmb_raster_units.findText(UNITS_FRAMES)
-            self._updating = True
-            if idx >= 0:
-                self.cmb_raster_units.setCurrentIndex(idx)
-            self._updating = False
+        selected = combo_x_units(self.cmb_raster_units)
+        if selected == UNITS_SECONDS and self._fs() is None:
+            selected = UNITS_FRAMES
+        fill_x_units_combo(self.cmb_raster_units, self._fs(), selected)
         self._apply_raster_x_units()
 
     def _on_raster_units_changed(self) -> None:
         if self._updating:
             return
-        if self.cmb_raster_units.currentText() == UNITS_SECONDS and self._fs() is None:
+        if combo_x_units(self.cmb_raster_units) == UNITS_SECONDS and self._fs() is None:
             QMessageBox.information(
                 self,
                 "Seconds unavailable",
@@ -2140,7 +2252,7 @@ class MainWindow(QMainWindow):
             )
             self._sync_raster_units_combo()
             return
-        save_settings({"heatmap_x_units": self.cmb_raster_units.currentText()})
+        save_settings({"heatmap_x_units": combo_x_units(self.cmb_raster_units)})
         self._apply_raster_x_units()
 
     def _refresh_analysis_stale_ui(self) -> None:
@@ -2512,7 +2624,11 @@ class MainWindow(QMainWindow):
             self.dirty = True
             self._tc_norm_stale = True
             self._update_rebuild_button()
-        rows = rois_for_raster(self.doc["rois"], self._overlay_filter())
+        rows = rois_for_raster(
+            self.doc["rois"],
+            self._overlay_filter(),
+            active_roi_id=self._overlay_active_id(),
+        )
         run = active_sort_run(self.doc)
         rows = apply_raster_sort(rows, run)
         self._raster_row_ids = [int(r["roi_id"]) for r in rows]
@@ -2536,15 +2652,15 @@ class MainWindow(QMainWindow):
         rgb = colorize_raster(
             matrix, lut, highlight_row=highlight_row, highlight_lut=highlight_lut
         )
-        shape = (rgb.shape[0], rgb.shape[1])
-        vb = self.raster_view.getView()
-        prev_range = vb.viewRange() if self._raster_last_shape is not None else None
-        do_range = auto_range or self._raster_last_shape != shape
-        self.raster_view.setImage(
-            rgb, autoLevels=False, levels=(0, 255), autoRange=do_range
+        shape = keep_image_zoom(
+            self.raster_view,
+            rgb,
+            prev_shape=self._raster_last_shape,
+            force_range=auto_range,
         )
-        if not do_range and prev_range is not None:
-            vb.setRange(xRange=prev_range[0], yRange=prev_range[1], padding=0)
+        do_range = auto_range or self._raster_last_shape is None or (
+            self._raster_last_shape[1] != shape[1]
+        )
         self._raster_last_shape = shape
         self._clear_raster_boxes()
         filt = self._overlay_filter()
@@ -2731,8 +2847,13 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _set_display_rgb(view: pg.ImageView, rgb: np.ndarray) -> None:
-        """Show pre-composited RGB uint8 without ImageView re-applying levels."""
-        view.setImage(rgb, autoLevels=False, levels=(0, 255))
+        """Show pre-composited RGB uint8 without ImageView re-applying levels or zoom."""
+        img_item = view.getImageItem()
+        old = getattr(img_item, "image", None)
+        prev_shape: tuple[int, int] | None = None
+        if old is not None and getattr(old, "ndim", 0) >= 2:
+            prev_shape = (int(old.shape[0]), int(old.shape[1]))
+        keep_image_zoom(view, rgb, prev_shape=prev_shape)
 
     def _refresh_fov(self) -> None:
         if self.doc is None:
@@ -2858,7 +2979,16 @@ class MainWindow(QMainWindow):
             return
         y0, x0, side, row = self._zoom_geometry()
         self._w3_y0, self._w3_x0, self._w3_side = y0, x0, side
-        zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
+        zoom = zoom_masks_rgba(
+            rgb,
+            y0,
+            x0,
+            side,
+            row,
+            Ly,
+            Lx,
+            show_roi=self.chk_w3_show_roi.isChecked(),
+        )
         self._set_display_rgb(self.w3.image_view, zoom)  # type: ignore[attr-defined]
         src = self.cmb_w3_src.currentText()
         title = f"ROI zoom (W3) — {src}"
@@ -2915,15 +3045,17 @@ class MainWindow(QMainWindow):
         else:
             row = self._row()
             F = np.asarray(row["roi"]["F"], dtype=np.float64)
-            Fneu = np.asarray(row["neuropil"]["Fneu"], dtype=np.float64)
-            x = float(row["compensation"]["x"])
             comp = np.asarray(row["compensation"]["trace_comp"], dtype=np.float64)
             xs = np.arange(F.shape[0])
             self.curve_f.setData(xs, self._display_trace(F))
-            self.curve_fneu.setData(xs, self._display_trace(x * Fneu))
+            self.curve_fneu.setData(xs, self._display_trace(scaled_fneu(row)))
             self.curve_comp.setData(xs, self._display_trace(comp))
             self.plot_f.setTitle("F / Fneu")
-            self.plot_comp.setTitle("trace_comp = F − x·Fneu")
+            off = compensation_fneu_offset(row)
+            if abs(off) > 1e-12:
+                self.plot_comp.setTitle("trace_comp = F − x·(Fneu + offset)")
+            else:
+                self.plot_comp.setTitle("trace_comp = F − x·Fneu")
             nframes = int(self.doc["meta"]["nframes"])
             mask = led_shutter_nan_mask(self.doc, nframes)
             sm = row.get(TRACE_FIELD_SM)
@@ -3209,12 +3341,12 @@ class MainWindow(QMainWindow):
             wh = y_hi.widget()
             if wh is not None:
                 wh.adjustSize()
-                y_hi.setPos(lr.center().x() - wh.width() / 2, lr.top())
+                y_hi.setPos(lr.left(), lr.top())
             y_lo = nudges["y_lo"]
             wl = y_lo.widget()
             if wl is not None:
                 wl.adjustSize()
-                y_lo.setPos(lr.center().x() - wl.width() / 2, lr.bottom() - wl.height())
+                y_lo.setPos(lr.left(), lr.bottom() - wl.height())
             if not plot.getAxis("bottom").isVisible():
                 continue
             x_lo = nudges["x_lo"]
@@ -3432,7 +3564,16 @@ class MainWindow(QMainWindow):
             rgb = self._w3_rgb(frame_index=fi if movie else None)
             if rgb is None:
                 continue
-            zoom = zoom_masks_rgba(rgb, y0, x0, side, row, Ly, Lx)
+            zoom = zoom_masks_rgba(
+                rgb,
+                y0,
+                x0,
+                side,
+                row,
+                Ly,
+                Lx,
+                show_roi=self.chk_w3_show_roi.isChecked(),
+            )
             self._set_display_rgb(view, zoom)
             if movie:
                 lab.setText(f"C{i + 1} — frame {fi}")

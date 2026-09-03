@@ -32,8 +32,50 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def compute_trace_comp(F: np.ndarray, Fneu: np.ndarray, x: float) -> np.ndarray:
-    return np.asarray(F, dtype=np.float64) - float(x) * np.asarray(Fneu, dtype=np.float64)
+def compute_trace_comp(
+    F: np.ndarray,
+    Fneu: np.ndarray,
+    x: float,
+    fneu_offset: float = 0.0,
+) -> np.ndarray:
+    """``F - x * (Fneu + fneu_offset)``. Offset is 0 unless the user shifts Fneu."""
+    return np.asarray(F, dtype=np.float64) - float(x) * (
+        np.asarray(Fneu, dtype=np.float64) + float(fneu_offset)
+    )
+
+
+def compensation_fneu_offset(row: dict[str, Any]) -> float:
+    try:
+        off = float((row.get("compensation") or {}).get("fneu_offset", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return off if np.isfinite(off) else 0.0
+
+
+def ensure_compensation(row: dict[str, Any]) -> dict[str, Any]:
+    comp = row.setdefault("compensation", {})
+    if "x" not in comp:
+        comp["x"] = 1.0
+    if "fneu_offset" not in comp:
+        comp["fneu_offset"] = 0.0
+    return comp
+
+
+def refresh_trace_comp(row: dict[str, Any]) -> None:
+    comp = ensure_compensation(row)
+    comp["trace_comp"] = compute_trace_comp(
+        row["roi"]["F"],
+        row["neuropil"]["Fneu"],
+        float(comp["x"]),
+        compensation_fneu_offset(row),
+    )
+
+
+def scaled_fneu(row: dict[str, Any]) -> np.ndarray:
+    """Fneu as plotted / subtracted: ``x * (Fneu + offset)``."""
+    x = float(ensure_compensation(row)["x"])
+    Fneu = np.asarray(row["neuropil"]["Fneu"], dtype=np.float64)
+    return x * (Fneu + compensation_fneu_offset(row))
 
 
 def pickle_path(suite2p_dir: Path) -> Path:
@@ -84,7 +126,8 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
                 },
                 "compensation": {
                     "x": x,
-                    "trace_comp": compute_trace_comp(Fi, Fni, x),
+                    "fneu_offset": 0.0,
+                    "trace_comp": compute_trace_comp(Fi, Fni, x, 0.0),
                 },
             }
         )
@@ -176,6 +219,8 @@ def load_curation(path: Path) -> dict[str, Any]:
     ensure_analyses(doc)
     ensure_heatmaps(doc)
     ensure_trace_processing(doc)
+    for row in doc["rois"]:
+        ensure_compensation(row)
     refresh_stale_flags(doc)
     sid = str((doc.get("meta") or {}).get("raster_sort") or PICKLE_SORT_ID)
     if sid != PICKLE_SORT_ID and get_analysis(doc, sid) is None:
@@ -235,7 +280,8 @@ def reset_roi_from_suite2p(
         },
         "compensation": {
             "x": x,
-            "trace_comp": compute_trace_comp(Fi, Fni, x),
+            "fneu_offset": 0.0,
+            "trace_comp": compute_trace_comp(Fi, Fni, x, 0.0),
         },
     }
 
@@ -255,10 +301,13 @@ def reset_roi_from_suite2p(
 
 
 def set_compensation_x(row: dict[str, Any], x: float) -> None:
-    row["compensation"]["x"] = float(x)
-    row["compensation"]["trace_comp"] = compute_trace_comp(
-        row["roi"]["F"], row["neuropil"]["Fneu"], x
-    )
+    ensure_compensation(row)["x"] = float(x)
+    refresh_trace_comp(row)
+
+
+def set_compensation_fneu_offset(row: dict[str, Any], fneu_offset: float) -> None:
+    ensure_compensation(row)["fneu_offset"] = float(fneu_offset)
+    refresh_trace_comp(row)
 
 
 def next_roi_id(doc: dict[str, Any]) -> int:
@@ -287,7 +336,7 @@ def empty_roi_draft(roi_id: int, nframes: int) -> dict[str, Any]:
             "Fneu": z.copy(),
             "modified": True,
         },
-        "compensation": {"x": 1.0, "trace_comp": z.copy()},
+        "compensation": {"x": 1.0, "fneu_offset": 0.0, "trace_comp": z.copy()},
     }
 
 
@@ -335,4 +384,4 @@ def reextract_after_mask_edit(
                 progress_total=total,
             )
             row["neuropil"]["modified"] = True
-    set_compensation_x(row, float(row["compensation"]["x"]))
+    refresh_trace_comp(row)

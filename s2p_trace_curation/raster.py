@@ -10,7 +10,7 @@ from s2p_trace_curation.annotations import (
     ensure_annotations,
     nan_mask_from_annotations,
 )
-from s2p_trace_curation.gui.overlays import OverlayFilter
+from s2p_trace_curation.gui.overlays import OverlayFilter, roi_passes_overlay
 
 
 def led_shutter_ann_ids(doc: dict[str, Any]) -> list[int]:
@@ -119,17 +119,15 @@ def rebuild_all_tc_norm(doc: dict[str, Any]) -> None:
 
 
 def rois_for_raster(
-    rois: list[dict[str, Any]], overlay_filter: OverlayFilter
+    rois: list[dict[str, Any]],
+    overlay_filter: OverlayFilter,
+    active_roi_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Visible ROIs for the raster, in pickle (doc / roi_id) order."""
     out: list[dict[str, Any]] = []
     for row in rois:
-        iscell = bool(row.get("iscell", True))
-        if overlay_filter == "cell" and not iscell:
-            continue
-        if overlay_filter == "noncell" and iscell:
-            continue
-        out.append(row)
+        if roi_passes_overlay(row, overlay_filter, active_roi_id):
+            out.append(row)
     return out
 
 

@@ -6,24 +6,39 @@ from typing import Any, Literal
 
 import numpy as np
 
-OverlayFilter = Literal["noncell", "cell", "both"]
+OverlayFilter = Literal["none", "current", "noncell", "cell", "both"]
 
 
 def roi_area(row: dict[str, Any]) -> int:
     return int(len(row["roi"]["ypix"]))
 
 
+def roi_passes_overlay(
+    row: dict[str, Any],
+    overlay_filter: OverlayFilter,
+    active_roi_id: int | None = None,
+) -> bool:
+    if overlay_filter == "none":
+        return False
+    if overlay_filter == "current":
+        return active_roi_id is not None and int(row["roi_id"]) == int(active_roi_id)
+    iscell = bool(row.get("iscell", True))
+    if overlay_filter == "cell" and not iscell:
+        return False
+    if overlay_filter == "noncell" and iscell:
+        return False
+    return True
+
+
 def iter_visible_rois(
-    rois: list[dict[str, Any]], overlay_filter: OverlayFilter
+    rois: list[dict[str, Any]],
+    overlay_filter: OverlayFilter,
+    active_roi_id: int | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for row in rois:
-        iscell = bool(row.get("iscell", True))
-        if overlay_filter == "cell" and not iscell:
-            continue
-        if overlay_filter == "noncell" and iscell:
-            continue
-        out.append(row)
+        if roi_passes_overlay(row, overlay_filter, active_roi_id):
+            out.append(row)
     # Large first so smallest ends on top when painted sequentially
     out.sort(key=roi_area, reverse=True)
     return out
@@ -42,7 +57,7 @@ def build_fov_overlay(
     overlay = np.zeros((Ly, Lx, 4), dtype=np.uint8)
     a = int(round(alpha * 255))
     batch = batch_roi_ids or set()
-    for row in iter_visible_rois(rois, overlay_filter):
+    for row in iter_visible_rois(rois, overlay_filter, active_roi_id):
         y = np.asarray(row["roi"]["ypix"], dtype=np.int64)
         x = np.asarray(row["roi"]["xpix"], dtype=np.int64)
         if y.size == 0:
@@ -67,9 +82,10 @@ def rois_at_pixel(
     y: int,
     x: int,
     overlay_filter: OverlayFilter,
+    active_roi_id: int | None = None,
 ) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
-    for row in iter_visible_rois(rois, overlay_filter):
+    for row in iter_visible_rois(rois, overlay_filter, active_roi_id):
         ypix = np.asarray(row["roi"]["ypix"], dtype=np.int64)
         xpix = np.asarray(row["roi"]["xpix"], dtype=np.int64)
         if np.any((ypix == y) & (xpix == x)):
@@ -137,8 +153,9 @@ def zoom_masks_rgba(
     Lx: int,
     roi_alpha: float = 0.35,
     neu_alpha: float = 0.35,
+    show_roi: bool = True,
 ) -> np.ndarray:
-    """Crop RGB frame and blend ROI (red) + neuropil (yellow-orange)."""
+    """Crop RGB frame and blend neuropil (yellow-orange) + optional ROI (red)."""
     crop = frame_rgb[y0 : y0 + side, x0 : x0 + side].copy()
     overlay = np.zeros((side, side, 4), dtype=np.uint8)
 
@@ -154,12 +171,13 @@ def zoom_masks_rgba(
         overlay[cy[m], cx[m], 2] = 0
         overlay[cy[m], cx[m], 3] = int(round(neu_alpha * 255))
 
-    ypix = np.asarray(row["roi"]["ypix"], dtype=np.int64) - y0
-    xpix = np.asarray(row["roi"]["xpix"], dtype=np.int64) - x0
-    m = (ypix >= 0) & (ypix < side) & (xpix >= 0) & (xpix < side)
-    overlay[ypix[m], xpix[m], 0] = 255
-    overlay[ypix[m], xpix[m], 1] = 0
-    overlay[ypix[m], xpix[m], 2] = 0
-    overlay[ypix[m], xpix[m], 3] = int(round(roi_alpha * 255))
+    if show_roi:
+        ypix = np.asarray(row["roi"]["ypix"], dtype=np.int64) - y0
+        xpix = np.asarray(row["roi"]["xpix"], dtype=np.int64) - x0
+        m = (ypix >= 0) & (ypix < side) & (xpix >= 0) & (xpix < side)
+        overlay[ypix[m], xpix[m], 0] = 255
+        overlay[ypix[m], xpix[m], 1] = 0
+        overlay[ypix[m], xpix[m], 2] = 0
+        overlay[ypix[m], xpix[m], 3] = int(round(roi_alpha * 255))
 
     return compose_rgb_with_overlay(crop, overlay)
