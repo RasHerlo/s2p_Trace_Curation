@@ -135,8 +135,7 @@ class AnnotationEditorWindow(QDialog):
         self.cmb_prop.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.cmb_prop.setToolTip(
             "Pick LED+Shutter, AirPuff, PMT-noise, or BG-motion, or type a "
-            "custom name. Selecting LED+Shutter, PMT-noise, or BG-motion rows "
-            "NaNs that span on the traces."
+            "custom name. Selecting an LED+Shutter row NaNs that span on the traces."
         )
         self.cmb_prop.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
@@ -263,8 +262,7 @@ class AnnotationEditorWindow(QDialog):
             "Drag a range edge on the trace, or type Start/End and Add. "
             "Save writes each draft range as its own annotation, except PMT-noise "
             "and BG-motion, which become one annotation holding every interval. "
-            "Select LED+Shutter, PMT-noise, or BG-motion rows to NaN those spans "
-            "on the main traces."
+            "Select an LED+Shutter row to NaN those spans on the main traces."
         )
         hint.setWordWrap(True)
         right_layout.addWidget(hint)

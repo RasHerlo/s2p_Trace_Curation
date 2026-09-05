@@ -575,7 +575,7 @@ Selecting a saved run restores the line at `cut_threshold`; dragging it or typin
 
 ## Session 2026-08-28 — Annotation Tools window
 
-The right-panel Start/End + `Start ← C0` / `End ← C0` flow is gone. **Annotation Tools** opens a non-modal window like Edit HeatMaps: mirrored raster + trace, draggable draft ranges (Add / Remove / type Start–End), then **Save**. Each draft range becomes its own pickle annotation (`property`, inclusive `start_frame`/`end_frame`) so LED+Shutter / PMT-noise selection still NaNs one span at a time. **Kind** is one editable dropdown: presets `LED+Shutter`, `AirPuff`, `PMT-noise`, or a custom name you type (stored as `property`). Click a saved list row to load it for editing; extra ranges on Save are appended. C0 remains the movie cursor only. A **Trace** dropdown (`tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc`) chooses which stored field fills the raster and the selected-ROI plot used to place ranges; it is local to this window and does not rewrite Raster Tools. **X units** (frames / seconds) matches Edit HeatMaps: tick labels only, ranges stay in frames, persisted as `heatmap_x_units`. Click a raster row to switch ROI.
+The right-panel Start/End + `Start ← C0` / `End ← C0` flow is gone. **Annotation Tools** opens a non-modal window like Edit HeatMaps: mirrored raster + trace, draggable draft ranges (Add / Remove / type Start–End), then **Save**. Each draft range becomes its own pickle annotation (`property`, inclusive `start_frame`/`end_frame`) so LED+Shutter selection still NaNs one span at a time. **Kind** is one editable dropdown: presets `LED+Shutter`, `AirPuff`, `PMT-noise`, or a custom name you type (stored as `property`). Click a saved list row to load it for editing; extra ranges on Save are appended. C0 remains the movie cursor only. A **Trace** dropdown (`tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc`) chooses which stored field fills the raster and the selected-ROI plot used to place ranges; it is local to this window and does not rewrite Raster Tools. **X units** (frames / seconds) matches Edit HeatMaps: tick labels only, ranges stay in frames, persisted as `heatmap_x_units`. Click a raster row to switch ROI.
 
 ---
 
@@ -660,7 +660,7 @@ Background-measurement ROIs live in `doc["bg_rois"]` (schema **7**). They are no
 Raw `F` plus `F_sm` / `F_sm_bc` from the same session SG / bleach params (LED+Shutter excised). **No min–max** — amplitude stays usable for motion thresholding. Rebuild of cell `tc_norm_sm` / `tc_norm_sm_bc` also refreshes the BG copies.
 
 ### Annotation Tools
-Kind **BG-motion** (`nan_display=True`, same as PMT-noise / LED+Shutter). **BG ROIs** next to File… opens a picker: overlay selected traces (F / sm / sm_bc) and threshold the **sum of raw F**. Save writes one annotation holding every interval. The usual kind checkbox shows the spans on traces.
+Kind **BG-motion** (`nan_display=False`, same as PMT-noise). Only **LED+Shutter** NaNs traces. **BG ROIs** next to File… opens a picker: overlay selected traces (F / sm / sm_bc) and threshold the **sum of raw F**. Save writes one annotation holding every interval. The usual kind checkbox shows the spans on traces.
 
 ### Record (illustrative)
 

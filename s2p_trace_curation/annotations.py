@@ -32,13 +32,13 @@ PROPERTY_SPEC: dict[str, dict[str, Any]] = {
     },
     PROPERTY_PMT_NOISE: {
         "color": "#d35400",
-        "nan_display": True,
-        "description": "PMT noise epoch; NaN for display when selected",
+        "nan_display": False,
+        "description": "PMT noise epoch marker; spans only, no display NaNs",
     },
     PROPERTY_BG_MOTION: {
         "color": "#16a085",
-        "nan_display": True,
-        "description": "Background-evaluated motion; NaN for display when selected",
+        "nan_display": False,
+        "description": "Background-evaluated motion marker; spans only, no display NaNs",
     },
 }
 
