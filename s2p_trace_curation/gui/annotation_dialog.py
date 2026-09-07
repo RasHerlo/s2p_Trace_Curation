@@ -239,7 +239,8 @@ class AnnotationEditorWindow(QDialog):
         self.btn_bg_rois = QPushButton("BG ROIs")
         self.btn_bg_rois.setEnabled(False)
         self.btn_bg_rois.setToolTip(
-            "BG-motion only: plot saved BG-ROI traces and threshold their raw sum."
+            "BG-motion only: plot saved BG-ROI traces and threshold their "
+            "sum (raw, smoothed, or bleach-corrected)."
         )
         self.btn_bg_rois.clicked.connect(self._on_bg_rois)
         self.btn_save = QPushButton("Save")
@@ -450,7 +451,8 @@ class AnnotationEditorWindow(QDialog):
             )
         else:
             self.btn_bg_rois.setToolTip(
-                "BG-motion only: plot saved BG-ROI traces and threshold their raw sum."
+                "BG-motion only: plot saved BG-ROI traces and threshold their "
+                "sum (raw, smoothed, or bleach-corrected)."
             )
 
     def _pmt_start_dir(self) -> str:
@@ -573,18 +575,19 @@ class AnnotationEditorWindow(QDialog):
         self._ranges = ranges
         ids = dlg.selected_ids()
         id_txt = ",".join(str(i) for i in ids)
-        self._draft_label = f"BG {id_txt} sumF>{dlg.threshold():g}"
+        field = dlg.threshold_field()
+        self._draft_label = f"BG {id_txt} sum {field}>{dlg.threshold():g}"
         self._rebuild_ranges_ui()
         self._refresh_guide_spans()
         n_frames = sum(b - a + 1 for a, b in self._ranges)
         self.lbl_status.setText(
             f"{len(self._ranges)} interval(s) from {len(ids)} BG ROI(s) "
-            f"({n_frames} frame(s), sum F > {dlg.threshold():g}) — "
+            f"({n_frames} frame(s), sum {field} > {dlg.threshold():g}) — "
             "Save writes them as one BG-motion annotation"
         )
         self.main.statusBar().showMessage(
             f"BG-motion: {len(self._ranges)} interval(s) above "
-            f"sum F {dlg.threshold():g}"
+            f"sum {field} {dlg.threshold():g}"
         )
 
     def _set_draft_form(self) -> None:

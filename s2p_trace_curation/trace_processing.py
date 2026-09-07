@@ -548,6 +548,50 @@ def rebuild_all_tc_norm_sm_bc(doc: dict[str, Any]) -> None:
     rebuild_all_bg_processed(doc)
 
 
+def rebuild_row_traces(doc: dict[str, Any], row: dict[str, Any]) -> None:
+    """Recompute ``trace_comp``, ``tc_norm``, ``tc_norm_sm``, and ``tc_norm_sm_bc`` for one ROI.
+
+    Uses the session SG / bleach settings. Does not rewrite all-ROI fingerprints
+    or BG-ROI copies.
+    """
+    from s2p_trace_curation.curation import refresh_trace_comp
+
+    refresh_trace_comp(row)
+    tp = ensure_trace_processing(doc)
+    nframes = int(doc["meta"]["nframes"])
+    mask = led_shutter_nan_mask(doc, nframes)
+    row[TRACE_FIELD_NORM] = compute_tc_norm(row["compensation"]["trace_comp"], mask)
+    row[TRACE_FIELD_SM] = compute_tc_norm_sm_from_comp(
+        row["compensation"]["trace_comp"],
+        mask,
+        int(tp["sg_window"]),
+        int(tp["sg_poly"]),
+    )
+    sm = row.get(TRACE_FIELD_SM)
+    if sm is None:
+        row[TRACE_FIELD_SM_BC] = None
+        row["bleach"] = {"fit_params": None, "conservative": True}
+        return
+    sm_arr = np.asarray(sm, dtype=np.float64)
+    enabled = bool(tp["bleach_enabled"])
+    tau_mode = str(tp.get("tau_mode") or TAU_SHARED)
+    tau1 = tau2 = None
+    if enabled and tau_mode == TAU_SHARED:
+        stored1, stored2 = tp.get("shared_tau1"), tp.get("shared_tau2")
+        if stored1 is not None and stored2 is not None:
+            tau1, tau2 = float(stored1), float(stored2)
+    freeze = tau_mode == TAU_SHARED and tau1 is not None and tau2 is not None
+    params, cons = _fit_row_bleach(
+        sm_arr,
+        mask,
+        conservative=not enabled,
+        tau1=tau1 if (enabled and freeze) else None,
+        tau2=tau2 if (enabled and freeze) else None,
+    )
+    row["bleach"] = {"fit_params": list(params), "conservative": bool(cons)}
+    row[TRACE_FIELD_SM_BC] = apply_bleach_to_sm(sm_arr, mask, params)
+
+
 def row_trace_field(row: dict[str, Any], field: str, nframes: int) -> np.ndarray:
     tr = row.get(field)
     out = np.full(int(nframes), np.nan, dtype=np.float64)

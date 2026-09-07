@@ -143,6 +143,7 @@ from s2p_trace_curation.trace_processing import (
     raster_trace_field,
     rebuild_all_tc_norm_sm,
     rebuild_all_tc_norm_sm_bc,
+    rebuild_row_traces,
     set_raster_trace_field,
     stack_trace_field,
     tc_norm_sm_bc_is_stale,
@@ -287,7 +288,7 @@ def keep_image_zoom(
         if int(prev_shape[0]) == shape[0]:  # type: ignore[index]
             y_range = prev_range[1]
         else:
-            y_range = (-0.5, float(shape[0]) - 0.5)
+            y_range = (0.0, float(shape[0]))
         vb.setRange(xRange=prev_range[0], yRange=y_range, padding=0)
     return shape
 
@@ -449,6 +450,7 @@ class MainWindow(QMainWindow):
         self._raster_batch = False
         self._inspect_focus: str | None = None
         self._tc_norm_stale = False
+        self._roi_traces_pending: set[int] = set()
         self._raster_row_ids: list[int] = []
         self._raster_box_items: list[Any] = []
         self._raster_last_shape: tuple[int, int] | None = None
@@ -945,6 +947,14 @@ class MainWindow(QMainWindow):
 
         roi_form.addRow("x (F−x·Fneu)", self.spin_x)
         roi_form.addRow("Fneu offset", self.spin_fneu_offset)
+        self.btn_rebuild_roi_traces = QPushButton("Rebuild traces")
+        self.btn_rebuild_roi_traces.setEnabled(False)
+        self.btn_rebuild_roi_traces.setToolTip(
+            "Recompute this ROI's trace_comp, tc_norm, tc_norm_sm, and "
+            "tc_norm_sm_bc from the current x and Fneu offset."
+        )
+        self.btn_rebuild_roi_traces.clicked.connect(self._rebuild_active_roi_traces)
+        roi_form.addRow(self.btn_rebuild_roi_traces)
         roi_form.addRow("Trace X units", self.cmb_trace_units)
         layout.addWidget(roi)
 
@@ -1245,8 +1255,9 @@ class MainWindow(QMainWindow):
         ann_display_layout.setSpacing(2)
         show_lbl = QLabel("Show on traces")
         show_lbl.setToolTip(
-            "Which annotation kinds to draw on the inspect traces and the "
-            "raster trace (single and batch). Uncheck to hide that kind."
+            "Which annotation kinds to draw on the inspect traces, the "
+            "raster heatmap, and the raster trace (single and batch). "
+            "Uncheck to hide that kind."
         )
         ann_display_layout.addWidget(show_lbl)
         self.ann_display_checks_host = QWidget()
@@ -1504,6 +1515,7 @@ class MainWindow(QMainWindow):
         self.slider_raster_batch.setValue(0)
         self._updating = False
         self.lower_stack.setCurrentIndex(0)
+        self._roi_traces_pending.clear()
         self._select_roi(0, force=True)
         self._ensure_active_roi_in_filter()
         self._persist_ui_settings(suite2p_dir=suite2p_dir)
@@ -2277,6 +2289,7 @@ class MainWindow(QMainWindow):
             self._heatmap_window.on_active_roi_changed()
         if self._annotation_window is not None:
             self._annotation_window.on_active_roi_changed()
+        self._update_rebuild_roi_traces_button()
 
     def _on_fov_click(self, y: int, x: int) -> None:
         if self.doc is None or self._batch_mode:
@@ -2377,6 +2390,7 @@ class MainWindow(QMainWindow):
             self.spin_w3_hi,
         ):
             w.setEnabled(not self._batch_mode)
+        self._update_rebuild_roi_traces_button()
 
     def _on_fov_lasso(self, points_yx: list[tuple[float, float]]) -> None:
         if not self._batch_mode or self.doc is None:
@@ -2434,6 +2448,7 @@ class MainWindow(QMainWindow):
             return
         set_compensation_x(self._row(), float(value))
         self.dirty = True
+        self._roi_traces_pending.add(int(self.active_roi_id))
         self._mark_tc_norm_stale()
         self._refresh_traces(autoscale=True)
 
@@ -2442,6 +2457,7 @@ class MainWindow(QMainWindow):
             return
         set_compensation_fneu_offset(self._row(), float(value))
         self.dirty = True
+        self._roi_traces_pending.add(int(self.active_roi_id))
         self._mark_tc_norm_stale()
         self._refresh_traces(autoscale=True)
 
@@ -2462,6 +2478,33 @@ class MainWindow(QMainWindow):
     def _update_rebuild_button(self) -> None:
         self.btn_rebuild_tc_norm.setEnabled(
             self.doc is not None and self._tc_norm_stale
+        )
+        self._update_rebuild_roi_traces_button()
+
+    def _update_rebuild_roi_traces_button(self) -> None:
+        single = (
+            self.doc is not None
+            and not self._batch_mode
+            and not self._mask_edit_active
+        )
+        pending = int(self.active_roi_id) in self._roi_traces_pending
+        self.btn_rebuild_roi_traces.setEnabled(bool(single and pending))
+
+    def _rebuild_active_roi_traces(self) -> None:
+        if self.doc is None or self._batch_mode or self._mask_edit_active:
+            return
+        row = self._row()
+        rebuild_row_traces(self.doc, row)
+        self._roi_traces_pending.discard(int(row["roi_id"]))
+        self.dirty = True
+        self._update_rebuild_roi_traces_button()
+        self._refresh_analysis_stale_ui()
+        self._refresh_traces(autoscale=True)
+        if self._raster_mode:
+            self._refresh_raster(auto_range=False)
+        self._notify_heatmap_raster()
+        self.statusBar().showMessage(
+            f"Rebuilt traces for ROI {int(row['roi_id'])}"
         )
 
     def _fs(self) -> float | None:
@@ -2972,7 +3015,9 @@ class MainWindow(QMainWindow):
         if w <= 0 or h <= 0:
             return
         rect = QtWidgets.QGraphicsRectItem(x, y, w, h)
-        rect.setPen(pg.mkPen(color, width=width))
+        pen = pg.mkPen(color, width=width)
+        pen.setCosmetic(True)
+        rect.setPen(pen)
         rect.setBrush(QtGui.QBrush(Qt.BrushStyle.NoBrush))
         rect.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         rect.setZValue(z)
@@ -3026,33 +3071,34 @@ class MainWindow(QMainWindow):
         )
         self._raster_last_shape = shape
         self._clear_raster_boxes()
+        # Raster ImageItem occupies [0, nframes] × [0, n_rows]; row i is [i, i+1].
         filt = self._overlay_filter()
         if rows and (run is not None or filt != "both"):
             if run is not None:
                 self._add_raster_group_box(
-                    -0.5, -0.5, float(nframes), float(n_sel), "#e74c3c"
+                    0.0, 0.0, float(nframes), float(n_sel), "#e74c3c"
                 )
                 self._add_raster_group_box(
-                    -0.5,
-                    float(n_sel) - 0.5,
+                    0.0,
+                    float(n_sel),
                     float(nframes),
                     float(n_unsel),
                     "#3498db",
                 )
             elif filt == "cell":
                 self._add_raster_group_box(
-                    -0.5, -0.5, float(nframes), float(len(rows)), "#e74c3c"
+                    0.0, 0.0, float(nframes), float(len(rows)), "#e74c3c"
                 )
             elif filt == "noncell":
                 self._add_raster_group_box(
-                    -0.5, -0.5, float(nframes), float(len(rows)), "#3498db"
+                    0.0, 0.0, float(nframes), float(len(rows)), "#3498db"
                 )
         if rows and self.chk_raster_clusters.isChecked():
             cluster_of = roi_cluster_index(active_hac_clusters(self.doc))
             for start, end, cid in cluster_row_spans(self._raster_row_ids, cluster_of):
                 self._add_raster_group_box(
-                    -0.5,
-                    float(start) - 0.5,
+                    0.0,
+                    float(start),
                     float(nframes),
                     float(end - start + 1),
                     hac_cluster_hex(cid),
@@ -3864,13 +3910,19 @@ class MainWindow(QMainWindow):
             self._fit_trace_y(key)
         self.statusBar().showMessage("Trace scales reset to autoscale")
 
-    def _clear_ann_spans(self) -> None:
-        plots = (
+    def _ann_span_plots(self) -> tuple[Any, ...]:
+        plots: list[Any] = [
             self.plot_f,
             self.plot_comp,
             self.plot_bleach,
             self.plot_raster_trace,
-        )
+        ]
+        if hasattr(self, "raster_view"):
+            plots.append(self.raster_view.getView())
+        return tuple(plots)
+
+    def _clear_ann_spans(self) -> None:
+        plots = self._ann_span_plots()
         for item in self._ann_span_items:
             try:
                 item.scene().removeItem(item)  # type: ignore[union-attr]
@@ -3886,12 +3938,10 @@ class MainWindow(QMainWindow):
         self._clear_ann_spans()
         if self.doc is None:
             return
-        plots = (
-            self.plot_f,
-            self.plot_comp,
-            self.plot_bleach,
-            self.plot_raster_trace,
-        )
+        plots = self._ann_span_plots()
+        raster_view = None
+        if hasattr(self, "raster_view"):
+            raster_view = self.raster_view.getView()
         for ann in ensure_annotations(self.doc):
             prop = str(ann["property"])
             if not self._ann_kind_visible(prop):
@@ -3913,7 +3963,8 @@ class MainWindow(QMainWindow):
                     )
                     region.setHoverBrush(fill)
                     region.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                    region.setZValue(-10)
+                    # Above the heatmap / cluster boxes, below C0.
+                    region.setZValue(15 if plot is raster_view else -10)
                     plot.addItem(region)
                     self._ann_span_items.append(region)
 

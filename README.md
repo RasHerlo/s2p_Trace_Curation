@@ -38,7 +38,8 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
 
 - Load / save versioned `trc_curation.pkl`
 - FOV, movie, ROI zoom, traces, 4 analysis cursors + movie cursor
-- Per-ROI `x` compensation and `iscell` toggle
+- Per-ROI `x` / Fneu offset, **Rebuild traces** (`trace_comp` / `tc_norm` /
+  `tc_norm_sm` / `tc_norm_sm_bc` for the current ROI), and `iscell` toggle
 - Trace Processing: Savitzky–Golay (`tc_norm_sm`) and bleach (`tc_norm_sm_bc`)
 - Named heatmaps from `data.bin`: set frame ranges on the raster trace, map is
   AUC inside / AUC outside (Edit HeatMaps → Image dropdowns)
@@ -53,4 +54,5 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
   BG-motion) or a name you type; pick a trace type; frames or seconds; click
   a saved row to edit; draw ranges, then Save
 - Mask Tools: Add BG ROI (unweighted background traces, stored apart from
-  cells); Annotation Tools can threshold their sum as BG-motion
+  cells); Annotation Tools can threshold their sum as BG-motion (raw,
+  smoothed, or bleach-corrected)

@@ -154,7 +154,9 @@ def sum_bg_traces(
         return np.full(int(nframes), np.nan, dtype=np.float64)
     stacked = np.vstack([bg_trace(r, field, nframes) for r in rows])
     with np.errstate(all="ignore"):
-        return np.nansum(stacked, axis=0)
+        out = np.nansum(stacked, axis=0)
+    out[~np.isfinite(stacked).any(axis=0)] = np.nan
+    return out
 
 
 def compute_bg_sm(

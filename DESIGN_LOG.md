@@ -569,6 +569,7 @@ Selecting a saved run restores the line at `cut_threshold`; dragging it or typin
 - **Inspect panel space (2026-08-27):** draggable W1–W3 / lower-panel divider; click a plot title (or a zoom) to expand one of the four items
 - **Annotation Tools window (2026-08-28):** heatmap-style ranges; C0 copy buttons removed from the right panel
 - **BG ROIs + BG-motion (schema 7, 2026-09-03):** Add BG ROI; Show BG-ROIs on W1; threshold summed raw BG traces as BG-motion
+- **Per-ROI Rebuild traces (2026-09-07):** ROI Tools button above Trace X units; rebuilds this ROI's `trace_comp` / `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` after x or Fneu-offset edits
 - Run: `python -m s2p_trace_curation`
 
 ---
@@ -660,7 +661,7 @@ Background-measurement ROIs live in `doc["bg_rois"]` (schema **7**). They are no
 Raw `F` plus `F_sm` / `F_sm_bc` from the same session SG / bleach params (LED+Shutter excised). **No min–max** — amplitude stays usable for motion thresholding. Rebuild of cell `tc_norm_sm` / `tc_norm_sm_bc` also refreshes the BG copies.
 
 ### Annotation Tools
-Kind **BG-motion** (`nan_display=False`, same as PMT-noise). Only **LED+Shutter** NaNs traces. **BG ROIs** next to File… opens a picker: overlay selected traces (F / sm / sm_bc) and threshold the **sum of raw F**. Save writes one annotation holding every interval. The usual kind checkbox shows the spans on traces.
+Kind **BG-motion** (`nan_display=False`, same as PMT-noise). Only **LED+Shutter** NaNs traces. **BG ROIs** next to File… opens a picker: overlay selected traces and threshold their **sum**. **Show** (`F` / `F_sm` / `F_sm_bc`) chooses both the overlay and the summed co-activity; default remains raw `F`. `F_sm_bc` is the bleach-corrected cut (session SG / bleach params, no min–max). Save writes one annotation holding every interval. The usual kind checkbox shows the spans on traces.
 
 ### Record (illustrative)
 
@@ -704,4 +705,11 @@ Palette `HAC_CLUSTER_COLORS` is shared by the similarity-matrix squares, raster 
 
 Both default off and persist in user settings (`raster_add_clusters`, `show_clusters`).
 
+---
+
+## Session 2026-09-07 — Per-ROI Rebuild traces
+
+Changing `x` or Fneu offset already refreshes live `trace_comp` in the inspect plots, but stored `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` wait for the session-wide Raster / Trace Processing rebuilds.
+
+**Rebuild traces** sits in ROI Tools above Trace X units. It is enabled only for the current ROI after that ROI's `x` or Fneu offset is edited (disabled in batch / mask-edit). Clicking it recomputes this ROI only: `trace_comp`, `tc_norm` (LED+Shutter NaNs), `tc_norm_sm` (session SG), and `tc_norm_sm_bc` (session bleach: shared τ if stored, otherwise an independent fit; does not rewrite shared τ or all-ROI fingerprints, and does not rebuild BG ROIs). Raster **Rebuild tc_norm** remains the session-wide `tc_norm` path.
 

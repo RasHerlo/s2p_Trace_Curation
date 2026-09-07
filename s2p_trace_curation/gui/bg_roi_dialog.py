@@ -1,4 +1,4 @@
-"""Pick BG-ROI traces and threshold their raw sum into BG-motion ranges."""
+"""Pick BG-ROI traces and threshold their sum into BG-motion ranges."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ BAND_BRUSH = (22, 160, 133, 55)
 
 
 class BgRoiThresholdDialog(QDialog):
-    """Overlay selected BG traces; threshold the sum of their raw F."""
+    """Overlay selected BG traces; threshold the sum of the chosen field."""
 
     def __init__(
         self,
@@ -111,10 +111,10 @@ class BgRoiThresholdDialog(QDialog):
         for field in BG_TRACE_FIELDS:
             self.cmb_field.addItem(BG_TRACE_LABELS[field], field)
         self.cmb_field.setToolTip(
-            "Overlay field for the upper plot. Thresholding always uses "
-            "the sum of the raw BG-ROI traces."
+            "Field for the overlay and for the summed co-activity that is "
+            "thresholded. Use BG-ROI sm_bc to cut on bleach-corrected traces."
         )
-        self.cmb_field.currentIndexChanged.connect(self._redraw_traces)
+        self.cmb_field.currentIndexChanged.connect(self._on_field_changed)
         pick.addWidget(self.cmb_field)
         layout.addLayout(pick)
 
@@ -124,9 +124,9 @@ class BgRoiThresholdDialog(QDialog):
         self.plot_traces.addLegend(offset=(10, 10))
         layout.addWidget(self.plot_traces, stretch=1)
 
-        self.plot_sum = pg.PlotWidget(title="Sum of raw BG-ROI traces")
+        self.plot_sum = pg.PlotWidget(title="Sum of BG-ROI traces")
         self.plot_sum.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_sum.setLabel("left", "sum F")
+        self.plot_sum.setLabel("left", "sum")
         self.plot_sum.getAxis("bottom").enableAutoSIPrefix(False)
         self.band = pg.PlotDataItem(
             pen=None, brush=QtGui.QColor(*BAND_BRUSH), fillLevel=0.0
@@ -151,7 +151,8 @@ class BgRoiThresholdDialog(QDialog):
         self.spin_threshold.setRange(-1e12, 1e12)
         self.spin_threshold.setKeyboardTracking(False)
         self.spin_threshold.setToolTip(
-            "Frames where the raw sum is strictly above this value become BG-motion."
+            "Frames where the summed traces (the Show field) are strictly "
+            "above this value become BG-motion."
         )
         controls.addWidget(self.spin_threshold)
 
@@ -217,6 +218,9 @@ class BgRoiThresholdDialog(QDialog):
             if chk.isChecked()
         ]
 
+    def threshold_field(self) -> str:
+        return self._display_field()
+
     # ----------------------------------------------------------------- private
     def _selected_rows(self) -> list[dict[str, Any]]:
         want = set(self.selected_ids())
@@ -227,7 +231,7 @@ class BgRoiThresholdDialog(QDialog):
         return str(data) if data else BG_FIELD_F
 
     def _sum_values(self) -> np.ndarray:
-        return sum_bg_traces(self._selected_rows(), BG_FIELD_F, self._nframes)
+        return sum_bg_traces(self._selected_rows(), self._display_field(), self._nframes)
 
     def _apply_x_units(self) -> None:
         scale = 1.0 / self._fs if self._seconds and self._fs else 1.0
@@ -240,6 +244,13 @@ class BgRoiThresholdDialog(QDialog):
         self._redraw_traces()
         self._refresh_sum_curve()
         self._recompute()
+
+    def _on_field_changed(self) -> None:
+        if self._updating:
+            return
+        self._redraw_traces()
+        self._refresh_sum_curve()
+        self._set_threshold(suggest_threshold(self._sum_values()))
 
     def _redraw_traces(self) -> None:
         for curve in self._trace_curves:
@@ -278,7 +289,10 @@ class BgRoiThresholdDialog(QDialog):
             self.spin_threshold.setSingleStep(span / 100.0 if span else 0.01)
             self.spin_threshold.setDecimals(self._decimals_for(span))
         n = len(self._selected_rows())
-        self.plot_sum.setTitle(f"Sum of raw BG-ROI traces  ({n})")
+        field = self._display_field()
+        label = BG_TRACE_LABELS[field]
+        self.plot_sum.setTitle(f"Sum of BG-ROI traces — {label}  ({n})")
+        self.plot_sum.setLabel("left", f"sum {field}")
 
     @staticmethod
     def _decimals_for(span: float) -> int:
