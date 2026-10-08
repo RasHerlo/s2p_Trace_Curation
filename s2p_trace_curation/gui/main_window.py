@@ -77,12 +77,16 @@ from s2p_trace_curation.bg_rois import (
     BG_ROI_RGB,
     append_bg_roi,
     apply_processed_to_bg,
+    bg_draft_from_saved,
     bg_roi_from_draft,
+    bg_rois_at_pixel,
     build_bg_overlay,
     empty_bg_paint_draft,
     ensure_bg_rois,
+    get_bg_roi,
     next_bg_id,
     reextract_bg_draft,
+    replace_bg_roi,
 )
 from s2p_trace_curation.curation import (
     append_roi,
@@ -460,7 +464,9 @@ class MainWindow(QMainWindow):
         self._annotation_window: AnnotationEditorWindow | None = None
 
         self._mask_edit_active = False
-        self._mask_edit_kind: str | None = None  # "modify" | "add" | "add_bg"
+        self._mask_edit_kind: str | None = None  # "modify" | "add" | "add_bg" | "modify_bg"
+        self._active_bg_id: int | None = None
+        self._bg_view: dict[str, Any] | None = None
         self._add_mask_draft: dict[str, Any] | None = None
         self._add_mask_center: tuple[float, float] | None = None
         self._add_mask_side = 64
@@ -862,7 +868,8 @@ class MainWindow(QMainWindow):
         self.chk_show_bg_rois.setChecked(False)
         self.chk_show_bg_rois.setEnabled(False)
         self.chk_show_bg_rois.setToolTip(
-            "Overlay background measurement ROIs on W1. Off by default."
+            "Overlay background measurement ROIs on W1. "
+            "Click one to center W3 on it, then Modify BG ROI to edit it."
         )
         self.chk_show_clusters = QCheckBox("Show Clusters")
         self.chk_show_clusters.setChecked(False)
@@ -1504,6 +1511,8 @@ class MainWindow(QMainWindow):
         self.spin_roi.setMaximum(max(0, n - 1))
         self.spin_roi.setValue(0)
         self.active_roi_id = 0
+        self._active_bg_id = None
+        self._bg_view = None
         self._init_display_levels()
         self._init_cursors()
         self._updating = False
@@ -1709,9 +1718,42 @@ class MainWindow(QMainWindow):
     def _is_add_bg(self) -> bool:
         return self._mask_edit_kind == "add_bg"
 
+    def _is_bg_paint(self) -> bool:
+        """New or existing BG ROI is the mask being painted."""
+        return self._mask_edit_kind in ("add_bg", "modify_bg")
+
+    def _showing_bg(self) -> bool:
+        """W3 / traces should show a BG ROI rather than the active cell."""
+        if self._mask_edit_kind in ("modify", "add"):
+            return False
+        if self._is_bg_paint():
+            return True
+        return self._active_bg_id is not None and self._bg_view is not None
+
+    def _w3_subject(self) -> dict[str, Any]:
+        """Row whose pixels fill W3: a BG draft/view, or the active cell."""
+        if (
+            self._add_mask_draft is not None
+            and self._mask_edit_kind in ("add", "add_bg", "modify_bg")
+        ):
+            return self._add_mask_draft
+        if self._showing_bg() and self._bg_view is not None:
+            return self._bg_view
+        return self._row()
+
+    def _sync_modify_button(self) -> None:
+        if self._active_bg_id is not None and not self._mask_edit_active:
+            self.btn_modify.setText("Modify BG ROI")
+            self.btn_modify.setToolTip(
+                f"Edit BG ROI {self._active_bg_id} in W3, then Apply BG ROI"
+            )
+        else:
+            self.btn_modify.setText("Modify Mask")
+            self.btn_modify.setToolTip("Edit F / Fneu pixels in W3")
+
     def _sync_mask_mode_labels(self) -> None:
         """Fneu tools stay hidden while painting a BG ROI."""
-        bg = self._is_add_bg()
+        bg = self._is_bg_paint()
         for mode, rb in self.mask_mode_buttons.items():
             if mode in ("add_fneu", "remove_fneu"):
                 rb.setVisible(not bg)
@@ -1763,7 +1805,7 @@ class MainWindow(QMainWindow):
         self.btn_add_bg.setEnabled(can_start)
         view: PaintImageView = self.w3.image_view  # type: ignore[attr-defined]
         paint_ok = active and (
-            self._mask_edit_kind == "modify"
+            self._mask_edit_kind in ("modify", "modify_bg")
             or (self._is_new_mask() and self._add_mask_center is not None)
         )
         view.paint_enabled = paint_ok
@@ -1787,10 +1829,13 @@ class MainWindow(QMainWindow):
         ):
             w.setVisible(bool(active and is_add))
         self._sync_mask_mode_labels()
+        self._sync_modify_button()
         if active and self._mask_edit_kind == "add":
             self.btn_apply_mask.setText("Save Mask")
         elif active and self._is_add_bg():
             self.btn_apply_mask.setText("Save BG ROI")
+        elif active and self._mask_edit_kind == "modify_bg":
+            self.btn_apply_mask.setText("Apply BG ROI")
         else:
             self.btn_apply_mask.setText("Apply Mask")
 
@@ -1805,6 +1850,9 @@ class MainWindow(QMainWindow):
     def _start_mask_edit(self) -> None:
         if self.doc is None or self._mask_edit_active or self._batch_mode:
             return
+        if self._active_bg_id is not None:
+            self._start_modify_bg()
+            return
         self._mask_edit_kind = "modify"
         self._add_mask_draft = None
         self._add_mask_center = None
@@ -1815,6 +1863,30 @@ class MainWindow(QMainWindow):
         self._set_mask_edit_ui(True)
         self.statusBar().showMessage(
             f"Modify Mask: ROI {self.active_roi_id} — paint in W3, then Apply or Cancel"
+        )
+
+    def _start_modify_bg(self) -> None:
+        if self.doc is None or self._active_bg_id is None:
+            return
+        saved = get_bg_roi(self.doc, self._active_bg_id)
+        if saved is None:
+            self._active_bg_id = None
+            self._bg_view = None
+            self._sync_modify_button()
+            return
+        nframes = int(self.doc["meta"]["nframes"])
+        self._mask_edit_kind = "modify_bg"
+        self._add_mask_draft = bg_draft_from_saved(saved, nframes)
+        self._add_mask_center = None
+        self._mask_edit_snapshot = deepcopy(saved)
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        self._set_mask_edit_ui(True)
+        self._refresh_fov()
+        self._refresh_w3()
+        self.statusBar().showMessage(
+            f"Modify BG ROI {self._active_bg_id} — paint in W3, then Apply BG ROI or Cancel"
         )
 
     def _start_add_mask(self) -> None:
@@ -1830,6 +1902,8 @@ class MainWindow(QMainWindow):
         Lx = int(self.doc["meta"]["Lx"])
         side = median_zoom_side(self.doc["rois"], Ly, Lx)
         nframes = int(self.doc["meta"]["nframes"])
+        self._active_bg_id = None
+        self._bg_view = None
         self._mask_edit_kind = kind
         self._add_mask_center = None
         self._add_mask_side = side
@@ -1888,6 +1962,8 @@ class MainWindow(QMainWindow):
         if self._extracting:
             self._extract_cancel = True
             return
+        was_modify_bg = self._mask_edit_kind == "modify_bg"
+        bg_id = self._active_bg_id
         if self._mask_edit_kind == "modify" and self._mask_edit_snapshot is not None:
             if self.doc is not None:
                 snap = self._mask_edit_snapshot
@@ -1903,6 +1979,12 @@ class MainWindow(QMainWindow):
         self._mask_roi_changed = False
         self._mask_neu_changed = False
         self._set_mask_edit_ui(False)
+        if was_modify_bg and bg_id is not None and self.doc is not None:
+            saved = get_bg_roi(self.doc, bg_id)
+            if saved is not None:
+                self._bg_view = bg_draft_from_saved(
+                    saved, int(self.doc["meta"]["nframes"])
+                )
         self._refresh_all()
         self.statusBar().showMessage("Mask edit cancelled")
 
@@ -1911,6 +1993,8 @@ class MainWindow(QMainWindow):
             self._save_new_mask()
         elif self._is_add_bg():
             self._save_new_bg_roi()
+        elif self._mask_edit_kind == "modify_bg":
+            self._apply_bg_edit()
         else:
             self._apply_mask_edit()
 
@@ -1933,6 +2017,44 @@ class MainWindow(QMainWindow):
         self._set_mask_edit_ui(False)
         self._refresh_all()
         self.statusBar().showMessage(f"Applied mask edits and saved {path}")
+
+    def _apply_bg_edit(self) -> None:
+        if (
+            not self._mask_edit_active
+            or self._mask_edit_kind != "modify_bg"
+            or self.doc is None
+            or self.suite2p_dir is None
+            or self._add_mask_draft is None
+            or self._active_bg_id is None
+        ):
+            return
+        if self._extracting:
+            return
+        if len(self._add_mask_draft["roi"]["ypix"]) == 0:
+            QMessageBox.warning(
+                self, "Apply BG ROI", "The BG-ROI must be non-empty before saving."
+            )
+            return
+        if self._mask_traces_stale:
+            ok = self._recalculate_traces()
+            if not ok:
+                return
+        bg_id = int(self._active_bg_id)
+        saved = bg_roi_from_draft(self._add_mask_draft, bg_id)
+        replace_bg_roi(self.doc, saved)
+        path = save_curation(self.doc, self.suite2p_dir)
+        self.dirty = False
+        self._mask_edit_snapshot = None
+        self._add_mask_draft = None
+        self._add_mask_center = None
+        self._mask_edit_kind = None
+        self._mask_traces_stale = False
+        self._mask_roi_changed = False
+        self._mask_neu_changed = False
+        self._bg_view = bg_draft_from_saved(saved, int(self.doc["meta"]["nframes"]))
+        self._set_mask_edit_ui(False)
+        self._refresh_all()
+        self.statusBar().showMessage(f"Updated BG ROI {bg_id} and saved {path}")
 
     def _save_new_mask(self) -> None:
         if (
@@ -2053,7 +2175,7 @@ class MainWindow(QMainWindow):
         neu_changed = bool(self._mask_neu_changed)
         if self._mask_traces_stale and not roi_changed and not neu_changed:
             roi_changed = True
-            neu_changed = not self._is_add_bg()
+            neu_changed = not self._is_bg_paint()
 
         self._extracting = True
         self._extract_cancel = False
@@ -2071,7 +2193,7 @@ class MainWindow(QMainWindow):
                 if step == 1 or step == total or step % 25 == 0:
                     QApplication.processEvents()
 
-            if self._is_add_bg():
+            if self._is_bg_paint():
                 reextract_bg_draft(
                     self._row(),
                     self.suite2p_dir,
@@ -2092,7 +2214,7 @@ class MainWindow(QMainWindow):
             self._mask_roi_changed = False
             self._mask_neu_changed = False
             self.dirty = True
-            if self._mask_edit_kind not in ("add", "add_bg"):
+            if self._mask_edit_kind not in ("add", "add_bg", "modify_bg"):
                 self._mark_tc_norm_stale()
             self._refresh_traces(autoscale=True)
             self.extract_progress.setValue(100)
@@ -2147,7 +2269,7 @@ class MainWindow(QMainWindow):
         if self._mask_edit_mode in ("add_f", "add_fneu"):
             self._mask_roi_changed = True
             self._mask_neu_changed = True
-        if self._is_add_bg():
+        if self._is_bg_paint():
             self._mask_neu_changed = False
         self._mask_traces_stale = True
         self.dirty = True
@@ -2161,8 +2283,8 @@ class MainWindow(QMainWindow):
         assert self.doc is not None
         if (
             roi_id is None
-            and self._is_new_mask()
             and self._add_mask_draft is not None
+            and self._mask_edit_kind in ("add", "add_bg", "modify_bg")
         ):
             return self._add_mask_draft
         rid = self.active_roi_id if roi_id is None else roi_id
@@ -2271,6 +2393,9 @@ class MainWindow(QMainWindow):
             return
         if self._batch_mode and not force:
             return
+        self._active_bg_id = None
+        self._bg_view = None
+        self._sync_modify_button()
         if not force and roi_id == self.active_roi_id and not self._updating:
             # still refresh when forced internals call
             pass
@@ -2290,6 +2415,20 @@ class MainWindow(QMainWindow):
         if self._annotation_window is not None:
             self._annotation_window.on_active_roi_changed()
         self._update_rebuild_roi_traces_button()
+
+    def _select_bg(self, bg_id: int) -> None:
+        if self.doc is None or self._mask_edit_active or self._batch_mode:
+            return
+        row = get_bg_roi(self.doc, bg_id)
+        if row is None:
+            return
+        self._active_bg_id = int(bg_id)
+        self._bg_view = bg_draft_from_saved(row, int(self.doc["meta"]["nframes"]))
+        self._sync_modify_button()
+        self._refresh_all()
+        self.statusBar().showMessage(
+            f"BG ROI {bg_id} — W3 centered. Modify BG ROI to edit it."
+        )
 
     def _on_fov_click(self, y: int, x: int) -> None:
         if self.doc is None or self._batch_mode:
@@ -2324,6 +2463,11 @@ class MainWindow(QMainWindow):
 
         if self._mask_edit_active:
             return
+        if self.chk_show_bg_rois.isChecked():
+            bg_hits = bg_rois_at_pixel(ensure_bg_rois(self.doc), y, x)
+            if bg_hits:
+                self._select_bg(int(bg_hits[0]["bg_id"]))
+                return
         hits = rois_at_pixel(
             self.doc["rois"],
             y,
@@ -3305,18 +3449,23 @@ class MainWindow(QMainWindow):
             cluster_rgb=self._fov_cluster_rgb(),
         )
         composed = compose_rgb_with_overlay(rgb, overlay)
-        show_bg = bool(self.chk_show_bg_rois.isChecked()) or self._is_add_bg()
+        editing_bg = self._mask_edit_kind == "modify_bg"
+        show_bg = (
+            bool(self.chk_show_bg_rois.isChecked())
+            or self._is_add_bg()
+            or editing_bg
+        )
         if show_bg:
-            draft = (
-                self._add_mask_draft
-                if self._is_add_bg() and self._add_mask_draft is not None
-                else None
-            )
+            draft = None
+            if self._add_mask_draft is not None and (self._is_add_bg() or editing_bg):
+                draft = self._add_mask_draft
             bg_ov = build_bg_overlay(
                 int(self.doc["meta"]["Ly"]),
                 int(self.doc["meta"]["Lx"]),
                 ensure_bg_rois(self.doc),
                 draft=draft,
+                active_id=None if editing_bg else self._active_bg_id,
+                hide_id=self._active_bg_id if editing_bg else None,
             )
             composed = compose_rgb_with_overlay(composed, bg_ov)
         if self._is_new_mask() and self._add_mask_center is not None:
@@ -3349,7 +3498,7 @@ class MainWindow(QMainWindow):
         assert self.doc is not None
         meta = self.doc["meta"]
         Ly, Lx = int(meta["Ly"]), int(meta["Lx"])
-        row = self._row()
+        row = self._w3_subject()
         if self._is_new_mask() and self._add_mask_center is not None:
             cy, cx = self._add_mask_center
             y0, x0, side = zoom_square_at(cy, cx, self._add_mask_side, Ly, Lx)
@@ -3384,12 +3533,12 @@ class MainWindow(QMainWindow):
                 if y_out.size:
                     w2[y_out, x_out] = (255, 0, 0)
         else:
-            row = self._row()
+            row = self._w3_subject()
             y_out, x_out = thick_outline_mask(
                 Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=2
             )
             if y_out.size:
-                color = BG_ROI_RGB if self._is_add_bg() else (255, 0, 0)
+                color = BG_ROI_RGB if self._showing_bg() else (255, 0, 0)
                 w2[y_out, x_out] = color
         self._set_display_rgb(self.w2.image_view, w2)  # type: ignore[attr-defined]
         self.w2.setTitle(f"Movie (W2) — frame {t}")  # type: ignore[attr-defined]
@@ -3426,14 +3575,16 @@ class MainWindow(QMainWindow):
             Ly,
             Lx,
             show_roi=self.chk_w3_show_roi.isChecked(),
-            show_neu=not self._is_add_bg(),
-            roi_rgb=BG_ROI_RGB if self._is_add_bg() else (255, 0, 0),
+            show_neu=not self._showing_bg(),
+            roi_rgb=BG_ROI_RGB if self._showing_bg() else (255, 0, 0),
         )
         self._set_display_rgb(self.w3.image_view, zoom)  # type: ignore[attr-defined]
         src = self.cmb_w3_src.currentText()
         title = f"ROI zoom (W3) — {src}"
         if self._w3_source_is_movie():
             title += f" frame {t}"
+        if self._showing_bg() and self._active_bg_id is not None:
+            title += f" — BG {self._active_bg_id}"
         if self._mask_edit_active:
             title += " [editing]"
         self.w3.setTitle(title)  # type: ignore[attr-defined]
@@ -3483,11 +3634,11 @@ class MainWindow(QMainWindow):
                 self.curve_bleach_bc.setData(xs, np.full_like(xs, np.nan, dtype=float))
             self.plot_bleach.setTitle("mean tc_norm_sm / tc_norm_sm_bc — batch")
         else:
-            row = self._row()
+            row = self._w3_subject() if self._showing_bg() else self._row()
             F = np.asarray(row["roi"]["F"], dtype=np.float64)
             xs = np.arange(F.shape[0])
             nan_y = np.full(xs.shape, np.nan, dtype=np.float64)
-            if self._is_add_bg():
+            if self._showing_bg():
                 self.curve_f.setData(xs, self._display_trace(F))
                 self.curve_fneu.setData(xs, nan_y)
                 self.curve_comp.setData(xs, nan_y)

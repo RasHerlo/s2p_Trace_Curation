@@ -24,6 +24,7 @@ from s2p_trace_curation.pmt_noise import (
     ranges_above_threshold,
     suggest_threshold,
 )
+from s2p_trace_curation.raster import led_shutter_nan_mask
 
 Qt = QtCore.Qt
 QCheckBox = QtWidgets.QCheckBox
@@ -69,6 +70,7 @@ class BgRoiThresholdDialog(QDialog):
         self._doc = doc
         self._rows = list(ensure_bg_rois(doc))
         self._nframes = int(doc["meta"]["nframes"])
+        self._led_mask = led_shutter_nan_mask(doc, self._nframes)
         self._fs = fs if (fs and np.isfinite(fs) and fs > 0) else None
         self._seconds = bool(seconds and self._fs)
         self._ranges: list[list[int]] = []
@@ -152,7 +154,8 @@ class BgRoiThresholdDialog(QDialog):
         self.spin_threshold.setKeyboardTracking(False)
         self.spin_threshold.setToolTip(
             "Frames where the summed traces (the Show field) are strictly "
-            "above this value become BG-motion."
+            "above this value become BG-motion. LED+Shutter frames are left "
+            "out of the sum, so they do not set its range or the threshold."
         )
         controls.addWidget(self.spin_threshold)
 
@@ -230,8 +233,17 @@ class BgRoiThresholdDialog(QDialog):
         data = self.cmb_field.currentData()
         return str(data) if data else BG_FIELD_F
 
+    def _without_led(self, values: np.ndarray) -> np.ndarray:
+        """Copy with LED+Shutter frames set to NaN so they cannot set the scale."""
+        out = np.asarray(values, dtype=np.float64).copy()
+        mask = self._led_mask
+        if mask.shape[0] == out.shape[0] and mask.any():
+            out[mask] = np.nan
+        return out
+
     def _sum_values(self) -> np.ndarray:
-        return sum_bg_traces(self._selected_rows(), self._display_field(), self._nframes)
+        raw = sum_bg_traces(self._selected_rows(), self._display_field(), self._nframes)
+        return self._without_led(raw)
 
     def _apply_x_units(self) -> None:
         scale = 1.0 / self._fs if self._seconds and self._fs else 1.0
@@ -265,7 +277,7 @@ class BgRoiThresholdDialog(QDialog):
             color = TRACE_COLORS[i % len(TRACE_COLORS)]
             curve = self.plot_traces.plot(
                 xs,
-                bg_trace(row, field, self._nframes),
+                self._without_led(bg_trace(row, field, self._nframes)),
                 pen=pg.mkPen(color, width=1.2),
                 name=bg_roi_label(row),
                 connect="finite",
@@ -291,7 +303,8 @@ class BgRoiThresholdDialog(QDialog):
         n = len(self._selected_rows())
         field = self._display_field()
         label = BG_TRACE_LABELS[field]
-        self.plot_sum.setTitle(f"Sum of BG-ROI traces — {label}  ({n})")
+        shutter = " — LED+Shutter excluded" if self._led_mask.any() else ""
+        self.plot_sum.setTitle(f"Sum of BG-ROI traces — {label}  ({n}){shutter}")
         self.plot_sum.setLabel("left", f"sum {field}")
 
     @staticmethod

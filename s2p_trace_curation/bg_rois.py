@@ -39,6 +39,7 @@ BG_TRACE_LABELS = {
 
 # W1 / W3 fill — distinct from cell red / active cyan.
 BG_ROI_RGB = (46, 204, 113)
+BG_ROI_RGB_ACTIVE = (186, 255, 201)
 BG_ROI_RGB_DRAFT = (88, 255, 160)
 
 
@@ -113,6 +114,46 @@ def bg_roi_from_draft(draft: dict[str, Any], bg_id: int) -> dict[str, Any]:
 def append_bg_roi(doc: dict[str, Any], row: dict[str, Any]) -> None:
     ensure_bg_rois(doc).append(row)
     doc["bg_rois"].sort(key=lambda r: int(r["bg_id"]))
+
+
+def replace_bg_roi(doc: dict[str, Any], row: dict[str, Any]) -> None:
+    """Replace the saved row with the same ``bg_id``."""
+    want = int(row["bg_id"])
+    rows = ensure_bg_rois(doc)
+    for i, old in enumerate(rows):
+        if int(old["bg_id"]) == want:
+            rows[i] = row
+            return
+    raise KeyError(want)
+
+
+def bg_draft_from_saved(row: dict[str, Any], nframes: int) -> dict[str, Any]:
+    """ROI-shaped copy so W3 and the mask brush can show or edit a saved BG ROI."""
+    draft = empty_bg_paint_draft(nframes)
+    ypix = np.asarray(row["ypix"], dtype=np.int32).copy()
+    xpix = np.asarray(row["xpix"], dtype=np.int32).copy()
+    draft["roi"]["ypix"] = ypix
+    draft["roi"]["xpix"] = xpix
+    draft["roi"]["lam"] = np.ones(ypix.shape[0], dtype=np.float32)
+    draft["roi"]["F"] = np.asarray(row["F"], dtype=np.float64).copy()
+    draft["bg_id"] = int(row["bg_id"])
+    for key in (BG_FIELD_SM, BG_FIELD_SM_BC, "bleach"):
+        if row.get(key) is not None:
+            draft[key] = row[key].copy() if hasattr(row[key], "copy") else row[key]
+    return draft
+
+
+def bg_rois_at_pixel(
+    rows: list[dict[str, Any]], y: int, x: int
+) -> list[dict[str, Any]]:
+    """BG ROIs covering (y, x), smallest first."""
+    hits: list[dict[str, Any]] = []
+    for row in rows:
+        ypix, xpix = bg_pixels(row)
+        if ypix.size and np.any((ypix == int(y)) & (xpix == int(x))):
+            hits.append(row)
+    hits.sort(key=lambda r: int(bg_pixels(r)[0].size))
+    return hits
 
 
 def get_bg_roi(doc: dict[str, Any], bg_id: int) -> dict[str, Any] | None:
@@ -284,22 +325,29 @@ def build_bg_overlay(
     bg_rois: list[dict[str, Any]],
     *,
     draft: dict[str, Any] | None = None,
+    active_id: int | None = None,
+    hide_id: int | None = None,
     alpha: float = 0.40,
 ) -> np.ndarray:
     """RGBA overlay of saved BG ROIs (and an in-progress draft)."""
     overlay = np.zeros((Ly, Lx, 4), dtype=np.uint8)
     a = int(round(alpha * 255))
-    entries: list[tuple[dict[str, Any], tuple[int, int, int]]] = [
-        (row, BG_ROI_RGB) for row in bg_rois
-    ]
+    active_a = int(round(0.62 * 255))
+    entries: list[tuple[dict[str, Any], tuple[int, int, int], int]] = []
+    for row in bg_rois:
+        if hide_id is not None and int(row.get("bg_id", -1)) == int(hide_id):
+            continue
+        selected = active_id is not None and int(row.get("bg_id", -2)) == int(active_id)
+        rgb = BG_ROI_RGB_ACTIVE if selected else BG_ROI_RGB
+        entries.append((row, rgb, active_a if selected else a))
     if draft is not None:
-        entries.append((draft, BG_ROI_RGB_DRAFT))
-    for entry, rgb in entries:
+        entries.append((draft, BG_ROI_RGB_DRAFT, a))
+    for entry, rgb, alpha_u8 in entries:
         y, x = bg_pixels(entry)
         if y.size == 0:
             continue
         overlay[y, x, 0] = rgb[0]
         overlay[y, x, 1] = rgb[1]
         overlay[y, x, 2] = rgb[2]
-        overlay[y, x, 3] = a
+        overlay[y, x, 3] = alpha_u8
     return overlay

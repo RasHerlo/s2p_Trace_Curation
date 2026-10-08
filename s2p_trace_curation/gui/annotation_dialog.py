@@ -13,6 +13,7 @@ from s2p_trace_curation.analyses import active_sort_run, apply_raster_sort
 from s2p_trace_curation.annotations import (
     ANNOTATION_PROPERTIES,
     PROPERTY_BG_MOTION,
+    PROPERTY_LED_SHUTTER,
     PROPERTY_PMT_NOISE,
     SPAN_FILL_ALPHA,
     SPAN_PEN_ALPHA,
@@ -33,6 +34,7 @@ from s2p_trace_curation.annotations import (
     validate_annotation_frames,
 )
 from s2p_trace_curation.bg_rois import ensure_bg_rois
+from s2p_trace_curation.led_shutter import read_shutter_runs
 from s2p_trace_curation.pmt_noise import RMS_COLUMN, read_per_frame_rms
 from s2p_trace_curation.gui.colormaps import (
     colorize_raster,
@@ -232,10 +234,10 @@ class AnnotationEditorWindow(QDialog):
         self.btn_pmt_file = QPushButton("File\u2026")
         self.btn_pmt_file.setEnabled(False)
         self.btn_pmt_file.setToolTip(
-            f"PMT-noise only: load a per_frame.csv and threshold its "
-            f"'{RMS_COLUMN}' column into ranges."
+            "LED+Shutter: load families.json shutter runs. "
+            f"PMT-noise: load a per_frame.csv and threshold its '{RMS_COLUMN}' column."
         )
-        self.btn_pmt_file.clicked.connect(self._on_pmt_file)
+        self.btn_pmt_file.clicked.connect(self._on_kind_file)
         self.btn_bg_rois = QPushButton("BG ROIs")
         self.btn_bg_rois.setEnabled(False)
         self.btn_bg_rois.setToolTip(
@@ -261,6 +263,8 @@ class AnnotationEditorWindow(QDialog):
             "Kind is a preset (LED+Shutter, AirPuff, PMT-noise, BG-motion) or a "
             "name you type. Click a saved row to load it, or New for a draft. "
             "Drag a range edge on the trace, or type Start/End and Add. "
+            "File… loads families.json shutter runs for LED+Shutter, or a "
+            "per_frame.csv for PMT-noise. "
             "Save writes each draft range as its own annotation, except PMT-noise "
             "and BG-motion, which become one annotation holding every interval. "
             "Select an LED+Shutter row to NaN those spans on the main traces."
@@ -436,13 +440,30 @@ class AnnotationEditorWindow(QDialog):
         self._update_kind_buttons()
 
     def _update_kind_buttons(self) -> None:
-        """File… is PMT-noise; BG ROIs is BG-motion (and needs saved BG ROIs)."""
+        """File… is LED+Shutter or PMT-noise; BG ROIs is BG-motion."""
         if not hasattr(self, "btn_pmt_file") or not hasattr(self, "btn_bg_rois"):
             return
         doc = self._doc()
         has = doc is not None
-        kind = self.cmb_prop.currentText()
-        self.btn_pmt_file.setEnabled(has and is_pmt_noise(kind))
+        kind = self._kind_now()
+        self.btn_pmt_file.setEnabled(
+            has and (is_led_shutter(kind) or is_pmt_noise(kind))
+        )
+        if is_led_shutter(kind):
+            self.btn_pmt_file.setToolTip(
+                "LED+Shutter: load a defringe families.json and use its "
+                "shutter runs (start/stop) as ranges."
+            )
+        elif is_pmt_noise(kind):
+            self.btn_pmt_file.setToolTip(
+                f"PMT-noise: load a per_frame.csv and threshold its "
+                f"'{RMS_COLUMN}' column into ranges."
+            )
+        else:
+            self.btn_pmt_file.setToolTip(
+                "Choose LED+Shutter or PMT-noise, then File… to load "
+                "families.json or per_frame.csv."
+            )
         n_bg = len(ensure_bg_rois(doc)) if has else 0
         self.btn_bg_rois.setEnabled(has and is_bg_motion(kind) and n_bg > 0)
         if has and is_bg_motion(kind) and n_bg == 0:
@@ -454,6 +475,101 @@ class AnnotationEditorWindow(QDialog):
                 "BG-motion only: plot saved BG-ROI traces and threshold their "
                 "sum (raw, smoothed, or bleach-corrected)."
             )
+
+    def _kind_now(self) -> str:
+        try:
+            return self._form_kind()
+        except ValueError:
+            return ""
+
+    def _on_kind_file(self) -> None:
+        kind = self._kind_now()
+        if is_led_shutter(kind):
+            self._on_led_file()
+        elif is_pmt_noise(kind):
+            self._on_pmt_file()
+
+    def _led_start_dir(self) -> str:
+        raw = load_settings().get("last_led_json_dir")
+        if raw and Path(raw).is_dir():
+            return str(raw)
+        guessed = self._guess_defringe_dir()
+        if guessed is not None:
+            return str(guessed)
+        return self._pmt_start_dir()
+
+    def _guess_defringe_dir(self) -> Path | None:
+        """Chan folder next to suite2p_temp / suite2p_anat, if a defringe dir is there."""
+        suite2p_dir = getattr(self.main, "suite2p_dir", None)
+        if suite2p_dir is None:
+            return None
+        chan = Path(suite2p_dir).parent
+        if not chan.is_dir():
+            return None
+        hits = [
+            d
+            for d in sorted(chan.glob("defringe*"))
+            if d.is_dir() and (d / "families.json").is_file()
+        ]
+        return hits[-1] if hits else None
+
+    def _on_led_file(self) -> None:
+        doc = self._doc()
+        if doc is None:
+            return
+        start = self._led_start_dir()
+        suggested = str(Path(start) / "families.json") if start else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select families.json",
+            suggested or start,
+            "families.json (families.json);;JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        nframes = self._nframes()
+        try:
+            shutter = read_shutter_runs(path, nframes=nframes)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Could not read families.json", str(exc))
+            return
+        if not shutter.ranges:
+            detail = (
+                f"{shutter.out_of_range} run(s) fell outside this movie "
+                f"({nframes} frame(s))."
+                if shutter.out_of_range
+                else f"{shutter.path.name} listed no shutter frames."
+            )
+            QMessageBox.warning(self, "No shutter ranges", detail)
+            return
+        save_settings({"last_led_json_dir": str(shutter.path.parent)})
+        if shutter.out_of_range:
+            QMessageBox.information(
+                self,
+                "Runs outside the movie",
+                f"{shutter.path.name} has {shutter.n_runs} shutter run(s); "
+                f"{shutter.out_of_range} fell outside this movie "
+                f"({nframes} frame(s)) and were dropped.",
+            )
+        self._editing_id = None
+        self._loading = True
+        self.list_ann.clearSelection()
+        self._loading = False
+        self.main._set_ann_selection(set())
+        self._set_kind(PROPERTY_LED_SHUTTER)
+        self._ranges = [list(r) for r in shutter.ranges]
+        self._draft_label = f"{shutter.path.name} shutter"
+        self._rebuild_ranges_ui()
+        self._refresh_guide_spans()
+        n_frames = sum(b - a + 1 for a, b in self._ranges)
+        self.lbl_status.setText(
+            f"{len(self._ranges)} interval(s) from {shutter.path.name} "
+            f"({n_frames} frame(s)) — Save writes each run as its own "
+            "LED+Shutter annotation"
+        )
+        self.main.statusBar().showMessage(
+            f"LED+Shutter: {len(self._ranges)} run(s) from {shutter.path.name}"
+        )
 
     def _pmt_start_dir(self) -> str:
         raw = load_settings().get("last_pmt_csv_dir")
