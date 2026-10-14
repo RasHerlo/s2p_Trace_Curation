@@ -11,6 +11,10 @@ root = spec_dir.parent
 _PG_SKIP = ("pyqtgraph.opengl", "pyqtgraph.examples", "pyqtgraph.jupyter", "pyqtgraph.canvas")
 
 hiddenimports = collect_submodules("s2p_trace_curation")
+# suite2p .npy files pickled under NumPy 1.x reference numpy.core.*, which
+# NumPy 2 only provides as import-on-demand shims that PyInstaller can't see.
+hiddenimports += collect_submodules("numpy.core")
+hiddenimports += ["numpy.random._pickle"]
 hiddenimports += collect_submodules(
     "pyqtgraph", filter=lambda name: not name.startswith(_PG_SKIP)
 )

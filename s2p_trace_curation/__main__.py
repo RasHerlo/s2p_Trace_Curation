@@ -53,6 +53,26 @@ def _install_frozen_excepthook() -> None:
     sys.excepthook = hook
 
 
+def _check_numpy1_pickles() -> None:
+    """Unpickle arrays, scalars and dtypes the way NumPy 1.x wrote them (suite2p ops/stat)."""
+    import pickle
+
+    import numpy as np
+
+    sample = {
+        "arr": np.arange(3, dtype=np.int16),
+        "f": np.float32(1.5),
+        "dtype": np.dtype("float64"),
+        "stat": np.array([{"ypix": np.arange(2)}], dtype=object),
+    }
+    raw = pickle.dumps(sample, protocol=2).replace(b"numpy._core", b"numpy.core")
+    if b"numpy.core" not in raw:
+        raise RuntimeError("could not build a NumPy 1.x-style test pickle")
+    back = pickle.loads(raw)
+    if not np.array_equal(back["arr"], sample["arr"]):
+        raise RuntimeError("NumPy 1.x-style pickle round-trip mismatch")
+
+
 def selftest() -> int:
     """Import every module and build the main window without showing it."""
     import importlib
@@ -67,6 +87,7 @@ def selftest() -> int:
             raise RuntimeError("no s2p_trace_curation submodules found")
         for name in names:
             importlib.import_module(name)
+        _check_numpy1_pickles()
 
         from pyqtgraph.Qt import QtWidgets
 
