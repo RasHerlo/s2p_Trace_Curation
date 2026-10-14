@@ -2,7 +2,18 @@
 
 Inspection, compensation and editing of suite2p ROIs and traces.
 
-## Setup
+## Download (Windows app)
+
+No Python needed: grab the latest
+[release](https://github.com/RasHerlo/s2p_Trace_Curation/releases/latest) and
+either run `s2pTraceCuration-<version>-Setup.exe` or unzip the portable zip and
+double-click `s2pTraceCuration.exe`. Windows may warn about an unrecognised app
+on first launch (the exe is unsigned): choose **More info → Run anyway**.
+
+Errors in the app are shown in a dialog and logged to
+`%USERPROFILE%\.s2p_trace_curation\error.log`.
+
+## Setup (from source)
 
 Needs NumPy, pyqtgraph, and a Qt binding (**PyQt5** in this project’s venv).
 
@@ -31,6 +42,19 @@ Use **File → Open suite2p folder…** and select a `suite2p` directory (the fo
 
 - If `trc_curation.pkl` already exists beside `plane0/`, it is loaded.
 - Otherwise it is generated from `plane0` (`stat.npy`, `F.npy`, `Fneu.npy`, `iscell.npy`, `ops.npy`).
+
+## Building a release
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+```
+
+This builds in its own `venv_build\` (the dev venv is untouched), runs a
+`--selftest` on the built exe, and writes the portable zip (plus an installer
+if Inno Setup 6 is installed) to `dist\release\`. To publish, bump
+`__version__` in `s2p_trace_curation/__init__.py`, commit, and push a matching
+tag (`git tag v1.0.0; git push origin v1.0.0`); GitHub Actions builds and
+attaches both files to the release.
 
 Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
 

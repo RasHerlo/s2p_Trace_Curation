@@ -31,6 +31,7 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!packaging/*.spec
 
 # Installer logs
 pip-log.txt
@@ -152,6 +153,7 @@ activemq-data/
 .envrc
 .venv
 venv_s2p_tc/
+venv_build/
 env/
 venv/
 ENV/
