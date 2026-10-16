@@ -90,6 +90,8 @@ from s2p_trace_curation.bg_rois import (
 )
 from s2p_trace_curation.curation import (
     append_roi,
+    apply_baseline_fneu_offset,
+    baseline_offset_enabled,
     compensation_fneu_offset,
     empty_roi_draft,
     ensure_meanimge,
@@ -99,6 +101,7 @@ from s2p_trace_curation.curation import (
     reset_roi_from_suite2p,
     save_curation,
     scaled_fneu,
+    set_baseline_offset_enabled,
     set_compensation_fneu_offset,
     set_compensation_x,
 )
@@ -912,6 +915,16 @@ class MainWindow(QMainWindow):
         roi_nav.addWidget(self.btn_roi_up)
         roi_nav.addWidget(self.btn_roi_down)
         self.chk_iscell = QCheckBox("iscell")
+        self.chk_baseline_offset = QCheckBox("baseline offset")
+        self.chk_baseline_offset.setToolTip(
+            "Set Fneu offset so the median of x·(Fneu + offset) matches the "
+            "median of F. LED+Shutter frames are excluded. Changing x or the "
+            "Fneu offset turns this off; tick it again to realign."
+        )
+        cell_row = QHBoxLayout()
+        cell_row.addWidget(self.chk_iscell)
+        cell_row.addWidget(self.chk_baseline_offset)
+        cell_row.addStretch(1)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Single"))
         self.slider_mode = QSlider(Qt.Orientation.Horizontal)
@@ -943,7 +956,7 @@ class MainWindow(QMainWindow):
         )
         roi_form.addRow("ROI #", roi_nav)
         roi_form.addRow("Mode", mode_row)
-        roi_form.addRow(self.chk_iscell)
+        roi_form.addRow(cell_row)
         self.cmb_trace_units = QComboBox()
         fill_x_units_combo(self.cmb_trace_units, None)  # fs not known yet
         self.cmb_trace_units.setToolTip(
@@ -1102,6 +1115,7 @@ class MainWindow(QMainWindow):
         self.btn_roi_up.clicked.connect(lambda: self._roi_step(+1))
         self.btn_roi_down.clicked.connect(lambda: self._roi_step(-1))
         self.chk_iscell.toggled.connect(self._on_iscell_toggled)
+        self.chk_baseline_offset.toggled.connect(self._on_baseline_offset_toggled)
         self.spin_x.valueChanged.connect(self._on_x_changed)
         self.spin_fneu_offset.valueChanged.connect(self._on_fneu_offset_changed)
         self.slider_mode.valueChanged.connect(self._on_mode_slider)
@@ -1816,6 +1830,7 @@ class MainWindow(QMainWindow):
         self.chk_iscell.setEnabled(not active and not self._batch_mode)
         self.spin_x.setEnabled(single_ok)
         self.spin_fneu_offset.setEnabled(single_ok)
+        self.chk_baseline_offset.setEnabled(single_ok)
         self.slider_mode.setEnabled(
             not active and self.doc is not None and not self._raster_mode
         )
@@ -2210,6 +2225,11 @@ class MainWindow(QMainWindow):
                     progress=_progress,
                     should_cancel=lambda: self._extract_cancel,
                 )
+                if baseline_offset_enabled(self._row()):
+                    set_baseline_offset_enabled(self._row(), False)
+                    self._updating = True
+                    self.chk_baseline_offset.setChecked(False)
+                    self._updating = False
             self._mask_traces_stale = False
             self._mask_roi_changed = False
             self._mask_neu_changed = False
@@ -2404,6 +2424,7 @@ class MainWindow(QMainWindow):
         self._updating = True
         self.spin_roi.setValue(self.active_roi_id)
         self.chk_iscell.setChecked(bool(row["iscell"]))
+        self.chk_baseline_offset.setChecked(baseline_offset_enabled(row))
         self.spin_x.setValue(float(row["compensation"]["x"]))
         self.spin_fneu_offset.setValue(compensation_fneu_offset(row))
         self._updating = False
@@ -2505,6 +2526,7 @@ class MainWindow(QMainWindow):
             self.spin_x.setValue(1.0)
             self.spin_fneu_offset.setValue(0.0)
             self.chk_iscell.setChecked(True)
+            self.chk_baseline_offset.setChecked(False)
             self._updating = False
             self._refresh_all()
         else:
@@ -2518,6 +2540,7 @@ class MainWindow(QMainWindow):
         self.btn_roi_down.setEnabled(single)
         self.spin_x.setEnabled(single)
         self.spin_fneu_offset.setEnabled(single)
+        self.chk_baseline_offset.setEnabled(single)
         self.btn_modify.setEnabled(single and self.doc is not None)
         self.btn_add_mask.setEnabled(single and self.doc is not None)
         self.btn_add_bg.setEnabled(single and self.doc is not None)
@@ -2554,6 +2577,7 @@ class MainWindow(QMainWindow):
         self.dirty = True
         self._updating = True
         self.chk_iscell.setChecked(True)
+        self.chk_baseline_offset.setChecked(False)
         self.spin_x.setValue(1.0)
         self.spin_fneu_offset.setValue(0.0)
         self._updating = False
@@ -2587,10 +2611,48 @@ class MainWindow(QMainWindow):
             if self._raster_mode:
                 self._refresh_raster()
 
+    def _clear_baseline_offset_flag(self) -> None:
+        """Drop the alignment flag without changing the stored offset."""
+        if self.doc is None or self._batch_mode:
+            return
+        row = self._row()
+        if not baseline_offset_enabled(row):
+            return
+        set_baseline_offset_enabled(row, False)
+        self._updating = True
+        self.chk_baseline_offset.setChecked(False)
+        self._updating = False
+
+    def _on_baseline_offset_toggled(self, checked: bool) -> None:
+        if self._updating or self.doc is None or self._batch_mode:
+            return
+        row = self._row()
+        if not checked:
+            set_baseline_offset_enabled(row, False)
+            self.dirty = True
+            return
+        try:
+            mask = led_shutter_nan_mask(self.doc, int(self.doc["meta"]["nframes"]))
+            offset = apply_baseline_fneu_offset(row, mask)
+        except ValueError as exc:
+            self._updating = True
+            self.chk_baseline_offset.setChecked(False)
+            self._updating = False
+            QMessageBox.warning(self, "Baseline offset", str(exc))
+            return
+        self._updating = True
+        self.spin_fneu_offset.setValue(float(offset))
+        self._updating = False
+        self.dirty = True
+        self._roi_traces_pending.add(int(self.active_roi_id))
+        self._mark_tc_norm_stale()
+        self._refresh_traces(autoscale=True)
+
     def _on_x_changed(self, value: float) -> None:
         if self._updating or self.doc is None or self._batch_mode:
             return
         set_compensation_x(self._row(), float(value))
+        self._clear_baseline_offset_flag()
         self.dirty = True
         self._roi_traces_pending.add(int(self.active_roi_id))
         self._mark_tc_norm_stale()
@@ -2600,6 +2662,7 @@ class MainWindow(QMainWindow):
         if self._updating or self.doc is None or self._batch_mode:
             return
         set_compensation_fneu_offset(self._row(), float(value))
+        self._clear_baseline_offset_flag()
         self.dirty = True
         self._roi_traces_pending.add(int(self.active_roi_id))
         self._mark_tc_norm_stale()

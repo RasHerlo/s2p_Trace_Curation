@@ -62,8 +62,14 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
 
 - Load / save versioned `trc_curation.pkl`
 - FOV, movie, ROI zoom, traces, 4 analysis cursors + movie cursor
-- Per-ROI `x` / Fneu offset, **Rebuild traces** (`trace_comp` / `tc_norm` /
-  `tc_norm_sm` / `tc_norm_sm_bc` for the current ROI), and `iscell` toggle
+- Per-ROI `x` / Fneu offset, **baseline offset** (align the scaled Fneu
+  median with F; unticks if `x` or the offset is edited), **Rebuild traces**
+  (`trace_comp` / `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` for the current
+  ROI), and `iscell` toggle
+- **File → Merge s2p folders**: **Automate initial steps** uses only the
+  output parent (`suite2p_temp`, `suite2p_anat`, and
+  `defringe_v4/families.json`) and writes `suite2p_merged` with LED+Shutter,
+  default smoothing, shared-τ bleach, and baseline-aligned Fneu offsets
 - Trace Processing: Savitzky–Golay (`tc_norm_sm`) and bleach (`tc_norm_sm_bc`)
 - Named heatmaps from `data.bin`: set frame ranges on the raster trace, map is
   AUC inside / AUC outside (Edit HeatMaps → Image dropdowns)

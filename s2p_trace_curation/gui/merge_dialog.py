@@ -6,6 +6,12 @@ from pathlib import Path
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from s2p_trace_curation.auto_curation import (
+    MERGED_DIR_NAME,
+    AutomationError,
+    preview_automation,
+    run_automated_merge,
+)
 from s2p_trace_curation.merge_suite2p import (
     BinCheckMode,
     MergeError,
@@ -14,6 +20,7 @@ from s2p_trace_curation.merge_suite2p import (
 )
 from s2p_trace_curation.user_settings import last_open_start_dir, load_settings, save_settings
 
+QCheckBox = QtWidgets.QCheckBox
 QDialog = QtWidgets.QDialog
 QDialogButtonBox = QtWidgets.QDialogButtonBox
 QFileDialog = QtWidgets.QFileDialog
@@ -52,9 +59,14 @@ class MergeSuite2pDialog(QDialog):
             self.edit_b.setPlaceholderText(start)
             self.edit_out_parent.setText(str(Path(start).parent if Path(start).name.startswith("suite2p") else start))
 
-        form.addRow("Folder A (first ROIs)", self._browse_row(self.edit_a, "Select first suite2p folder"))
-        form.addRow("Folder B (second ROIs)", self._browse_row(self.edit_b, "Select second suite2p folder"))
-        form.addRow("Output parent folder", self._browse_row(self.edit_out_parent, "Select output parent folder", dir_only=True))
+        row_a, self.btn_a = self._browse_row(self.edit_a, "Select first suite2p folder")
+        row_b, self.btn_b = self._browse_row(self.edit_b, "Select second suite2p folder")
+        row_parent, _btn_parent = self._browse_row(
+            self.edit_out_parent, "Select output parent folder", dir_only=True
+        )
+        form.addRow("Folder A (first ROIs)", row_a)
+        form.addRow("Folder B (second ROIs)", row_b)
+        form.addRow("Output parent folder", row_parent)
         form.addRow("Output folder name", self.edit_out_name)
         layout.addLayout(form)
 
@@ -74,6 +86,16 @@ class MergeSuite2pDialog(QDialog):
         )
         layout.addWidget(check_box)
 
+        self.chk_automate = QCheckBox("Automate initial steps")
+        self.chk_automate.setToolTip(
+            "Use only the output parent. It must contain suite2p_temp, "
+            "suite2p_anat, and defringe_v4/families.json. Writes suite2p_merged "
+            "(temp ROIs first) with LED+Shutter, default smoothing, shared-τ "
+            "bleach, and baseline-aligned Fneu offsets."
+        )
+        self.chk_automate.toggled.connect(self._on_automate_toggled)
+        layout.addWidget(self.chk_automate)
+
         self.lbl_hint = QLabel("")
         self.lbl_hint.setWordWrap(True)
         layout.addWidget(self.lbl_hint)
@@ -89,7 +111,9 @@ class MergeSuite2pDialog(QDialog):
         self.edit_a.textChanged.connect(self._maybe_suggest_parent)
         self.edit_b.textChanged.connect(self._maybe_suggest_parent)
 
-    def _browse_row(self, edit: QLineEdit, title: str, dir_only: bool = True) -> QtWidgets.QWidget:
+    def _browse_row(
+        self, edit: QLineEdit, title: str, dir_only: bool = True
+    ) -> tuple[QtWidgets.QWidget, QPushButton]:
         row = QtWidgets.QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
@@ -104,7 +128,20 @@ class MergeSuite2pDialog(QDialog):
 
         btn.clicked.connect(_browse)
         h.addWidget(btn)
-        return row
+        return row, btn
+
+    def _on_automate_toggled(self, on: bool) -> None:
+        for widget in (self.edit_a, self.edit_b, self.edit_out_name, self.btn_a, self.btn_b):
+            widget.setEnabled(not on)
+        if on:
+            self.edit_out_name.setText(MERGED_DIR_NAME)
+            self.lbl_hint.setText(
+                "Automation looks in the output parent for suite2p_temp, "
+                "suite2p_anat, and defringe_v4/families.json, then writes "
+                "suite2p_merged there (temporal ROIs first)."
+            )
+        else:
+            self.lbl_hint.setText("")
 
     def _bin_mode(self) -> BinCheckMode:
         return "full" if self.radio_full.isChecked() else "sample"
@@ -120,11 +157,21 @@ class MergeSuite2pDialog(QDialog):
             self.lbl_hint.setText(f"Suggested output parent (shared): {parent}")
 
     def _on_merge(self) -> None:
+        automate = self.chk_automate.isChecked()
         a = self.edit_a.text().strip()
         b = self.edit_b.text().strip()
         out_parent = self.edit_out_parent.text().strip()
-        name = self.edit_out_name.text().strip() or "suite2p_merged"
-        if not a or not b or not out_parent:
+        name = MERGED_DIR_NAME if automate else (self.edit_out_name.text().strip() or "suite2p_merged")
+        if automate:
+            if not out_parent:
+                QMessageBox.warning(self, "Merge", "Please set the output parent folder.")
+                return
+            try:
+                preview_automation(Path(out_parent))
+            except AutomationError as exc:
+                QMessageBox.warning(self, "Cannot automate", str(exc))
+                return
+        elif not a or not b or not out_parent:
             QMessageBox.warning(
                 self, "Merge", "Please set Folder A, Folder B, and the output parent folder."
             )
@@ -151,19 +198,34 @@ class MergeSuite2pDialog(QDialog):
         save_settings({"merge_bin_check": mode})
         self.setEnabled(False)
         QtWidgets.QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        done_message = ""
         try:
-            merged = merge_suite2p_folders(
-                Path(a),
-                Path(b),
-                Path(out_parent),
-                name,
-                bin_check=mode,
-                overwrite=overwrite,
-            )
+            if automate:
+                result = run_automated_merge(
+                    Path(out_parent),
+                    bin_check=mode,
+                    overwrite=overwrite,
+                )
+                merged = result.merged_dir
+                done_message = result.summary()
+            else:
+                merged = merge_suite2p_folders(
+                    Path(a),
+                    Path(b),
+                    Path(out_parent),
+                    name,
+                    bin_check=mode,
+                    overwrite=overwrite,
+                )
+                done_message = (
+                    f"Wrote merged suite2p folder:\n{merged}\n\n"
+                    "See merge_note.txt beside plane0/.\n"
+                    "The merged folder will now open in the main window."
+                )
         except FileExistsError as exc:
             QMessageBox.warning(self, "Merge", f"Output already exists:\n{exc}")
             return
-        except (MergeError, FileNotFoundError, OSError, ValueError) as exc:
+        except (AutomationError, MergeError, FileNotFoundError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "Merge failed", str(exc))
             return
         except Exception as exc:
@@ -174,11 +236,5 @@ class MergeSuite2pDialog(QDialog):
             self.setEnabled(True)
 
         self.merged_dir = merged
-        QMessageBox.information(
-            self,
-            "Merge complete",
-            f"Wrote merged suite2p folder:\n{merged}\n\n"
-            f"See merge_note.txt beside plane0/.\n"
-            "The merged folder will now open in the main window.",
-        )
+        QMessageBox.information(self, "Merge complete", done_message)
         self.accept()

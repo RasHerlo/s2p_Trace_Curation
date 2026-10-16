@@ -60,7 +60,67 @@ def ensure_compensation(row: dict[str, Any]) -> dict[str, Any]:
         comp["x"] = 1.0
     if "fneu_offset" not in comp:
         comp["fneu_offset"] = 0.0
+    if "baseline_offset" not in comp:
+        comp["baseline_offset"] = False
     return comp
+
+
+def baseline_offset_enabled(row: dict[str, Any]) -> bool:
+    return bool(ensure_compensation(row).get("baseline_offset", False))
+
+
+def set_baseline_offset_enabled(row: dict[str, Any], enabled: bool) -> None:
+    ensure_compensation(row)["baseline_offset"] = bool(enabled)
+
+
+def illumination_median(trace: np.ndarray, nan_mask: np.ndarray) -> float | None:
+    """Median of finite samples outside ``nan_mask`` (LED+Shutter frames)."""
+    t = np.asarray(trace, dtype=np.float64).ravel()
+    mask = np.asarray(nan_mask, dtype=bool).ravel()
+    if mask.shape[0] != t.shape[0]:
+        raise ValueError("nan_mask length must match trace")
+    keep = np.isfinite(t) & ~mask
+    if not np.any(keep):
+        return None
+    return float(np.median(t[keep]))
+
+
+def baseline_fneu_offset(
+    F: np.ndarray,
+    Fneu: np.ndarray,
+    x: float,
+    nan_mask: np.ndarray,
+) -> float:
+    """Offset so ``median(x·(Fneu + offset))`` matches ``median(F)``.
+
+    Shutter frames in ``nan_mask`` are left out of both medians. Changing ``x``
+    without recomputing this offset breaks the alignment.
+    """
+    xf = float(x)
+    if not np.isfinite(xf) or abs(xf) < 1e-9:
+        raise ValueError(
+            "x is zero, so the scaled Fneu baseline cannot be aligned with F."
+        )
+    med_f = illumination_median(F, nan_mask)
+    med_n = illumination_median(Fneu, nan_mask)
+    if med_f is None or med_n is None:
+        raise ValueError("No illumination samples left to estimate a baseline.")
+    return med_f / xf - med_n
+
+
+def apply_baseline_fneu_offset(row: dict[str, Any], nan_mask: np.ndarray) -> float:
+    """Set this ROI's Fneu offset so the scaled neuropil baseline matches F."""
+    comp = ensure_compensation(row)
+    offset = baseline_fneu_offset(
+        row["roi"]["F"],
+        row["neuropil"]["Fneu"],
+        float(comp["x"]),
+        nan_mask,
+    )
+    comp["fneu_offset"] = float(offset)
+    comp["baseline_offset"] = True
+    refresh_trace_comp(row)
+    return float(offset)
 
 
 def refresh_trace_comp(row: dict[str, Any]) -> None:
@@ -129,6 +189,7 @@ def create_curation_from_plane(suite2p_dir: Path) -> dict[str, Any]:
                 "compensation": {
                     "x": x,
                     "fneu_offset": 0.0,
+                    "baseline_offset": False,
                     "trace_comp": compute_trace_comp(Fi, Fni, x, 0.0),
                 },
             }
@@ -286,6 +347,7 @@ def reset_roi_from_suite2p(
         "compensation": {
             "x": x,
             "fneu_offset": 0.0,
+            "baseline_offset": False,
             "trace_comp": compute_trace_comp(Fi, Fni, x, 0.0),
         },
     }
@@ -341,7 +403,12 @@ def empty_roi_draft(roi_id: int, nframes: int) -> dict[str, Any]:
             "Fneu": z.copy(),
             "modified": True,
         },
-        "compensation": {"x": 1.0, "fneu_offset": 0.0, "trace_comp": z.copy()},
+        "compensation": {
+            "x": 1.0,
+            "fneu_offset": 0.0,
+            "baseline_offset": False,
+            "trace_comp": z.copy(),
+        },
     }
 
 
