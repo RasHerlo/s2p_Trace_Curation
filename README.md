@@ -42,6 +42,7 @@ Use **File → Open suite2p folder…** and select a `suite2p` directory (the fo
 
 - If `trc_curation.pkl` already exists beside `plane0/`, it is loaded.
 - Otherwise it is generated from `plane0` (`stat.npy`, `F.npy`, `Fneu.npy`, `iscell.npy`, `ops.npy`).
+- **File → Find pickle file…** searches a root folder for `trc_curation.pkl` and opens the suite2p folder that contains the file you pick.
 
 ## Building a release
 
@@ -66,6 +67,7 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
   median with F; unticks if `x` or the offset is edited), **Rebuild traces**
   (`trace_comp` / `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` for the current
   ROI), and `iscell` toggle
+- **File → Find pickle file…** searches a root folder for `trc_curation.pkl` and opens that suite2p folder
 - **File → Merge s2p folders**: **Automate initial steps** uses only the
   output parent (`suite2p_temp`, `suite2p_anat`, and
   `defringe_v4/families.json`) and writes `suite2p_merged` with LED+Shutter,

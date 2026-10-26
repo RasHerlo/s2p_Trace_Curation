@@ -105,6 +105,7 @@ from s2p_trace_curation.curation import (
     set_compensation_fneu_offset,
     set_compensation_x,
 )
+from s2p_trace_curation import PICKLE_NAME
 from s2p_trace_curation.gui.analysis_dialog import AnalysisToolsWindow
 from s2p_trace_curation.gui.annotation_dialog import AnnotationEditorWindow
 from s2p_trace_curation.gui.heatmap_dialog import HeatmapEditorWindow
@@ -529,6 +530,10 @@ class MainWindow(QMainWindow):
         act_open = QAction("Open suite2p folder…", self)
         act_open.triggered.connect(self.open_suite2p)
         file_menu.addAction(act_open)
+
+        act_find = QAction("Find pickle file…", self)
+        act_find.triggered.connect(self.find_pickle_file)
+        file_menu.addAction(act_find)
 
         act_merge = QAction("Merge s2p folders…", self)
         act_merge.triggered.connect(self.merge_suite2p_folders)
@@ -1489,6 +1494,46 @@ class MainWindow(QMainWindow):
             return
         try:
             self._load_suite2p(Path(path))
+        except Exception as exc:
+            QMessageBox.critical(self, "Open failed", str(exc))
+
+    def find_pickle_file(self) -> None:
+        from s2p_trace_curation.gui.find_pickle_dialog import (
+            FindPickleDialog,
+            find_curation_pickles,
+        )
+
+        settings = load_settings()
+        start = str(settings.get("last_pickle_search_dir") or "")
+        if not start or not Path(start).is_dir():
+            last = last_open_start_dir(settings)
+            start = str(Path(last).parent) if last else ""
+        path = QFileDialog.getExistingDirectory(self, "Select root folder", start)
+        if not path:
+            return
+        root = Path(path)
+        save_settings({"last_pickle_search_dir": str(root)})
+        previous = self.statusBar().currentMessage()
+        self.statusBar().showMessage(f"Searching {root} for {PICKLE_NAME}…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            found = find_curation_pickles(root)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not found:
+            self.statusBar().showMessage(f"No {PICKLE_NAME} files under {root}")
+            QMessageBox.information(
+                self,
+                "Find pickle file",
+                f"No {PICKLE_NAME} files under:\n{root}",
+            )
+            return
+        dlg = FindPickleDialog(root, found, self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted or dlg.selected is None:
+            self.statusBar().showMessage(previous)
+            return
+        try:
+            self._load_suite2p(dlg.selected.parent)
         except Exception as exc:
             QMessageBox.critical(self, "Open failed", str(exc))
 
