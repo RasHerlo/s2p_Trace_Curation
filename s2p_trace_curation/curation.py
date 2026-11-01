@@ -378,6 +378,10 @@ def set_compensation_fneu_offset(row: dict[str, Any], fneu_offset: float) -> Non
 
 
 def next_roi_id(doc: dict[str, Any]) -> int:
+    if doc.get("master_link"):
+        from s2p_trace_curation.roisets import next_local_roi_id
+
+        return next_local_roi_id(doc)
     if not doc.get("rois"):
         return 0
     return max(int(r["roi_id"]) for r in doc["rois"]) + 1

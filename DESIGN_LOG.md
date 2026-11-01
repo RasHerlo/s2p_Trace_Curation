@@ -570,6 +570,7 @@ Selecting a saved run restores the line at `cut_threshold`; dragging it or typin
 - **Annotation Tools window (2026-08-28):** heatmap-style ranges; C0 copy buttons removed from the right panel
 - **BG ROIs + BG-motion (schema 7, 2026-09-03):** Add BG ROI; Show BG-ROIs on W1; threshold summed raw BG traces as BG-motion
 - **Per-ROI Rebuild traces (2026-09-07):** ROI Tools button above Trace X units; rebuilds this ROI's `trace_comp` / `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` after x or Fneu-offset edits
+- **Shared ROI sets, phase 1 (schema 8, 2026-11-01):** `roisets.py` (master I/O, registry, registration, shifting, publish / apply, ghosts), `gui/roiset_dialog.py` (ROI Set window), W1 ROI-set status + Originals layer + Import; Reset ROI on linked experiments re-derives from the master
 - Run: `python -m s2p_trace_curation`
 
 ---
@@ -712,4 +713,65 @@ Both default off and persist in user settings (`raster_add_clusters`, `show_clus
 Changing `x` or Fneu offset already refreshes live `trace_comp` in the inspect plots, but stored `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` wait for the session-wide Raster / Trace Processing rebuilds.
 
 **Rebuild traces** sits in ROI Tools above Trace X units. It is enabled only for the current ROI after that ROI's `x` or Fneu offset is edited (disabled in batch / mask-edit). Clicking it recomputes this ROI only: `trace_comp`, `tc_norm` (LED+Shutter NaNs), `tc_norm_sm` (session SG), and `tc_norm_sm_bc` (session bleach: shared τ if stored, otherwise an independent fit; does not rewrite shared τ or all-ROI fingerprints, and does not rebuild BG ROIs). Raster **Rebuild tc_norm** remains the session-wide `tc_norm` path.
+
+---
+
+## Session 2026-11-01 — Shared ROI sets across experiments (master)
+
+### Intent
+Datasets come in groups recorded in the same FOV (e.g. `240916_pl100` LED 2s ex02–04 + LED+AP ex01–03). A curated ROI set from one experiment should seed the others, be adapted per experiment, and keep improving as a shared set. One **master** per FOV × channel. Motion correction ran independently per experiment, so FOVs can be shifted by a few pixels between experiments.
+
+Data facts (2026-11-01 scan of `New recordings PFC`): all 512×512, fs 2.52 Hz, rigid MC (`nonrigid=False`), nframes differ (2950 LED+AP vs 1580 LED 2s). The folder mixes several FOVs (`pl100`/`pl33`, several days, von Frey), so membership cannot be inferred from the folder.
+
+### Model: shared geometry + intent, local traces
+| Layer | Lives in | Shared |
+|---|---|---|
+| Masks (`ypix/xpix/lam`, neuropil `ipix`), default `iscell`, `x`, baseline-offset on/off; BG-ROI masks; SG params + bleach mode | master | yes |
+| `F`, `Fneu`, `trace_comp`, `tc_norm*`, fitted `fneu_offset`, τ / amplitudes | experiment pickle | no — re-derived from that experiment's `data.bin` |
+| Annotations, heatmaps, analyses | experiment pickle | no |
+
+### Master file (`*.roiset.pkl`, own schema)
+- `kind="trc_roiset"`, `schema_version=1`; `meta`: name, channel label, `rev` (bumped on ROI content changes only), Ly/Lx, reference images (`meanImg`/`meanImgE`/`VCorr` of the source), `trace_processing` defaults, `next_uid`.
+- `rois[]`: `uid`, `rev`, `iscell`, `ypix/xpix/lam`, `neuropil_ipix`, `x`, `baseline_offset`, source info. Publish takes **iscell=True only**.
+- `bg_rois[]`: `uid`, `rev`, `ypix/xpix`.
+- `experiments[]` registry: `path` (relative to the master file), `approved` toggle, `shift [dy, dx]`, `score`, `image_key`, `tag`, `synced_rev`. Approval is the user's; Scan only suggests.
+- Location: user picks the folder on Publish (default = parent); name like `240916_pl100_ChanA.roiset.pkl`. Saves are atomic with a `.bak`; registry edits re-read the file from disk before writing.
+
+### Experiment side (schema 8)
+- `doc["master_link"]`: master path (relative to the suite2p dir; absolute hint), name, channel, `rev`, `shift`, `score`, `image_key`, `applied_utc`.
+- Per-ROI `link`: `{uid, rev, origin: "master" | "own"}`. `roi_id == uid` for master-derived ROIs; local additions (Add Mask, imported originals) start at **10000**. Master uids stay < 10000.
+- Applying a master moves the existing `trc_curation.pkl` to `trc_curation.original.pkl` (kept once — the true original) plus `trc_curation.bak.pkl` of the state just before. The original is the **ghost** source (falls back to `plane0/stat.npy`).
+- On apply: annotations / heatmaps / meta images kept; analyses cleared (roi_ids changed; still in the backup); BG ROIs replaced by the master's when it has any; SG + bleach mode copied, shared τ re-estimated; F/Fneu from one batched pass over `data.bin`; baseline offset recomputed where the master asks for it; `tc_norm*` rebuilt.
+- Publishing an experiment applies the new master to it too (shift 0, traces copied), so every member works the same way; analyses are kept there because the ids survive.
+
+### Alignment
+Integer translation from phase correlation of the master reference vs the target image (`meanImg` default; `meanImgE` / `VCorr` selectable). Score = Pearson r of the high-passed images on the overlap after the shift. On `240916_pl100` the six same-FOV experiments scored 0.83–0.96 (shifts 0–2 px, identical for ChanA and ChanB); every other FOV in the folder scored < 0.05, so the GUI treats ≥ 0.5 as "likely same FOV". Integer shifts keep masks exact and invertible (no resampling drift on later push-back). Pixels shifted outside the FOV are dropped and the ROI is reported as clipped. Neuropil is shifted as-is.
+
+### Extraction and suite2p overlap
+suite2p ran with `allow_overlap=False`: `F.npy` leaves pixels shared by several ROIs out of the weighted mean (checked: r = 1.000 with those pixels excluded, down to 0.53 for heavily overlapping ROIs when they are included). The app's per-ROI re-extraction after mask edits uses all pixels. To keep every member consistent with the source's `F.npy`, the master stores suite2p's per-pixel `overlap` flags for ROIs whose mask is still the stat.npy one, and the batched extractor (`extract_traces_batch`, one streaming pass over `data.bin`, ~10–20 s for 55–370 ROIs) leaves them out. Edited masks carry no flags and use all pixels, as before. Re-deriving the source at shift 0 reproduces its traces to ~1e-7.
+
+### GUI
+- FOV (W1) box: ROI-set status line, **ROI Set…** button, **Originals** combo (off / iscell=1 / all) for the ghost layer, **Import original**. Ghosts are 1-px outlines; ones not overlapping a working ROI (IoU < 0.2) are drawn brighter as candidates. Clicking a ghost (where no working ROI is hit) shows it in W3 and the traces, read-only.
+- **ROI Set** window (non-modal): Master (publish / open), Experiments registry (approve toggles, tag, Scan folder, Register, Open), This experiment (image, Estimate shift, dY/dX nudge, Preview on W1, Apply master).
+
+### Agreements (locked 2026-11-01)
+| ID | Agreement |
+|----|-----------|
+| RS-A1 | One master per FOV × channel; user-chosen folder and name |
+| RS-A2 | Publish takes iscell=True ROIs; the rest stay reachable as ghosts |
+| RS-A3 | Master `iscell` is a default; toggling it in an experiment is a local edit |
+| RS-A4 | Neuropil shifted as-is |
+| RS-A5 | Registration image: same-channel `meanImg` default, selectable |
+| RS-A6 | BG ROIs are part of the master; traces re-extracted per experiment |
+| RS-A7 | SG / bleach mode and per-ROI intent in the master; fitted values per experiment |
+| RS-A8 | `roi_id == uid` for master-derived ROIs; local ids from 10000 |
+| RS-A9 | Existing pickles count as originals (ghost source) and can be published |
+| RS-A10 | Explicit approved-experiment registry inside the master; Scan suggests by registration score |
+| RS-A11 | Edits stay local until explicitly pushed (push / pull / compare = phase 2) |
+| RS-A12 | Collected (cross-experiment) analysis parked; needs its own design for switching between collected and single-experiment work |
+
+### Phases
+1. Master file + registry, registration, batched extraction, Publish / Apply, ghost layer + import. **(this session)**
+2. Compare (IoU match table) and Sync (per-ROI push / pull / keep local, revision check).
+3. Collected analysis (parked).
 

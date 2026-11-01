@@ -192,6 +192,76 @@ class BinaryStack:
         return out
 
 
+EXTRACT_BLOCK_BYTES = 32_000_000
+
+
+def extract_traces_batch(
+    plane: Path,
+    pixel_sets: list[tuple[np.ndarray, np.ndarray | None]],
+    *,
+    progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> np.ndarray:
+    """Weighted means of many pixel sets in one streaming pass over data.bin.
+
+    Each entry is ``(linear_ipix, weights)``; ``weights=None`` means an
+    unweighted mean. Matches ``BinaryStack.extract_roi_trace`` (lam-weighted)
+    and ``extract_neuropil_trace`` / ``extract_unweighted_trace`` (unweighted).
+    Empty sets give an all-zero trace. Returns ``(len(pixel_sets), nframes)``.
+    """
+    from scipy import sparse
+
+    with BinaryStack(plane) as stack:
+        nframes = int(stack.nframes)
+        n_pixels = int(stack.Ly * stack.Lx)
+        path = stack.path
+        dtype = stack.dtype
+
+    rows: list[np.ndarray] = []
+    cols: list[np.ndarray] = []
+    vals: list[np.ndarray] = []
+    for k, (ipix, weights) in enumerate(pixel_sets):
+        ipix = np.asarray(ipix, dtype=np.int64).ravel()
+        if ipix.size == 0:
+            continue
+        if weights is None:
+            w = np.full(ipix.size, 1.0 / ipix.size, dtype=np.float64)
+        else:
+            w = np.asarray(weights, dtype=np.float64).ravel()
+            wsum = float(w.sum())
+            if wsum <= 0:
+                continue
+            w = w / wsum
+        rows.append(np.full(ipix.size, k, dtype=np.int64))
+        cols.append(ipix)
+        vals.append(w)
+    n_sets = len(pixel_sets)
+    out = np.zeros((n_sets, nframes), dtype=np.float64)
+    if not rows:
+        return out
+    weights_mat = sparse.csr_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n_sets, n_pixels),
+    )
+    block = max(1, int(EXTRACT_BLOCK_BYTES // max(n_pixels * dtype.itemsize, 1)))
+    mmap = np.memmap(path, dtype=dtype, mode="r", shape=(nframes, n_pixels))
+    try:
+        for t0 in range(0, nframes, block):
+            if should_cancel is not None and should_cancel():
+                from s2p_trace_curation.mask_edit import ExtractCancelled
+
+                raise ExtractCancelled()
+            t1 = min(t0 + block, nframes)
+            frames = np.asarray(mmap[t0:t1], dtype=np.float64)
+            out[:, t0:t1] = weights_mat @ frames.T
+            del frames
+            if progress is not None:
+                progress(t1, nframes)
+    finally:
+        del mmap
+    return out
+
+
 def combined_bbox(
     ypix: np.ndarray,
     xpix: np.ndarray,

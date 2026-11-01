@@ -160,10 +160,22 @@ from s2p_trace_curation.trace_processing import (
 from s2p_trace_curation.gui.overlays import (
     OverlayFilter,
     build_fov_overlay,
+    build_outline_overlay,
     compose_rgb_with_overlay,
+    mask_outline,
     rois_at_pixel,
     thick_outline_mask,
     zoom_masks_rgba,
+)
+from s2p_trace_curation.roisets import (
+    ORIGIN_MASTER,
+    ghost_candidates,
+    import_ghost,
+    link_summary,
+    load_ghost_rows,
+    load_master,
+    master_path_for_doc,
+    rederive_row,
 )
 from s2p_trace_curation.mask_edit import (
     MODE_LABELS,
@@ -204,6 +216,12 @@ FILTER_LABELS = {
 # Analysis cursor colors (dotted)
 C_COLORS = ["#ff8c00", "#da70d6", "#7fffd4", "#ffa07a"]
 C0_COLOR = "#ffff66"  # solid movie cursor
+
+GHOST_MODES = {"off": "Off", "cell": "iscell=1", "all": "all"}
+GHOST_RGB_CANDIDATE = (255, 215, 0)
+GHOST_RGB_MATCHED = (160, 160, 160)
+GHOST_RGB_ACTIVE = (255, 255, 255)
+MASTER_PREVIEW_RGB = (255, 0, 255)
 
 _NUDGE_FRAC = 0.05  # fraction of visible span per axis-arrow click
 # Extra left-axis width so Y nudge buttons sit left of the tick labels.
@@ -466,6 +484,19 @@ class MainWindow(QMainWindow):
         self._trace_proc_window: TraceProcessingWindow | None = None
         self._heatmap_window: HeatmapEditorWindow | None = None
         self._annotation_window: AnnotationEditorWindow | None = None
+        self._roiset_window: Any = None
+
+        # Shared ROI set (master) and the experiment's original ROIs (ghosts)
+        self._master: dict[str, Any] | None = None
+        self._master_path: Path | None = None
+        self._master_error: str | None = None
+        self._master_preview: list[tuple[int, np.ndarray, np.ndarray]] | None = None
+        self._ghosts: list[dict[str, Any]] | None = None
+        self._ghost_source = ""
+        self._ghost_outlines: list[tuple[np.ndarray, np.ndarray]] = []
+        self._ghost_cand: np.ndarray | None = None
+        self._ghost_cand_sig: Any = None
+        self._active_ghost_idx: int | None = None
 
         self._mask_edit_active = False
         self._mask_edit_kind: str | None = None  # "modify" | "add" | "add_bg" | "modify_bg"
@@ -891,6 +922,41 @@ class MainWindow(QMainWindow):
         fov_show_row.addWidget(self.chk_show_clusters)
         fov_show_row.addStretch(1)
         fov_form.addRow(fov_show_row)
+
+        self.lbl_roiset = QLabel("ROI set: —")
+        self.lbl_roiset.setMinimumWidth(10)
+        self.lbl_roiset.setToolTip("Shared ROI set (master) this experiment is linked to")
+        self.btn_roiset = QPushButton("ROI Set…")
+        self.btn_roiset.setEnabled(False)
+        self.btn_roiset.setToolTip(
+            "Publish this experiment as a shared ROI set, manage the experiments "
+            "it is approved for, and align / apply it here"
+        )
+        self.btn_roiset.clicked.connect(self._open_roiset_window)
+        roiset_row = QHBoxLayout()
+        roiset_row.addWidget(self.lbl_roiset, stretch=1)
+        roiset_row.addWidget(self.btn_roiset)
+        fov_form.addRow(roiset_row)
+        self.cmb_ghosts = QComboBox()
+        for key, label in GHOST_MODES.items():
+            self.cmb_ghosts.addItem(label, key)
+        self.cmb_ghosts.setEnabled(False)
+        self.cmb_ghosts.setToolTip(
+            "Outline this experiment's original ROIs (before the shared set was applied). "
+            "Yellow: no working ROI overlaps it (candidate); grey: already covered. "
+            "Click one where no working ROI is hit to inspect it."
+        )
+        self.cmb_ghosts.currentIndexChanged.connect(self._on_ghost_mode_changed)
+        self.btn_import_ghost = QPushButton("Import")
+        self.btn_import_ghost.setEnabled(False)
+        self.btn_import_ghost.setToolTip(
+            "Copy the selected original ROI into the working set as a local ROI (id ≥ 10000)"
+        )
+        self.btn_import_ghost.clicked.connect(self._import_active_ghost)
+        ghost_row = QHBoxLayout()
+        ghost_row.addWidget(self.cmb_ghosts, stretch=1)
+        ghost_row.addWidget(self.btn_import_ghost)
+        fov_form.addRow("Originals", ghost_row)
         layout.addWidget(fov)
 
         mov = QGroupBox("Movie (W2)")
@@ -908,6 +974,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(mov)
 
         roi = QGroupBox("ROI / curation")
+        self.grp_roi = roi
         roi_form = QFormLayout(roi)
         roi_nav = QHBoxLayout()
         self.spin_roi = QSpinBox()
@@ -1566,10 +1633,12 @@ class MainWindow(QMainWindow):
         self._meanimge_failed = False
         self.stack = BinaryStack(plane_dir(suite2p_dir))
         n = len(doc["rois"])
+        first_id = int(doc["rois"][0]["roi_id"]) if n else 0
+        self._reset_roiset_state()
         self._updating = True
-        self.spin_roi.setMaximum(max(0, n - 1))
-        self.spin_roi.setValue(0)
-        self.active_roi_id = 0
+        self._sync_roi_spin_range()
+        self.spin_roi.setValue(first_id)
+        self.active_roi_id = first_id
         self._active_bg_id = None
         self._bg_view = None
         self._init_display_levels()
@@ -1584,7 +1653,7 @@ class MainWindow(QMainWindow):
         self._updating = False
         self.lower_stack.setCurrentIndex(0)
         self._roi_traces_pending.clear()
-        self._select_roi(0, force=True)
+        self._select_roi(first_id, force=True)
         self._ensure_active_roi_in_filter()
         self._persist_ui_settings(suite2p_dir=suite2p_dir)
         self.btn_modify.setEnabled(True)
@@ -1629,6 +1698,9 @@ class MainWindow(QMainWindow):
             self._heatmap_window.refresh_from_doc()
         if self._annotation_window is not None:
             self._annotation_window.refresh_from_doc()
+        self._link_master_from_doc()
+        if self._roiset_window is not None:
+            self._roiset_window.refresh_from_main()
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -1725,6 +1797,9 @@ class MainWindow(QMainWindow):
                 "Finish with Apply/Save Mask/Save BG ROI or Cancel before resetting the ROI.",
             )
             return
+        if self.doc.get("master_link"):
+            self._reset_linked_roi()
+            return
         reset_roi_from_suite2p(self.doc, self.suite2p_dir, self.active_roi_id)
         self.dirty = True
         self._mark_tc_norm_stale()
@@ -1798,6 +1873,8 @@ class MainWindow(QMainWindow):
             return self._add_mask_draft
         if self._showing_bg() and self._bg_view is not None:
             return self._bg_view
+        if self._showing_ghost():
+            return self._ghosts[self._active_ghost_idx]  # type: ignore[index]
         return self._row()
 
     def _sync_modify_button(self) -> None:
@@ -1856,6 +1933,8 @@ class MainWindow(QMainWindow):
         }
 
     def _set_mask_edit_ui(self, active: bool) -> None:
+        if active:
+            self._set_active_ghost(None)
         self._mask_edit_active = active
         self.mask_edit_panel.setVisible(active)
         can_start = not active and self.doc is not None and not self._batch_mode
@@ -2164,8 +2243,7 @@ class MainWindow(QMainWindow):
         path = save_curation(self.doc, self.suite2p_dir)
         self.dirty = False
         self._set_mask_edit_ui(False)
-        n = len(self.doc["rois"])
-        self.spin_roi.setMaximum(max(0, n - 1))
+        self._sync_roi_spin_range()
         self._select_roi(new_id, force=True)
         self._refresh_analysis_stale_ui()
         self.statusBar().showMessage(f"Saved new ROI {new_id} to {path}")
@@ -2460,6 +2538,7 @@ class MainWindow(QMainWindow):
             return
         self._active_bg_id = None
         self._bg_view = None
+        self._set_active_ghost(None)
         self._sync_modify_button()
         if not force and roi_id == self.active_roi_id and not self._updating:
             # still refresh when forced internals call
@@ -2488,6 +2567,7 @@ class MainWindow(QMainWindow):
         row = get_bg_roi(self.doc, bg_id)
         if row is None:
             return
+        self._set_active_ghost(None)
         self._active_bg_id = int(bg_id)
         self._bg_view = bg_draft_from_saved(row, int(self.doc["meta"]["nframes"]))
         self._sync_modify_button()
@@ -2543,6 +2623,10 @@ class MainWindow(QMainWindow):
         )
         if hits:
             self._select_roi(int(hits[0]["roi_id"]))
+            return
+        ghost_idx = self._ghost_at_pixel(y, x)
+        if ghost_idx is not None:
+            self._select_ghost(ghost_idx)
 
     def _on_mode_slider(self, value: int) -> None:
         if self._updating:
@@ -2938,6 +3022,294 @@ class MainWindow(QMainWindow):
         self._trace_proc_window.show()
         self._trace_proc_window.raise_()
         self._trace_proc_window.activateWindow()
+
+    # ------------------------------------------------------------ ROI set
+    def _open_roiset_window(self) -> None:
+        if self.doc is None:
+            return
+        from s2p_trace_curation.gui.roiset_dialog import RoiSetWindow
+
+        if self._roiset_window is None:
+            self._roiset_window = RoiSetWindow(self)
+
+            def _clear(_obj: object = None) -> None:
+                self._roiset_window = None
+
+            self._roiset_window.destroyed.connect(_clear)
+        self._roiset_window.refresh_from_main()
+        self._roiset_window.show()
+        self._roiset_window.raise_()
+        self._roiset_window.activateWindow()
+
+    def reload_session(self) -> None:
+        """Reopen the current suite2p folder from disk (after publish / apply)."""
+        if self.suite2p_dir is not None:
+            self._load_suite2p(self.suite2p_dir)
+
+    def _sync_roi_spin_range(self) -> None:
+        ids = [int(r["roi_id"]) for r in (self.doc or {}).get("rois") or []]
+        self.spin_roi.setMaximum(max(ids) if ids else 0)
+
+    def _reset_roiset_state(self) -> None:
+        self._master = None
+        self._master_path = None
+        self._master_error = None
+        self._master_preview = None
+        self._ghosts = None
+        self._ghost_source = ""
+        self._ghost_outlines = []
+        self._ghost_cand = None
+        self._ghost_cand_sig = None
+        self._set_active_ghost(None)
+        self._updating = True
+        self.cmb_ghosts.setCurrentIndex(self.cmb_ghosts.findData("off"))
+        self._updating = False
+
+    def _link_master_from_doc(self) -> None:
+        """Load the master this experiment is linked to, when it can be found."""
+        self._master = None
+        self._master_path = None
+        self._master_error = None
+        if self.doc is not None and self.suite2p_dir is not None and self.doc.get("master_link"):
+            path = master_path_for_doc(self.doc, self.suite2p_dir)
+            if path is None:
+                self._master_error = "master file not found"
+            else:
+                try:
+                    self._master = load_master(path)
+                    self._master_path = path
+                except Exception as exc:
+                    self._master_error = str(exc)
+        self._sync_roiset_ui()
+
+    def set_master(self, master: dict[str, Any] | None, path: Path | None) -> None:
+        self._master = master
+        self._master_path = path
+        self._master_error = None
+        self._sync_roiset_ui()
+
+    def _sync_roiset_ui(self) -> None:
+        loaded = self.doc is not None
+        linked = loaded and bool(self.doc.get("master_link"))  # type: ignore[union-attr]
+        self.btn_roiset.setEnabled(loaded)
+        if not loaded:
+            text = tip = "ROI set: —"
+        elif not linked:
+            text = tip = "ROI set: not linked"
+        else:
+            link = self.doc["master_link"]  # type: ignore[index]
+            tip = f"ROI set: {link_summary(self.doc)}"  # type: ignore[arg-type]
+            name = self.lbl_roiset.fontMetrics().elidedText(
+                str(link.get("name") or "?"), Qt.TextElideMode.ElideMiddle, 125
+            )
+            dy, dx = (int(v) for v in (link.get("shift") or [0, 0]))
+            text = f"ROI set: {name}<br>rev {link.get('rev', '?')} · shift ({dy:+d}, {dx:+d})"
+            link_rev = int(link.get("rev") or 0)
+            note = ""
+            if self._master_error:
+                note = self._master_error
+            elif self._master is not None and int(self._master["meta"]["rev"]) > link_rev:
+                note = f"master is at rev {self._master['meta']['rev']}"
+            if note:
+                text += f" — <span style='color:#c62828'>{note}</span>"
+                tip += f" — {note}"
+        self.lbl_roiset.setText(text)
+        self.lbl_roiset.setToolTip(tip)
+        self.cmb_ghosts.setEnabled(linked)
+        self.btn_import_ghost.setEnabled(self._showing_ghost())
+
+    def set_master_preview(
+        self, masks: list[tuple[int, np.ndarray, np.ndarray]] | None
+    ) -> None:
+        self._master_preview = masks
+        self._refresh_fov()
+
+    def _ghost_mode(self) -> str:
+        return str(self.cmb_ghosts.currentData() or "off")
+
+    def _ensure_ghosts(self) -> bool:
+        if self._ghosts is not None:
+            return True
+        if self.doc is None or self.suite2p_dir is None:
+            return False
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ghosts, source = load_ghost_rows(self.suite2p_dir)
+        except Exception as exc:
+            QMessageBox.warning(self, "Originals", f"Could not load the original ROIs:\n{exc}")
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+        Ly, Lx = int(self.doc["meta"]["Ly"]), int(self.doc["meta"]["Lx"])
+        self._ghosts = ghosts
+        self._ghost_source = source
+        self._ghost_outlines = [
+            mask_outline(g["roi"]["ypix"], g["roi"]["xpix"], Ly, Lx) for g in ghosts
+        ]
+        self._ghost_cand = None
+        self._ghost_cand_sig = None
+        self.statusBar().showMessage(f"{len(ghosts)} original ROIs from {source}")
+        return True
+
+    def _on_ghost_mode_changed(self) -> None:
+        if self._updating or self.doc is None:
+            return
+        if self._ghost_mode() != "off" and not self._ensure_ghosts():
+            self._updating = True
+            self.cmb_ghosts.setCurrentIndex(self.cmb_ghosts.findData("off"))
+            self._updating = False
+        if self._showing_ghost() and self._active_ghost_idx not in self._ghost_visible():
+            self._set_active_ghost(None)
+            self._refresh_all()
+            return
+        self._refresh_fov()
+
+    def _ghost_visible(self) -> list[int]:
+        mode = self._ghost_mode()
+        if mode == "off" or self._ghosts is None:
+            return []
+        return [
+            i for i, g in enumerate(self._ghosts)
+            if mode == "all" or bool(g.get("iscell", True))
+        ]
+
+    def _ghost_candidate_flags(self) -> np.ndarray:
+        assert self.doc is not None and self._ghosts is not None
+        rois = self.doc["rois"]
+        sig = tuple(
+            (int(r["roi_id"]), len(r["roi"]["ypix"]), int(np.sum(r["roi"]["ypix"])))
+            for r in rois
+        )
+        if self._ghost_cand is None or sig != self._ghost_cand_sig:
+            Ly, Lx = int(self.doc["meta"]["Ly"]), int(self.doc["meta"]["Lx"])
+            self._ghost_cand = ghost_candidates(self._ghosts, rois, Ly, Lx)
+            self._ghost_cand_sig = sig
+        return self._ghost_cand
+
+    def _roiset_outline_overlay(self) -> np.ndarray | None:
+        """Ghost outlines (originals) and the master preview, as one RGBA layer."""
+        if self.doc is None:
+            return None
+        Ly, Lx = int(self.doc["meta"]["Ly"]), int(self.doc["meta"]["Lx"])
+        outlines: list[tuple[np.ndarray, np.ndarray, tuple[int, int, int], int]] = []
+        visible = self._ghost_visible()
+        if visible:
+            cand = self._ghost_candidate_flags()
+            for i in visible:
+                if i == self._active_ghost_idx:
+                    continue
+                y, x = self._ghost_outlines[i]
+                if cand[i]:
+                    outlines.append((y, x, GHOST_RGB_CANDIDATE, 230))
+                else:
+                    outlines.append((y, x, GHOST_RGB_MATCHED, 150))
+        if self._showing_ghost():
+            y, x = self._ghost_outlines[self._active_ghost_idx]  # type: ignore[index]
+            outlines.append((y, x, GHOST_RGB_ACTIVE, 255))
+        for _uid, y, x in self._master_preview or []:
+            yy, xx = mask_outline(y, x, Ly, Lx)
+            outlines.append((yy, xx, MASTER_PREVIEW_RGB, 255))
+        if not outlines:
+            return None
+        return build_outline_overlay(Ly, Lx, outlines)
+
+    def _ghost_at_pixel(self, y: int, x: int) -> int | None:
+        """Smallest visible original ROI covering (y, x)."""
+        best: int | None = None
+        best_area = 0
+        for i in self._ghost_visible():
+            g = self._ghosts[i]  # type: ignore[index]
+            yp = np.asarray(g["roi"]["ypix"])
+            xp = np.asarray(g["roi"]["xpix"])
+            if np.any((yp == y) & (xp == x)) and (best is None or yp.size < best_area):
+                best, best_area = i, int(yp.size)
+        return best
+
+    def _showing_ghost(self) -> bool:
+        return (
+            self._active_ghost_idx is not None
+            and self._ghosts is not None
+            and not self._mask_edit_active
+            and not self._batch_mode
+        )
+
+    def _set_active_ghost(self, idx: int | None) -> None:
+        """Ghost view is read-only, so the ROI / curation controls are locked meanwhile."""
+        self._active_ghost_idx = idx
+        self.grp_roi.setEnabled(idx is None)
+        self.btn_import_ghost.setEnabled(idx is not None)
+
+    def _select_ghost(self, idx: int) -> None:
+        if self.doc is None or self._mask_edit_active or self._batch_mode:
+            return
+        self._active_bg_id = None
+        self._bg_view = None
+        self._set_active_ghost(int(idx))
+        self._sync_modify_button()
+        self._refresh_all()
+        g = self._ghosts[idx]  # type: ignore[index]
+        covered = "" if self._ghost_candidate_flags()[idx] else " — overlaps a working ROI"
+        self.statusBar().showMessage(
+            f"Original ROI {g['roi_id']} from {self._ghost_source}{covered}. "
+            "Import copies it into the working set; click a working ROI to go back."
+        )
+
+    def _import_active_ghost(self) -> None:
+        if self.doc is None or not self._showing_ghost():
+            return
+        ghost = self._ghosts[self._active_ghost_idx]  # type: ignore[index]
+        was_stale = self._tc_norm_stale or tc_norm_is_stale(self.doc)
+        row = import_ghost(self.doc, ghost)
+        if not was_stale:
+            self.doc.setdefault("meta", {})["tc_norm_sig"] = tc_norm_sig(self.doc)
+        self._tc_norm_stale = was_stale
+        self._update_rebuild_button()
+        self.dirty = True
+        self._sync_roi_spin_range()
+        self._select_roi(int(row["roi_id"]), force=True)
+        self._refresh_analysis_stale_ui()
+        self.statusBar().showMessage(
+            f"Imported original ROI {ghost['roi_id']} as local ROI {row['roi_id']} (not yet saved)"
+        )
+
+    def _reset_linked_roi(self) -> None:
+        """Reset ROI on a linked experiment: re-derive the row from the master."""
+        assert self.doc is not None and self.suite2p_dir is not None
+        row = self._row()
+        link = row.get("link") or {}
+        if link.get("origin") != ORIGIN_MASTER:
+            QMessageBox.information(
+                self,
+                "Reset ROI",
+                "This ROI was added in this experiment, so it has no shared version to "
+                "reset to. Untick iscell to drop it.",
+            )
+            return
+        if self._master is None:
+            QMessageBox.warning(
+                self,
+                "Reset ROI",
+                f"The shared ROI set is not available ({self._master_error or 'not loaded'}).",
+            )
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            new_row = rederive_row(self.doc, self.suite2p_dir, self._master, int(link["uid"]))
+        except Exception as exc:
+            QMessageBox.critical(self, "Reset ROI", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        for i, r in enumerate(self.doc["rois"]):
+            if int(r["roi_id"]) == int(new_row["roi_id"]):
+                self.doc["rois"][i] = new_row
+                break
+        self.dirty = True
+        self._mark_tc_norm_stale()
+        self._select_roi(int(new_row["roi_id"]), force=True)
+        self.statusBar().showMessage(
+            f"Reset ROI {new_row['roi_id']} from the shared set (rev {new_row['link']['rev']})"
+        )
 
     def _open_heatmap_editor(self) -> None:
         if self.doc is None:
@@ -3576,6 +3948,9 @@ class MainWindow(QMainWindow):
                 hide_id=self._active_bg_id if editing_bg else None,
             )
             composed = compose_rgb_with_overlay(composed, bg_ov)
+        roiset_ov = self._roiset_outline_overlay()
+        if roiset_ov is not None:
+            composed = compose_rgb_with_overlay(composed, roiset_ov)
         if self._is_new_mask() and self._add_mask_center is not None:
             cy, cx = self._add_mask_center
             self._draw_red_cross(composed, int(round(cy)), int(round(cx)))
@@ -3693,6 +4068,8 @@ class MainWindow(QMainWindow):
             title += f" frame {t}"
         if self._showing_bg() and self._active_bg_id is not None:
             title += f" — BG {self._active_bg_id}"
+        if self._showing_ghost():
+            title += f" — original ROI {row['roi_id']}"
         if self._mask_edit_active:
             title += " [editing]"
         self.w3.setTitle(title)  # type: ignore[attr-defined]
@@ -3742,7 +4119,11 @@ class MainWindow(QMainWindow):
                 self.curve_bleach_bc.setData(xs, np.full_like(xs, np.nan, dtype=float))
             self.plot_bleach.setTitle("mean tc_norm_sm / tc_norm_sm_bc — batch")
         else:
-            row = self._w3_subject() if self._showing_bg() else self._row()
+            row = (
+                self._w3_subject()
+                if self._showing_bg() or self._showing_ghost()
+                else self._row()
+            )
             F = np.asarray(row["roi"]["F"], dtype=np.float64)
             xs = np.arange(F.shape[0])
             nan_y = np.full(xs.shape, np.nan, dtype=np.float64)
@@ -3767,7 +4148,10 @@ class MainWindow(QMainWindow):
                 self.curve_f.setData(xs, self._display_trace(F))
                 self.curve_fneu.setData(xs, self._display_trace(scaled_fneu(row)))
                 self.curve_comp.setData(xs, self._display_trace(comp))
-                self.plot_f.setTitle("F / Fneu")
+                if self._showing_ghost():
+                    self.plot_f.setTitle(f"F / Fneu — original ROI {row['roi_id']} (read-only)")
+                else:
+                    self.plot_f.setTitle("F / Fneu")
                 off = compensation_fneu_offset(row)
                 if abs(off) > 1e-12:
                     self.plot_comp.setTitle("trace_comp = F − x·(Fneu + offset)")

@@ -140,6 +140,47 @@ def thick_outline_mask(
     return ys.astype(np.int64), xs.astype(np.int64)
 
 
+def mask_outline(
+    ypix: np.ndarray, xpix: np.ndarray, Ly: int, Lx: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """(y, x) of the 1-px inner boundary of a mask, computed on its bounding box."""
+    ypix = np.asarray(ypix, dtype=np.int64)
+    xpix = np.asarray(xpix, dtype=np.int64)
+    if ypix.size == 0:
+        return ypix, xpix
+    y0, x0 = int(ypix.min()), int(xpix.min())
+    h = int(ypix.max()) - y0 + 1
+    w = int(xpix.max()) - x0 + 1
+    mask = np.zeros((h + 2, w + 2), dtype=bool)
+    mask[ypix - y0 + 1, xpix - x0 + 1] = True
+    inner = (
+        mask[:-2, 1:-1] & mask[2:, 1:-1] & mask[1:-1, :-2] & mask[1:-1, 2:]
+    )
+    edge = mask[1:-1, 1:-1] & ~inner
+    ys, xs = np.nonzero(edge)
+    ys = ys + y0
+    xs = xs + x0
+    keep = (ys >= 0) & (ys < Ly) & (xs >= 0) & (xs < Lx)
+    return ys[keep], xs[keep]
+
+
+def build_outline_overlay(
+    Ly: int,
+    Lx: int,
+    outlines: list[tuple[np.ndarray, np.ndarray, tuple[int, int, int], int]],
+) -> np.ndarray:
+    """RGBA overlay of ``(y, x, rgb, alpha_u8)`` outlines, drawn in order."""
+    overlay = np.zeros((Ly, Lx, 4), dtype=np.uint8)
+    for y, x, rgb, a in outlines:
+        if y.size == 0:
+            continue
+        overlay[y, x, 0] = rgb[0]
+        overlay[y, x, 1] = rgb[1]
+        overlay[y, x, 2] = rgb[2]
+        overlay[y, x, 3] = a
+    return overlay
+
+
 def compose_rgb_with_overlay(rgb: np.ndarray, overlay_rgba: np.ndarray) -> np.ndarray:
     """Alpha-blend overlay onto RGB uint8 image."""
     base = rgb.astype(np.float64)
