@@ -571,6 +571,7 @@ Selecting a saved run restores the line at `cut_threshold`; dragging it or typin
 - **BG ROIs + BG-motion (schema 7, 2026-09-03):** Add BG ROI; Show BG-ROIs on W1; threshold summed raw BG traces as BG-motion
 - **Per-ROI Rebuild traces (2026-09-07):** ROI Tools button above Trace X units; rebuilds this ROI's `trace_comp` / `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` after x or Fneu-offset edits
 - **Shared ROI sets, phase 1 (schema 8, 2026-11-01):** `roisets.py` (master I/O, registry, registration, shifting, publish / apply, ghosts), `gui/roiset_dialog.py` (ROI Set window), W1 ROI-set status + Originals layer + Import; Reset ROI on linked experiments re-derives from the master
+- **Per-ROI edit tracking (2026-11-05):** `edits.py`, `gui/edits_dialog.py`; **Edits** button in the ROI / curation box, **View → Show Edits** overview; replaces File → Reset current ROI (see session below)
 - Run: `python -m s2p_trace_curation`
 
 ---
@@ -774,4 +775,47 @@ suite2p ran with `allow_overlap=False`: `F.npy` leaves pixels shared by several 
 1. Master file + registry, registration, batched extraction, Publish / Apply, ghost layer + import. **(this session)**
 2. Compare (IoU match table) and Sync (per-ROI push / pull / keep local, revision check).
 3. Collected analysis (parked).
+
+---
+
+## Session 2026-11-05 — Per-ROI edit tracking and component reset
+
+### Intent
+See, per ROI, which parts differ from a default, and reset single parts. Replaces **File → Reset current ROI** (removed).
+
+### Edited = differs from the baseline (computed, not a flag)
+The sticky `roi.modified` / `neuropil.modified` flags stay true after an edit is undone and do not cover compensation, so nothing is read from them. Each ROI is compared with its baseline on demand, so editing a value back un-ticks it.
+
+| Experiment | Baseline |
+|---|---|
+| Not linked | suite2p `plane0` files (`stat.npy`, `iscell.npy`; default `x = 1`, offset 0, no baseline-offset flag) |
+| Linked, ROI from the master (`link.origin == "master"`) | the master version in this experiment's frame (shift applied); the master's SG / bleach settings are the smoothing / bleach defaults |
+| ROI drawn or imported here | none — shown as **new**, nothing to reset |
+| Linked, master file not found | none — shown as **?** |
+
+`trc_curation.original.pkl` is not used as the baseline: it is the user's pickle from before the first publish / apply and may already hold edits. Other experiments' ROI ids do not match their own originals either (a shared ROI keeps the publisher's id).
+
+### Components
+| Component | Counts in "Edited" | Resettable | Ticked when |
+|---|---|---|---|
+| Selected | yes | yes | `iscell` differs from the baseline |
+| ROI-mask | yes | yes | pixel set or weights differ (pixel order ignored) |
+| Neuropil-mask | yes | yes | neuropil pixel set differs |
+| Fneu-compensation | yes | yes | `x` differs, or the offset is manual (baseline-offset flag off and offset ≠ 0). Baseline alignment itself is **not** an edit: it is a derived offset and "Automate initial steps" applies it to every ROI |
+| Trace smoothing | no | no | SG window / order differ from the default (11, 2, or the master's) |
+| Bleach-correction | no | no | bleach on with a non-default τ mode (independent fits instead of shared τ); or, for a linked experiment, on/off differing from the master. Bleach **on with default settings is not an edit** (the automation turns it on) |
+
+Smoothing and bleach are experiment-wide settings (`meta.trace_processing`); per ROI only the fitted parameters are stored. They are shown but not counted in the ROI's Edited status (otherwise one global setting would mark every ROI) and not reset per ROI. Per-ROI overrides would be a separate feature.
+
+### Reset
+Ticking components in the Edits window and pressing *Reset checked components* restores only those. Unlinked: from the suite2p files (masks bring back `F` / `Fneu` from `F.npy` / `Fneu.npy`). Linked: from the master; mask resets re-extract the ROI from `data.bin`, the other components need no extraction. Resetting Fneu-compensation restores the default `x` and clears a manual offset; if the ROI has baseline alignment on (or the shared set asks for it) it is re-aligned for the restored `x`. Changing `x` or the offset in the GUI turns the alignment flag off, so after such an edit reset gives `x` and offset 0 — tick baseline offset again to re-align. A kept baseline-offset flag is also re-aligned after a mask reset. The ROI's `trace_comp` / `tc_norm*` are rebuilt; the session is marked unsaved.
+
+### Timestamps (new, from this version on)
+`row["edited_utc"] = {component: ISO time}` is set when a component is edited in the GUI (iscell toggle, mask Apply / re-calculate, x / Fneu offset / baseline-offset changes) and cleared on reset. No schema bump; older pickles simply have no entries, and edits made earlier have no time. Shown as a tooltip on the Edited tick; a "when" column is a later step.
+
+### GUI
+- **Edits** button right under the ROI # row (`Edits (n)` when n components are edited): small non-modal window, follows the active ROI; columns Edited ✓ / Reset checkbox / Component / Current / Default.
+- **View → Show Edits**: non-modal table, one row per ROI (ROI #, Edited yes / no / new / ?, then the current value of each component). Edited cells bold dark green, same-as-default cells normal grey. Clicking a row opens that ROI. Both windows refresh a moment after any edit (hooked on the session's dirty flag).
+- **Find pickle file**: the dialog has an **Edited ROIs** column (`edited/all`, bold dark green when > 0, grey for 0, `?/n` when no baseline could be loaded, `?` when the file could not be read). `edits.summarize_pickle(pkl, master_cache)` computes it headlessly with the same baselines as the Edits windows (suite2p files next to the pickle, or the linked master; masters cached per path) and never raises. A `QThread` reads the files one by one so the list opens at once; the thread is interrupted when the dialog closes. Tooltip: new / not-comparable counts and any baseline problem.
+- **Total row**: directly under the column names, a pinned `Total:` row gives `edited/all ROIs` for Edited and for every component (e.g. `34/254` under Selected). It lives in its own one-row table (column names are its header; the scrolling ROI table has its header hidden) with column widths kept identical, so it stays visible while the ROI list scrolls and does not shift the row → ROI mapping. Smoothing/bleach totals count ROIs whose displayed value differs from the default, but those columns are still not part of "Edited".
 

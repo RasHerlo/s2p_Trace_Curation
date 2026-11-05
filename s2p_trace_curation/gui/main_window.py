@@ -98,7 +98,6 @@ from s2p_trace_curation.curation import (
     next_roi_id,
     open_suite2p_session,
     reextract_after_mask_edit,
-    reset_roi_from_suite2p,
     save_curation,
     scaled_fneu,
     set_baseline_offset_enabled,
@@ -106,8 +105,17 @@ from s2p_trace_curation.curation import (
     set_compensation_x,
 )
 from s2p_trace_curation import PICKLE_NAME
+from s2p_trace_curation.edits import (
+    EditBaselines,
+    RoiEdits,
+    analyze_all,
+    analyze_row,
+    reset_components,
+    touch_edit,
+)
 from s2p_trace_curation.gui.analysis_dialog import AnalysisToolsWindow
 from s2p_trace_curation.gui.annotation_dialog import AnnotationEditorWindow
+from s2p_trace_curation.gui.edits_dialog import EditsOverviewWindow, RoiEditsWindow
 from s2p_trace_curation.gui.heatmap_dialog import HeatmapEditorWindow
 from s2p_trace_curation.gui.trace_processing_dialog import TraceProcessingWindow
 from s2p_trace_curation.gui.x_units import (
@@ -168,14 +176,12 @@ from s2p_trace_curation.gui.overlays import (
     zoom_masks_rgba,
 )
 from s2p_trace_curation.roisets import (
-    ORIGIN_MASTER,
     ghost_candidates,
     import_ghost,
     link_summary,
     load_ghost_rows,
     load_master,
     master_path_for_doc,
-    rederive_row,
 )
 from s2p_trace_curation.mask_edit import (
     MODE_LABELS,
@@ -458,6 +464,18 @@ class PaintImageView(pg.ImageView):
 
 
 class MainWindow(QMainWindow):
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    @dirty.setter
+    def dirty(self, value: bool) -> None:
+        # Every edit marks the session dirty; use that to keep the edit windows live.
+        self._dirty = bool(value)
+        timer = getattr(self, "_edits_timer", None)
+        if value and timer is not None:
+            timer.start()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("s2p Trace Curation")
@@ -485,6 +503,15 @@ class MainWindow(QMainWindow):
         self._heatmap_window: HeatmapEditorWindow | None = None
         self._annotation_window: AnnotationEditorWindow | None = None
         self._roiset_window: Any = None
+
+        # Per-ROI edit status (current state vs. suite2p files / shared ROI set)
+        self._edit_baselines = EditBaselines()
+        self._edits_window: RoiEditsWindow | None = None
+        self._edits_overview: EditsOverviewWindow | None = None
+        self._edits_timer = QTimer(self)
+        self._edits_timer.setSingleShot(True)
+        self._edits_timer.setInterval(200)
+        self._edits_timer.timeout.connect(self._refresh_edit_windows)
 
         # Shared ROI set (master) and the experiment's original ROIs (ghosts)
         self._master: dict[str, Any] | None = None
@@ -575,14 +602,19 @@ class MainWindow(QMainWindow):
         act_save.triggered.connect(self.save_session)
         file_menu.addAction(act_save)
 
-        act_reset = QAction("Reset current ROI", self)
-        act_reset.triggered.connect(self.reset_current_roi)
-        file_menu.addAction(act_reset)
-
         file_menu.addSeparator()
         act_quit = QAction("Quit", self)
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
+
+        view_menu = self.menuBar().addMenu("&View")
+        self.act_show_edits = QAction("Show Edits", self)
+        self.act_show_edits.setEnabled(False)
+        self.act_show_edits.setToolTip(
+            "Overview of every ROI and which of its components were edited"
+        )
+        self.act_show_edits.triggered.connect(self._open_edits_overview)
+        view_menu.addAction(self.act_show_edits)
 
     def _build_shortcuts(self) -> None:
         sc_up = QShortcut(QKeySequence(Qt.Key.Key_Up), self)
@@ -1026,7 +1058,15 @@ class MainWindow(QMainWindow):
             "Added to Fneu before scaling. trace_comp = F − x·(Fneu + offset). "
             "Default 0."
         )
+        self.btn_edits = QPushButton("Edits")
+        self.btn_edits.setEnabled(False)
+        self.btn_edits.setToolTip(
+            "Show which components of this ROI were edited (selected, masks, "
+            "Fneu compensation, smoothing, bleach) and reset them"
+        )
+        self.btn_edits.clicked.connect(self._open_edits_window)
         roi_form.addRow("ROI #", roi_nav)
+        roi_form.addRow(self.btn_edits)
         roi_form.addRow("Mode", mode_row)
         roi_form.addRow(cell_row)
         self.cmb_trace_units = QComboBox()
@@ -1666,6 +1706,8 @@ class MainWindow(QMainWindow):
         self.btn_scale_tools.setEnabled(True)
         self.btn_trace_proc.setEnabled(True)
         self.btn_save.setEnabled(True)
+        self.btn_edits.setEnabled(True)
+        self.act_show_edits.setEnabled(True)
         ensure_annotations(doc)
         self._ann_selected_ids = set()
         self._batch_mode = False
@@ -1701,6 +1743,7 @@ class MainWindow(QMainWindow):
         self._link_master_from_doc()
         if self._roiset_window is not None:
             self._roiset_window.refresh_from_main()
+        self._refresh_edit_windows()
         msg = "Created" if created else "Loaded"
         self.statusBar().showMessage(
             f"{msg} {suite2p_dir / 'trc_curation.pkl'} — {n} ROIs, "
@@ -1787,24 +1830,150 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved {path}")
         return True
 
-    def reset_current_roi(self) -> None:
+    # ------------------------------------------------------------- edits
+    def _prepared_baselines(self) -> EditBaselines | None:
         if self.doc is None or self.suite2p_dir is None:
+            return None
+        self._edit_baselines.prepare(self.doc, self.suite2p_dir, self._master)
+        return self._edit_baselines
+
+    def edit_baseline_label(self) -> str:
+        base = self._prepared_baselines()
+        return base.label if base is not None else ""
+
+    def edit_baseline_error(self) -> str | None:
+        base = self._prepared_baselines()
+        return base.error if base is not None else None
+
+    def edits_for_active(self) -> RoiEdits | None:
+        """Edit state of the active cell ROI (None for a BG ROI / unknown id)."""
+        base = self._prepared_baselines()
+        if base is None or self.doc is None:
+            return None
+        for row in self.doc["rois"]:
+            if int(row["roi_id"]) == int(self.active_roi_id):
+                return analyze_row(self.doc, row, base)
+        return None
+
+    def edits_for_all(self) -> list[RoiEdits]:
+        base = self._prepared_baselines()
+        if base is None or self.doc is None:
+            return []
+        return analyze_all(self.doc, base)
+
+    def can_reset_roi_components(self) -> bool:
+        return (
+            self.doc is not None
+            and self.suite2p_dir is not None
+            and not self._mask_edit_active
+            and not self._batch_mode
+            and not self._extracting
+        )
+
+    def _open_edits_window(self) -> None:
+        if self.doc is None:
+            return
+        if self._edits_window is None:
+            self._edits_window = RoiEditsWindow(self)
+
+            def _clear(_obj: object = None) -> None:
+                self._edits_window = None
+
+            self._edits_window.destroyed.connect(_clear)
+        self._edits_window.refresh()
+        self._edits_window.show()
+        self._edits_window.raise_()
+        self._edits_window.activateWindow()
+
+    def _open_edits_overview(self) -> None:
+        if self.doc is None:
+            return
+        if self._edits_overview is None:
+            self._edits_overview = EditsOverviewWindow(self)
+
+            def _clear(_obj: object = None) -> None:
+                self._edits_overview = None
+
+            self._edits_overview.destroyed.connect(_clear)
+        self._edits_overview.refresh()
+        self._edits_overview.show()
+        self._edits_overview.raise_()
+        self._edits_overview.activateWindow()
+
+    def _update_edits_button(self) -> None:
+        if self.doc is None:
+            self.btn_edits.setText("Edits")
+            return
+        edits = self.edits_for_active()
+        n = len(edits.edited_keys) if edits is not None else 0
+        self.btn_edits.setText(f"Edits ({n})" if n else "Edits")
+
+    def _sync_edit_windows_to_active(self) -> None:
+        """Cheap: follow the active ROI without recomputing every ROI."""
+        if getattr(self, "btn_edits", None) is None:
+            return  # UI not built yet
+        self._update_edits_button()
+        if self._edits_window is not None:
+            self._edits_window.refresh()
+        if self._edits_overview is not None:
+            self._edits_overview.sync_active()
+
+    def _refresh_edit_windows(self) -> None:
+        """Recompute after an edit / load: button, per-ROI list and overview table."""
+        if self.doc is None:
+            return
+        self._update_edits_button()
+        if self._edits_window is not None:
+            self._edits_window.refresh()
+        if self._edits_overview is not None:
+            self._edits_overview.refresh()
+
+    def jump_to_roi(self, roi_id: int) -> None:
+        """Make ``roi_id`` the active ROI (from the overview table)."""
+        if self.doc is None or self._mask_edit_active or self._batch_mode:
+            return
+        if int(roi_id) == int(self.active_roi_id):
+            return
+        self._select_roi(int(roi_id))
+
+    def reset_roi_components(self, components: list[str]) -> None:
+        """Reset the chosen per-ROI components of the active ROI to the baseline."""
+        if self.doc is None or self.suite2p_dir is None or not components:
             return
         if self._mask_edit_active:
             QMessageBox.information(
                 self,
                 "Mask edit active",
-                "Finish with Apply/Save Mask/Save BG ROI or Cancel before resetting the ROI.",
+                "Finish with Apply/Save Mask/Save BG ROI or Cancel before resetting.",
             )
             return
-        if self.doc.get("master_link"):
-            self._reset_linked_roi()
+        if self._batch_mode:
+            QMessageBox.information(self, "Reset", "Switch to Single mode to reset an ROI.")
             return
-        reset_roi_from_suite2p(self.doc, self.suite2p_dir, self.active_roi_id)
+        row = self._row()
+        roi_id = int(row["roi_id"])
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            done = reset_components(
+                self.doc, self.suite2p_dir, row, list(components), master=self._master
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Reset ROI components", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not done:
+            return
         self.dirty = True
+        self._roi_traces_pending.discard(roi_id)
         self._mark_tc_norm_stale()
-        self._select_roi(self.active_roi_id, force=True)
-        self.statusBar().showMessage(f"Reset ROI {self.active_roi_id} from suite2p")
+        self._select_roi(roi_id, force=True)
+        if "selected" in done:
+            self._ensure_active_roi_in_filter()
+        self._refresh_analysis_stale_ui()
+        self.statusBar().showMessage(
+            f"Reset ROI {roi_id}: {', '.join(done)} (not yet saved)"
+        )
 
     def closeEvent(self, event) -> None:
         if self._mask_edit_active:
@@ -1977,6 +2146,7 @@ class MainWindow(QMainWindow):
             self.btn_apply_mask.setText("Apply BG ROI")
         else:
             self.btn_apply_mask.setText("Apply Mask")
+        self._sync_edit_windows_to_active()  # Reset is off while a mask is being edited
 
     def _on_mask_mode_toggled(self, checked: bool) -> None:
         if not checked:
@@ -2348,6 +2518,10 @@ class MainWindow(QMainWindow):
                     progress=_progress,
                     should_cancel=lambda: self._extract_cancel,
                 )
+                if roi_changed:
+                    touch_edit(self._row(), "roi_mask")
+                if neu_changed:
+                    touch_edit(self._row(), "neuropil_mask")
                 if baseline_offset_enabled(self._row()):
                     set_baseline_offset_enabled(self._row(), False)
                     self._updating = True
@@ -2560,6 +2734,7 @@ class MainWindow(QMainWindow):
         if self._annotation_window is not None:
             self._annotation_window.on_active_roi_changed()
         self._update_rebuild_roi_traces_button()
+        self._sync_edit_windows_to_active()
 
     def _select_bg(self, bg_id: int) -> None:
         if self.doc is None or self._mask_edit_active or self._batch_mode:
@@ -2687,6 +2862,7 @@ class MainWindow(QMainWindow):
         ):
             w.setEnabled(not self._batch_mode)
         self._update_rebuild_roi_traces_button()
+        self._sync_edit_windows_to_active()  # Reset is off in batch / mask-edit mode
 
     def _on_fov_lasso(self, points_yx: list[tuple[float, float]]) -> None:
         if not self._batch_mode or self.doc is None:
@@ -2702,6 +2878,8 @@ class MainWindow(QMainWindow):
         # Snap all selected ROIs to iscell=True (default on)
         for row in self.doc["rois"]:
             if int(row["roi_id"]) in ids:
+                if not bool(row.get("iscell", True)):
+                    touch_edit(row, "selected")
                 row["iscell"] = True
         self.dirty = True
         self._updating = True
@@ -2725,6 +2903,8 @@ class MainWindow(QMainWindow):
             id_set = set(self._batch_roi_ids)
             for row in self.doc["rois"]:
                 if int(row["roi_id"]) in id_set:
+                    if bool(row.get("iscell", True)) != bool(checked):
+                        touch_edit(row, "selected")
                     row["iscell"] = bool(checked)
             self.dirty = True
             self._refresh_fov()
@@ -2732,6 +2912,7 @@ class MainWindow(QMainWindow):
             self._refresh_analysis_stale_ui()
             return
         self._row()["iscell"] = bool(checked)
+        touch_edit(self._row(), "selected")
         self.dirty = True
         self._refresh_analysis_stale_ui()
         jumped = self._ensure_active_roi_in_filter()
@@ -2758,6 +2939,7 @@ class MainWindow(QMainWindow):
         row = self._row()
         if not checked:
             set_baseline_offset_enabled(row, False)
+            touch_edit(row, "fneu_comp")
             self.dirty = True
             return
         try:
@@ -2772,6 +2954,7 @@ class MainWindow(QMainWindow):
         self._updating = True
         self.spin_fneu_offset.setValue(float(offset))
         self._updating = False
+        touch_edit(row, "fneu_comp")
         self.dirty = True
         self._roi_traces_pending.add(int(self.active_roi_id))
         self._mark_tc_norm_stale()
@@ -2781,6 +2964,7 @@ class MainWindow(QMainWindow):
         if self._updating or self.doc is None or self._batch_mode:
             return
         set_compensation_x(self._row(), float(value))
+        touch_edit(self._row(), "fneu_comp")
         self._clear_baseline_offset_flag()
         self.dirty = True
         self._roi_traces_pending.add(int(self.active_roi_id))
@@ -2791,6 +2975,7 @@ class MainWindow(QMainWindow):
         if self._updating or self.doc is None or self._batch_mode:
             return
         set_compensation_fneu_offset(self._row(), float(value))
+        touch_edit(self._row(), "fneu_comp")
         self._clear_baseline_offset_flag()
         self.dirty = True
         self._roi_traces_pending.add(int(self.active_roi_id))
@@ -3087,6 +3272,7 @@ class MainWindow(QMainWindow):
         self._master_path = path
         self._master_error = None
         self._sync_roiset_ui()
+        self._refresh_edit_windows()
 
     def _sync_roiset_ui(self) -> None:
         loaded = self.doc is not None
@@ -3270,45 +3456,6 @@ class MainWindow(QMainWindow):
         self._refresh_analysis_stale_ui()
         self.statusBar().showMessage(
             f"Imported original ROI {ghost['roi_id']} as local ROI {row['roi_id']} (not yet saved)"
-        )
-
-    def _reset_linked_roi(self) -> None:
-        """Reset ROI on a linked experiment: re-derive the row from the master."""
-        assert self.doc is not None and self.suite2p_dir is not None
-        row = self._row()
-        link = row.get("link") or {}
-        if link.get("origin") != ORIGIN_MASTER:
-            QMessageBox.information(
-                self,
-                "Reset ROI",
-                "This ROI was added in this experiment, so it has no shared version to "
-                "reset to. Untick iscell to drop it.",
-            )
-            return
-        if self._master is None:
-            QMessageBox.warning(
-                self,
-                "Reset ROI",
-                f"The shared ROI set is not available ({self._master_error or 'not loaded'}).",
-            )
-            return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            new_row = rederive_row(self.doc, self.suite2p_dir, self._master, int(link["uid"]))
-        except Exception as exc:
-            QMessageBox.critical(self, "Reset ROI", str(exc))
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-        for i, r in enumerate(self.doc["rois"]):
-            if int(r["roi_id"]) == int(new_row["roi_id"]):
-                self.doc["rois"][i] = new_row
-                break
-        self.dirty = True
-        self._mark_tc_norm_stale()
-        self._select_roi(int(new_row["roi_id"]), force=True)
-        self.statusBar().showMessage(
-            f"Reset ROI {new_row['roi_id']} from the shared set (rev {new_row['link']['rev']})"
         )
 
     def _open_heatmap_editor(self) -> None:

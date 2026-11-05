@@ -12,8 +12,8 @@ ex02–04 and LED+AP ex01–03). Full design and agreements (RS-A1…A12):
   publish / apply / re-derive, originals ("ghosts") and import.
 - New `s2p_trace_curation/gui/roiset_dialog.py`: the **ROI Set** window.
 - `gui/main_window.py`: FOV (W1) box gets the ROI-set status line, the
-  **ROI Set…** button and the **Originals** row (show + Import). Reset ROI
-  re-derives from the master on linked experiments.
+  **ROI Set…** button and the **Originals** row (show + Import). On linked
+  experiments the **Edits** window resets components to the master version.
 - `gui/overlays.py`: outline overlays for ghosts and the master preview.
 - `suite2p_io.py`: `extract_traces_batch` (all ROIs in one pass over `data.bin`).
 - `curation.py`: local ROI ids start at 10000 on linked experiments.
@@ -51,8 +51,10 @@ ex02–04 and LED+AP ex01–03). Full design and agreements (RS-A1…A12):
    choices come from the master as defaults, fitted values stay local.
    Saved analyses are cleared; ROI ids equal master uids.
 4. **Keep optimising locally** — masks, compensation, smoothing, bleach and
-   iscell edits are local to the experiment. *Reset ROI* restores the
-   master version of that ROI.
+   iscell edits are local to the experiment. The **Edits** button in the
+   ROI / curation box lists what differs from the master for the active ROI
+   and resets the components you tick back to the master version; **View →
+   Show Edits** gives the same for all ROIs (see DESIGN_LOG, 2026-11-05).
 5. **Compare with originals** — **Originals** dropdown in the W1 box
    (iscell=1 / all). Yellow = not covered by any working ROI (IoU < 0.2),
    grey = covered. Click one to view it read-only in W3/traces; **Import**

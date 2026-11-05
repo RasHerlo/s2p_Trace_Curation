@@ -311,6 +311,50 @@ def open_suite2p_session(suite2p_dir: Path) -> tuple[Path, dict[str, Any], bool]
     return suite2p_dir, doc, True
 
 
+def plane_baseline_row(
+    suite2p_dir: Path, roi_id: int, *, with_traces: bool = True
+) -> dict[str, Any]:
+    """Row for ``roi_id`` as suite2p wrote it (stat / iscell / F / Fneu, default ``x``).
+
+    ``with_traces=False`` skips ``F.npy`` / ``Fneu.npy`` (masks and flags only).
+    """
+    plane = plane_dir(resolve_suite2p_dir(suite2p_dir))
+    stat = load_stat(plane)
+    if roi_id < 0 or roi_id >= len(stat):
+        raise IndexError(f"roi_id {roi_id} is not in the suite2p files")
+    iscell, iscell_prob = load_iscell(plane, len(stat))
+    s = stat[roi_id]
+    if with_traces:
+        Fi = np.asarray(np.load(plane / "F.npy", mmap_mode="r")[roi_id], dtype=np.float64)
+        Fni = np.asarray(np.load(plane / "Fneu.npy", mmap_mode="r")[roi_id], dtype=np.float64)
+    else:
+        Fi = np.zeros(0, dtype=np.float64)
+        Fni = np.zeros(0, dtype=np.float64)
+    return {
+        "roi_id": int(roi_id),
+        "iscell": bool(iscell[roi_id]),
+        "iscell_prob": float(iscell_prob[roi_id]) if iscell_prob is not None else None,
+        "roi": {
+            "ypix": np.asarray(s["ypix"], dtype=np.int32),
+            "xpix": np.asarray(s["xpix"], dtype=np.int32),
+            "lam": np.asarray(s["lam"], dtype=np.float32),
+            "F": Fi,
+            "modified": False,
+        },
+        "neuropil": {
+            "ipix": np.asarray(s["neuropil_mask"], dtype=np.int32),
+            "Fneu": Fni,
+            "modified": False,
+        },
+        "compensation": {
+            "x": 1.0,
+            "fneu_offset": 0.0,
+            "baseline_offset": False,
+            "trace_comp": np.zeros(0, dtype=np.float64),
+        },
+    }
+
+
 def reset_roi_from_suite2p(
     doc: dict[str, Any], suite2p_dir: Path, roi_id: int
 ) -> dict[str, Any]:

@@ -612,6 +612,17 @@ def _build_master_rows(
     return rows, bg_rows, report
 
 
+def master_baseline_rows(
+    master: dict[str, Any], dy: int, dx: int, uids: set[int] | None = None
+) -> dict[int, dict[str, Any]]:
+    """Master ROIs in this experiment's frame, by uid, with no real traces.
+
+    Used to tell which parts of a linked ROI differ from the shared version.
+    """
+    rows, _bg, _rep = _build_master_rows(master, dy, dx, 1, uids=uids)
+    return {int(r["roi_id"]): r for r in rows}
+
+
 def _extract_rows(
     suite2p_dir: Path,
     rows: list[dict[str, Any]],
@@ -826,7 +837,7 @@ def import_ghost(doc: dict[str, Any], ghost: dict[str, Any]) -> dict[str, Any]:
     from s2p_trace_curation.trace_processing import rebuild_row_traces
 
     row = deepcopy(ghost)
-    for key in ("tc_norm", "tc_norm_sm", "tc_norm_sm_bc", "bleach"):
+    for key in ("tc_norm", "tc_norm_sm", "tc_norm_sm_bc", "bleach", "edited_utc"):
         row.pop(key, None)
     src_id = int(row["roi_id"])
     row["roi_id"] = next_local_roi_id(doc)

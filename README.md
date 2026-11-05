@@ -67,7 +67,12 @@ Design decisions and schema notes live in [`DESIGN_LOG.md`](DESIGN_LOG.md).
   median with F; unticks if `x` or the offset is edited), **Rebuild traces**
   (`trace_comp` / `tc_norm` / `tc_norm_sm` / `tc_norm_sm_bc` for the current
   ROI), and `iscell` toggle
-- **File → Find pickle file…** searches a root folder for `trc_curation.pkl` and opens that suite2p folder
+- **File → Find pickle file…** searches a root folder for `trc_curation.pkl` and opens that suite2p folder;
+  each file is listed with its number of edited ROIs (`edited/all`, filled in as the files are read),
+  so you can pick up a dataset that is under curation
+- **Edits** (ROI / curation box): which components of the ROI differ from
+  the suite2p files (or the shared ROI set), with per-component reset;
+  **View → Show Edits** lists this for every ROI
 - **File → Merge s2p folders**: **Automate initial steps** uses only the
   output parent (`suite2p_temp`, `suite2p_anat`, and
   `defringe_v4/families.json`) and writes `suite2p_merged` with LED+Shutter,
