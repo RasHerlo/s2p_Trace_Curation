@@ -325,6 +325,60 @@ def keep_image_zoom(
     return shape
 
 
+class LevelSlider(QWidget):
+    """Horizontal float slider with a spin-box-like API (value/setValue/valueChanged)."""
+
+    valueChanged = QtCore.Signal(float)
+    _STEPS = 1000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lo, self._hi = 0.0, 1.0
+        self._value = 0.0
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, self._STEPS)
+        self._label = QLabel("0")
+        self._label.setMinimumWidth(48)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._slider, 1)
+        lay.addWidget(self._label)
+        self._slider.valueChanged.connect(self._on_slider)
+
+    def setRange(self, lo: float, hi: float) -> None:
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return
+        self._lo, self._hi = float(lo), float(hi)
+        self._sync_slider()
+
+    def setDecimals(self, _n: int) -> None:
+        pass
+
+    def value(self) -> float:
+        return self._value
+
+    def setValue(self, v: float) -> None:
+        v = float(v)
+        if v < self._lo or v > self._hi:
+            span = max(self._hi - self._lo, 1.0)
+            self.setRange(min(self._lo, v - 0.1 * span), max(self._hi, v + 0.1 * span))
+        self._value = v
+        self._sync_slider()
+        self._label.setText(f"{v:.4g}")
+
+    def _sync_slider(self) -> None:
+        frac = (self._value - self._lo) / (self._hi - self._lo)
+        pos = int(round(min(max(frac, 0.0), 1.0) * self._STEPS))
+        old = self._slider.blockSignals(True)
+        self._slider.setValue(pos)
+        self._slider.blockSignals(old)
+
+    def _on_slider(self, pos: int) -> None:
+        self._value = self._lo + (self._hi - self._lo) * pos / self._STEPS
+        self._label.setText(f"{self._value:.4g}")
+        self.valueChanged.emit(self._value)
+
+
 class ClickableImageView(pg.ImageView):
     """ImageView: left-click select and/or freehand lasso drawing."""
 
@@ -915,11 +969,8 @@ class MainWindow(QMainWindow):
             self.cmb_fov_src.addItem(key, key)
         self.cmb_fov_lut = QComboBox()
         self.cmb_fov_lut.addItems(list(LUT_NAMES))
-        self.spin_fov_lo = QDoubleSpinBox()
-        self.spin_fov_hi = QDoubleSpinBox()
-        for s in (self.spin_fov_lo, self.spin_fov_hi):
-            s.setRange(-1e9, 1e9)
-            s.setDecimals(2)
+        self.spin_fov_lo = LevelSlider()
+        self.spin_fov_hi = LevelSlider()
         self.cmb_overlay = QComboBox()
         for key, label in FILTER_LABELS.items():
             self.cmb_overlay.addItem(label, key)
@@ -1778,6 +1829,12 @@ class MainWindow(QMainWindow):
                 hi = float(flat.max())
             if hi <= lo:
                 hi = lo + 1.0
+        if isinstance(spin_lo, LevelSlider):
+            dmin, dmax = (float(flat.min()), float(flat.max())) if flat.size else (0.0, 1.0)
+            if dmax <= dmin:
+                dmax = dmin + 1.0
+            spin_lo.setRange(dmin, dmax)
+            spin_hi.setRange(dmin, dmax)
         spin_lo.blockSignals(True)
         spin_hi.blockSignals(True)
         spin_lo.setValue(float(lo))
@@ -2727,6 +2784,7 @@ class MainWindow(QMainWindow):
         self.spin_fneu_offset.setValue(compensation_fneu_offset(row))
         self._updating = False
         self._refresh_all()
+        self._center_views_on_active_roi()
         if self._trace_proc_window is not None:
             self._trace_proc_window._refresh_preview()
         if self._heatmap_window is not None:
@@ -4048,6 +4106,49 @@ class MainWindow(QMainWindow):
             prev_shape = (int(old.shape[0]), int(old.shape[1]))
         keep_image_zoom(view, rgb, prev_shape=prev_shape)
 
+    def _draw_selected_outline(self, rgb: np.ndarray) -> None:
+        """Strong outline of the selected ROI(s) on W1, matching W2."""
+        assert self.doc is not None
+        Ly, Lx = int(self.doc["meta"]["Ly"]), int(self.doc["meta"]["Lx"])
+        if self._batch_mode and self._batch_roi_ids:
+            id_set = set(self._batch_roi_ids)
+            for r in self.doc["rois"]:
+                if int(r["roi_id"]) not in id_set:
+                    continue
+                y_out, x_out = thick_outline_mask(
+                    Ly, Lx, r["roi"]["ypix"], r["roi"]["xpix"], thickness=2
+                )
+                if y_out.size:
+                    rgb[y_out, x_out] = (255, 0, 0)
+            return
+        row = self._w3_subject()
+        y_out, x_out = thick_outline_mask(
+            Ly, Lx, row["roi"]["ypix"], row["roi"]["xpix"], thickness=2
+        )
+        if y_out.size:
+            rgb[y_out, x_out] = BG_ROI_RGB if self._showing_bg() else (255, 0, 0)
+
+    def _center_views_on_active_roi(self) -> None:
+        """Pan W1 and W2 to the selected ROI, keeping the current zoom."""
+        if self.doc is None:
+            return
+        try:
+            row = self._row()
+            ys = np.asarray(row["roi"]["ypix"], dtype=np.float64)
+            xs = np.asarray(row["roi"]["xpix"], dtype=np.float64)
+        except Exception:
+            return
+        if ys.size == 0:
+            return
+        cy, cx = float(ys.mean()) + 0.5, float(xs.mean()) + 0.5
+        for panel in (self.w1, self.w2):
+            vb = image_view_box(panel.image_view)  # type: ignore[attr-defined]
+            (x0, x1), (y0, y1) = vb.viewRange()
+            hw, hh = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+            vb.setRange(
+                xRange=(cx - hw, cx + hw), yRange=(cy - hh, cy + hh), padding=0
+            )
+
     def _refresh_fov(self) -> None:
         if self.doc is None:
             return
@@ -4076,6 +4177,7 @@ class MainWindow(QMainWindow):
             cluster_rgb=self._fov_cluster_rgb(),
         )
         composed = compose_rgb_with_overlay(rgb, overlay)
+        self._draw_selected_outline(composed)
         editing_bg = self._mask_edit_kind == "modify_bg"
         show_bg = (
             bool(self.chk_show_bg_rois.isChecked())
